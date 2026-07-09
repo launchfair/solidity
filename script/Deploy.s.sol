@@ -64,7 +64,7 @@ contract Deploy is Script {
                 maxBuyBps: 200, // 2% wallet cap...
                 maxBuyBlocks: 360 // ...for the first 360 blocks
             }),
-            vm.envOr("WEBSITE", string("https://fun.example.xyz"))
+            vm.envOr("WEBSITE", string("https://hood.launchfair.app/"))
         );
         locker.setLaunchpad(address(pad));
 

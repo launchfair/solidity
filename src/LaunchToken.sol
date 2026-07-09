@@ -9,6 +9,9 @@ import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 /// Freely transferable from creation — the pool IS the market from block one,
 /// which is what makes the token visible to every DEX terminal without paid
 /// data integrations. No owner, no mint, no fee knobs, no blacklist.
+///
+/// Launched on https://hood.launchfair.app/ — every token of this contract is
+/// deployed exclusively through that launchpad (see `platformWebsite`).
 contract LaunchToken is ERC20Burnable {
     /// @notice Creator-supplied token metadata, immutable after creation.
     /// The launchpad validates every field (no quotes/backslashes/control
