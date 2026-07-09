@@ -64,7 +64,7 @@ contract RobinhoodChainForkTest is Test {
 
     uint128 constant TOTAL_SUPPLY = 1_000_000_000 ether;
     uint256 constant INITIAL_PRICE = 1_491_146_318;
-    uint256 constant GRAD_PRICE = 15 * INITIAL_PRICE;
+    uint256 constant GRAD_WETH = 1 ether; // WETH raised into the pool that bonds a token
     uint16 constant MAX_BUY_BPS = 200;
     uint32 constant MAX_BUY_BLOCKS = 360;
     uint256 constant CREATION_FEE = 0.000005 ether;
@@ -97,7 +97,7 @@ contract RobinhoodChainForkTest is Test {
                 tickUpper0: 887_200,
                 tokenTotalSupply: TOTAL_SUPPLY,
                 initialPriceWethPerToken: INITIAL_PRICE,
-                graduationPriceWethPerToken: GRAD_PRICE,
+                graduationWethAmount: GRAD_WETH,
                 maxBuyBps: MAX_BUY_BPS,
                 maxBuyBlocks: MAX_BUY_BLOCKS
             }),
@@ -196,7 +196,7 @@ contract RobinhoodChainForkTest is Test {
         uint256 bought = _buy(info.pool, info.tokenIsToken0, 5 ether);
         assertGt(bought, cap, "whale buy must clear after expiry");
 
-        // The 5 ETH buy walked the curve past 15x launch price: milestone fires.
+        // The 5 ETH buy bonded > 1 WETH into the real pool: milestone fires.
         assertEq(pad.curveProgress(token), 10_000);
         assertTrue(pad.checkGraduation(token));
 

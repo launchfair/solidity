@@ -3,14 +3,13 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {V3Launchpad} from "../src/V3Launchpad.sol";
 import {FeeLocker} from "../src/FeeLocker.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
 import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
 import {MockWETH} from "../test/mocks/MockWETH.sol";
-import {MockV3Factory, MockV3Pool, MockPositionManager} from "../test/mocks/MockUniswapV3.sol";
+import {MockV3Factory, MockPositionManager} from "../test/mocks/MockUniswapV3.sol";
 
 /// Self-contained lifecycle demo for a local node (anvil): deploy (with V3
 /// mocks) -> launch a token into its pool -> simulate accrued swap fees ->
@@ -41,7 +40,7 @@ contract Demo is Script {
                 tickUpper0: 887_200,
                 tokenTotalSupply: 1_000_000_000 ether,
                 initialPriceWethPerToken: 1_491_146_318,
-                graduationPriceWethPerToken: 15 * 1_491_146_318,
+                graduationWethAmount: 1 ether, // bonds once ~1 WETH is raised into the pool
                 maxBuyBps: 200,
                 maxBuyBlocks: 360
             }),
@@ -84,13 +83,13 @@ contract Demo is Script {
         console2.log("  supply after burn:", IERC20(token).totalSupply() / 1e18);
         require(IERC20(token).totalSupply() == supplyBefore - burned, "burn accounting");
 
-        // Market pumps past the milestone (16x launch) -> anyone can flag graduation.
+        // Buyers bond WETH into the pool -> once it passes graduationWethAmount,
+        // anyone can flag graduation. (Here we simulate 1.5 WETH bonded.)
         console2.log("Curve progress (bps):", pad.curveProgress(token));
-        uint256 pumped = 16 * 1_491_146_318;
-        uint256 ratioX192 =
-            info.tokenIsToken0 ? Math.mulDiv(pumped, 1 << 192, 1e18) : Math.mulDiv(1e18, 1 << 192, pumped);
-        MockV3Pool(info.pool).setSqrtPriceX96(uint160(Math.sqrt(ratioX192)));
-        console2.log("Curve progress after pump (bps):", pad.curveProgress(token));
+        console2.log("Graduation WETH target:", pad.graduationWethAmount());
+        weth.deposit{value: 1.5 ether}();
+        weth.transfer(info.pool, 1.5 ether);
+        console2.log("Curve progress after 1.5 WETH bonded (bps):", pad.curveProgress(token));
         pad.checkGraduation(token);
         console2.log("Graduated (cosmetic milestone):", pad.getLaunch(token).graduated);
 

@@ -21,7 +21,7 @@ abstract contract V3LaunchpadTestBase is Test {
     uint24 constant FEE_TIER = 10_000; // 1% per swap
     int24 constant TICK_LOWER0 = -203_200;
     int24 constant TICK_UPPER0 = 887_200;
-    uint256 constant GRAD_PRICE = 15 * INITIAL_PRICE; // graduation at 15x launch
+    uint256 constant GRAD_WETH = 5 ether; // WETH raised into the pool that bonds a token
     uint16 constant MAX_BUY_BPS = 200; // 2% wallet cap...
     uint32 constant MAX_BUY_BLOCKS = 360; // ...for the first 360 blocks
     string constant SITE = "https://fun.example.xyz";
@@ -65,7 +65,7 @@ abstract contract V3LaunchpadTestBase is Test {
                 tickUpper0: TICK_UPPER0,
                 tokenTotalSupply: TOTAL_SUPPLY,
                 initialPriceWethPerToken: INITIAL_PRICE,
-                graduationPriceWethPerToken: GRAD_PRICE,
+                graduationWethAmount: GRAD_WETH,
                 maxBuyBps: MAX_BUY_BPS,
                 maxBuyBlocks: MAX_BUY_BLOCKS
             }),
@@ -172,17 +172,24 @@ abstract contract V3LaunchpadTestBase is Test {
         locker.claim(token);
     }
 
-    function test_graduation_isCosmeticMilestone() public {
-        V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
-        MockV3Pool pool = MockV3Pool(info.pool);
+    /// Bond WETH into a pool (simulate buys) so checkGraduation/curveProgress see it.
+    function _bondWeth(address pool, uint256 amount) internal {
+        vm.deal(address(this), amount);
+        weth.deposit{value: amount}();
+        weth.transfer(pool, amount);
+    }
 
-        // Below the milestone: not graduated yet.
-        pool.setSqrtPriceX96(_sqrtPriceFor(GRAD_PRICE - GRAD_PRICE / 100, expectToken0));
-        vm.expectRevert(V3Launchpad.NotPastGraduationPrice.selector);
+    function test_graduation_atWethTarget() public {
+        V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
+        assertEq(pad.graduationWethAmount(), GRAD_WETH);
+
+        // Below the WETH target: not bonded yet.
+        _bondWeth(info.pool, GRAD_WETH - 1);
+        vm.expectRevert(V3Launchpad.NotEnoughWethBonded.selector);
         pad.checkGraduation(token);
 
-        // Past the milestone: anyone can poke it; nothing moves, only a flag+event.
-        pool.setSqrtPriceX96(_sqrtPriceFor(GRAD_PRICE + GRAD_PRICE / 100, expectToken0));
+        // One more wei reaches the target: anyone can poke it; liquidity never moves.
+        _bondWeth(info.pool, 1);
         vm.prank(alice);
         assertTrue(pad.checkGraduation(token));
         assertTrue(pad.getLaunch(token).graduated);
@@ -190,10 +197,23 @@ abstract contract V3LaunchpadTestBase is Test {
         vm.expectRevert(V3Launchpad.AlreadyGraduated.selector);
         pad.checkGraduation(token);
 
-        // Liquidity did not move.
         (uint256 tokenId,, bool exists) = locker.positions(token);
         assertTrue(exists);
         assertEq(tokenId, info.positionTokenId);
+    }
+
+    function test_setGraduationWethAmount_ownerOnly() public {
+        vm.prank(owner);
+        pad.setGraduationWethAmount(2 ether);
+        assertEq(pad.graduationWethAmount(), 2 ether);
+
+        vm.prank(owner);
+        vm.expectRevert(V3Launchpad.InvalidPoolConfig.selector);
+        pad.setGraduationWethAmount(0);
+
+        vm.prank(alice);
+        vm.expectRevert();
+        pad.setGraduationWethAmount(1 ether);
     }
 
     function _predictToken(string memory name, string memory symbol, address creator_, bytes32 salt)
@@ -221,29 +241,27 @@ abstract contract V3LaunchpadTestBase is Test {
         return _sqrtPriceFor(INITIAL_PRICE, predictedToken < address(weth));
     }
 
-    /// The single-sided range order IS the bonding curve; curveProgress is the
-    /// frontend progress bar from launch price (0) to graduation (10000 bps).
-    function test_curveProgress_tracksPriceLadder() public {
-        MockV3Pool pool = MockV3Pool(pad.getLaunch(token).pool);
+    /// curveProgress is the frontend progress bar, measured as WETH bonded into
+    /// the pool toward graduationWethAmount (0 -> 10000 bps).
+    function test_curveProgress_tracksWethBonded() public {
+        address pool = pad.getLaunch(token).pool;
 
-        // Fresh launch: pool sits at the launch price -> 0% progress.
+        // Fresh launch: nothing bonded -> 0%.
         assertEq(pad.curveProgress(token), 0);
 
-        // Buyers walk the curve up to 4x launch price.
-        pool.setSqrtPriceX96(_sqrtPriceFor(4 * INITIAL_PRICE, expectToken0));
-        // (4x - 1x) / (15x - 1x) = 3/14 = ~2142 bps
-        assertApproxEqAbs(pad.curveProgress(token), 2142, 5);
+        // Bond 30% of the target -> 3000 bps.
+        _bondWeth(pool, (GRAD_WETH * 30) / 100);
+        assertApproxEqAbs(pad.curveProgress(token), 3000, 1);
 
-        // Past graduation price: clamps at 100%, before and after the poke.
-        pool.setSqrtPriceX96(_sqrtPriceFor(20 * INITIAL_PRICE, expectToken0));
+        // Bond past the target -> clamps at 100%, before and after graduation.
+        _bondWeth(pool, GRAD_WETH);
         assertEq(pad.curveProgress(token), 10_000);
         pad.checkGraduation(token);
         assertEq(pad.curveProgress(token), 10_000);
 
-        // A dip below the launch price clamps at 0 for ungraduated tokens.
+        // A token with nothing bonded reads 0%.
         vm.prank(creator);
         address token2 = pad.createToken{value: CREATION_FEE}("Second", "SEC");
-        MockV3Pool(pad.getLaunch(token2).pool).setSqrtPriceX96(_sqrtPriceFor(INITIAL_PRICE / 2, token2 < address(weth)));
         assertEq(pad.curveProgress(token2), 0);
     }
 

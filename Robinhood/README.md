@@ -2,7 +2,7 @@
 
 A token launchpad in the model of [fun.noxa.fi](https://fun.noxa.fi/): every token launches **straight into a real Uniswap V3 pool** as a single-sided range order, with the LP locked forever. Because the market is a normal V3 pool from block one, DEX terminals (GMGN, DexScreener, GeckoTerminal, …) index it automatically — no paid data integrations.
 
-**The curve is still here.** A single-sided V3 range order *is* a bonding curve — mathematically identical to a pump.fun-style virtual-reserve constant-product curve. All supply sits above the launch price, so price only moves by buyers walking it up a deterministic ladder: 50% of supply sold ≈ 4× launch price, ~74% ≈ 15× (the graduation milestone, ≈4.3 WETH accumulated in the position), 80% ≈ 25×. `V3Launchpad.curveProgress(token)` returns progress toward graduation in bps (0–10 000) for the frontend progress bar. The only differences from a standalone curve: it lives inside the pool (that's what makes it indexable), it never "sells out" (price can keep climbing past graduation), and there's no transfer lock.
+**The curve is still here.** A single-sided V3 range order *is* a bonding curve — mathematically identical to a pump.fun-style virtual-reserve constant-product curve. All supply sits above the launch price, so price only moves by buyers walking it up a deterministic ladder. A token **bonds/graduates once `graduationWethAmount` of WETH has been raised into its pool** (net of sells, measured as `WETH.balanceOf(pool)`). That target is a single **owner-settable** knob (`setGraduationWethAmount`) — the manual "WETH to bond" control — applied globally. `V3Launchpad.curveProgress(token)` returns progress toward it in bps (0–10 000) for the frontend progress bar. The only differences from a standalone curve: it lives inside the pool (that's what makes it indexable), it never "sells out" (price can keep climbing past graduation), and there's no transfer lock.
 
 **Fee model** (via the pool's 1% fee tier — V3 fees accrue in the swap's *input* asset):
 
@@ -19,7 +19,7 @@ Plus a **flat creation fee** of **0.000005 ETH** charged to the dev at `createTo
 
 | Contract | Purpose |
 |---|---|
-| `src/V3Launchpad.sol` | `createToken(name, symbol[, metadata, salt])`: deploys the token (CREATE2, creator-scoped salt), creates + initializes the V3 pool at the configured launch price, mints the full supply as a single-sided range order with the `FeeLocker` as LP owner. `checkGraduation` is a permissionless price-milestone poke (cosmetic — nothing migrates). Handles pool pre-creation griefing safely. |
+| `src/V3Launchpad.sol` | `createToken(name, symbol[, metadata, salt])`: deploys the token (CREATE2, creator-scoped salt), creates + initializes the V3 pool at the configured launch price, mints the full supply as a single-sided range order with the `FeeLocker` as LP owner. `checkGraduation` is a permissionless poke that bonds a token once its pool has raised `graduationWethAmount` WETH (owner-settable; cosmetic — nothing migrates). Handles pool pre-creation griefing safely. |
 | `src/FeeLocker.sol` | Permanently holds every LP NFT. `claim(token)` (permissionless) collects pool fees: WETH → 50/50 treasury/dev, token side → burned. No liquidity-withdrawal path exists by construction. |
 | `src/LaunchToken.sol` | Vanilla OZ ERC20 + Burnable. Renounced, fixed supply. Carries creator metadata — logo (IPFS URI), website, Telegram, Discord, X — plus the platform site, immutable at creation, exposed as getters and via ERC-7572 `contractURI()` (validated at creation against JSON injection; emoji names fine). |
 | `src/interfaces/IUniswapV3.sol` | Minimal factory / pool / position-manager surfaces. |
@@ -32,7 +32,7 @@ Plus a **flat creation fee** of **0.000005 ETH** charged to the dev at `createTo
 | `initialPriceWethPerToken` | 1.491e9 wei | Launch price (~1.49 gwei/token) |
 | `feeTier` | 10 000 (1%) | The "1%/1% both ends" — enforced by the pool itself |
 | `tickLower0` / `tickUpper0` | −203 200 / 887 200 | Curve bounds (token0 orientation; mirrored automatically) |
-| `graduationPriceWethPerToken` | 15× launch price | Cosmetic milestone; drives `checkGraduation` and `curveProgress` |
+| `graduationWethAmount` | 4.6 WETH | WETH raised into the pool that bonds a token; **owner-settable** via `setGraduationWethAmount`; drives `checkGraduation` + `curveProgress` |
 
 ## Run it
 

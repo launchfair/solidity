@@ -27,7 +27,7 @@ contract Deploy is Script {
     uint24 constant FEE_TIER = 10_000; // 1% per swap
     int24 constant TICK_LOWER0 = -203_200;
     int24 constant TICK_UPPER0 = 887_200;
-    uint256 constant GRADUATION_PRICE = 15 * INITIAL_PRICE; // milestone at 15x launch
+    uint256 constant GRADUATION_WETH = 4.6 ether; // WETH raised into the pool that bonds a token
 
     // Default: anvil's well-known account 0, for local runs. Set PRIVATE_KEY for real deploys.
     uint256 constant ANVIL_KEY_0 = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
@@ -60,7 +60,7 @@ contract Deploy is Script {
                 tickUpper0: TICK_UPPER0,
                 tokenTotalSupply: TOTAL_SUPPLY,
                 initialPriceWethPerToken: INITIAL_PRICE,
-                graduationPriceWethPerToken: GRADUATION_PRICE,
+                graduationWethAmount: GRADUATION_WETH,
                 maxBuyBps: 200, // 2% wallet cap...
                 maxBuyBlocks: 360 // ...for the first 360 blocks
             }),

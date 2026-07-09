@@ -43,7 +43,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         int24 tickUpper0; // range end when token is token0
         uint128 tokenTotalSupply;
         uint256 initialPriceWethPerToken; // WETH wei per 1e18 token units at launch
-        uint256 graduationPriceWethPerToken; // milestone price (e.g. ~15x launch)
+        uint256 graduationWethAmount; // WETH raised into the pool that bonds/graduates a token
         uint16 maxBuyBps; // anti-sniper wallet cap during launch, e.g. 200 = 2% (0 = off)
         uint32 maxBuyBlocks; // how many blocks the cap lasts, e.g. 360 (0 = off)
     }
@@ -58,7 +58,10 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
     int24 public immutable tickUpper0;
     uint128 public immutable tokenTotalSupply;
     uint256 public immutable initialPriceWethPerToken;
-    uint256 public immutable graduationPriceWethPerToken;
+    /// @notice WETH raised into a token's pool that bonds/graduates it. Global
+    /// and owner-settable (setGraduationWethAmount) — the manual "weth to bond"
+    /// knob. Measured as WETH held by the pool (net of sells) since launch.
+    uint256 public graduationWethAmount;
     uint16 public immutable maxBuyBps;
     uint32 public immutable maxBuyBlocks;
 
@@ -83,9 +86,10 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         string symbol,
         LaunchToken.Metadata metadata
     );
-    event Graduated(address indexed token, address pool, uint160 sqrtPriceX96);
+    event Graduated(address indexed token, address pool, uint256 wethBonded);
     event CreatorTransferred(address indexed token, address indexed oldCreator, address indexed newCreator);
     event OfficialWebsiteSet(string website);
+    event GraduationWethAmountSet(uint256 amount);
     event CreationFeePaid(address indexed creator, address indexed token, uint256 fee);
     event CreationFeeSet(uint256 weiAmount);
 
@@ -94,7 +98,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
     error InvalidMetadata();
     error UnknownToken();
     error AlreadyGraduated();
-    error NotPastGraduationPrice();
+    error NotEnoughWethBonded();
     error PoolPriceUnsafe();
     error OnlyCreator();
     error InsufficientCreationFee();
@@ -116,7 +120,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         ) revert ZeroAddress();
         if (
             cfg.tokenTotalSupply == 0 || cfg.initialPriceWethPerToken == 0 || cfg.tickLower0 >= cfg.tickUpper0
-                || cfg.graduationPriceWethPerToken <= cfg.initialPriceWethPerToken || cfg.maxBuyBps > 10_000
+                || cfg.graduationWethAmount == 0 || cfg.maxBuyBps > 10_000
         ) revert InvalidPoolConfig();
 
         factory = factory_;
@@ -128,7 +132,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         tickUpper0 = cfg.tickUpper0;
         tokenTotalSupply = cfg.tokenTotalSupply;
         initialPriceWethPerToken = cfg.initialPriceWethPerToken;
-        graduationPriceWethPerToken = cfg.graduationPriceWethPerToken;
+        graduationWethAmount = cfg.graduationWethAmount;
         maxBuyBps = cfg.maxBuyBps;
         maxBuyBlocks = cfg.maxBuyBlocks;
         officialWebsite = officialWebsite_;
@@ -263,20 +267,19 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
     // ─────────────────────────────── graduation (gamification) ───────────────────
 
     /// @notice Permissionless milestone poke: marks the token graduated once the
-    /// pool price has crossed the graduation price. Purely cosmetic — liquidity
-    /// never moves; frontends/indexers use the event for badges and sorting.
+    /// pool has bonded at least `graduationWethAmount` of WETH (net of sells).
+    /// Purely cosmetic — liquidity never moves; frontends/indexers use the event
+    /// for badges and sorting.
     function checkGraduation(address token) external returns (bool graduated) {
         LaunchInfo storage info = _launches[token];
         if (info.creator == address(0)) revert UnknownToken();
         if (info.graduated) revert AlreadyGraduated();
 
-        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(info.pool).slot0();
-        uint160 target = _sqrtPriceX96For(graduationPriceWethPerToken, info.tokenIsToken0);
-        bool past = info.tokenIsToken0 ? sqrtPriceX96 >= target : sqrtPriceX96 <= target;
-        if (!past) revert NotPastGraduationPrice();
+        uint256 wethBonded = IERC20(weth).balanceOf(info.pool);
+        if (wethBonded < graduationWethAmount) revert NotEnoughWethBonded();
 
         info.graduated = true;
-        emit Graduated(token, info.pool, sqrtPriceX96);
+        emit Graduated(token, info.pool, wethBonded);
         return true;
     }
 
@@ -290,20 +293,19 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         return _launches[token].creator;
     }
 
-    /// @notice Bonding-curve progress toward graduation in bps (0 = launch
-    /// price, 10_000 = graduated). The single-sided range order IS a bonding
-    /// curve (a V3 position is mathematically a virtual-reserve constant
-    /// product curve); this is the progress bar for frontends.
+    /// @notice Bonding progress toward graduation in bps (0 = nothing bonded,
+    /// 10_000 = at/above graduationWethAmount). The progress bar for frontends,
+    /// measured against the WETH raised into the pool.
     function curveProgress(address token) external view returns (uint256 bps) {
         LaunchInfo storage info = _launches[token];
         if (info.creator == address(0)) revert UnknownToken();
         if (info.graduated) return 10_000;
 
-        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(info.pool).slot0();
-        uint256 price = _priceWethPerToken(sqrtPriceX96, info.tokenIsToken0);
-        if (price <= initialPriceWethPerToken) return 0;
-        if (price >= graduationPriceWethPerToken) return 10_000;
-        return ((price - initialPriceWethPerToken) * 10_000) / (graduationPriceWethPerToken - initialPriceWethPerToken);
+        uint256 grad = graduationWethAmount;
+        if (grad == 0) return 0;
+        uint256 wethBonded = IERC20(weth).balanceOf(info.pool);
+        if (wethBonded >= grad) return 10_000;
+        return (wethBonded * 10_000) / grad;
     }
 
     /// @notice Pool sqrt price encoding `priceWethPerToken` for either ordering.
@@ -315,16 +317,6 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
             ? Math.mulDiv(priceWethPerToken, 1 << 192, 1e18)
             : Math.mulDiv(1e18, 1 << 192, priceWethPerToken);
         return uint160(Math.sqrt(ratioX192));
-    }
-
-    /// @notice Decode a pool sqrt price back to WETH wei per 1e18 token units.
-    function _priceWethPerToken(uint160 sqrtPriceX96, bool tokenIsToken0) internal pure returns (uint256) {
-        if (tokenIsToken0) {
-            return Math.mulDiv(sqrtPriceX96, uint256(sqrtPriceX96) * 1e18, 1 << 192);
-        }
-        uint256 denom = Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96);
-        if (denom == 0) return type(uint256).max; // absurdly high token price; clamps to graduated
-        return Math.mulDiv(1 << 96, 1e18, denom);
     }
 
     // ─────────────────────────────────── admin ────────────────────────────────────
@@ -341,6 +333,15 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         if (weiAmount > MAX_CREATION_FEE_WEI) revert CreationFeeTooHigh();
         creationFeeWei = weiAmount;
         emit CreationFeeSet(weiAmount);
+    }
+
+    /// @notice Manually set the WETH-raised amount that bonds/graduates a token.
+    /// Global and owner-only; applies to all tokens' graduation + progress
+    /// checks immediately (affects existing tokens too).
+    function setGraduationWethAmount(uint256 amount) external onlyOwner {
+        if (amount == 0) revert InvalidPoolConfig();
+        graduationWethAmount = amount;
+        emit GraduationWethAmountSet(amount);
     }
 
     /// @notice Let a token's dev hand fee rights to a new address.
