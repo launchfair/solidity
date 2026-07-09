@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
+import {LaunchToken} from "./LaunchToken.sol";
+import {FeeLocker} from "./FeeLocker.sol";
+import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager} from "./interfaces/IUniswapV3.sol";
+
+/// @notice noxa-style hybrid launchpad: every token launches straight into a
+/// REAL Uniswap V3 pool as a single-sided range order (full supply), so DEX
+/// terminals (GMGN, DexScreener, ...) index it from block one — no bonding
+/// curve phase, no custom data integration needed.
+///
+/// - The LP NFT is minted directly to the FeeLocker and locked forever.
+/// - The pool's fee tier (e.g. 1%) replaces curve fees: buys pay WETH fees
+///   (50/50 treasury/dev via FeeLocker.claim), sells pay token fees (burned).
+/// - The single-sided position IS the bonding curve: a V3 range order is
+///   mathematically a virtual-reserve constant-product curve, so traders get
+///   the classic deterministic price ladder (see curveProgress) while
+///   terminals just see a normal pool.
+/// - "Graduation" is pure gamification: a permissionless milestone check that
+///   fires an event when the pool price crosses the graduation price. Nothing
+///   migrates; liquidity never moves.
+contract V3Launchpad is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    struct LaunchInfo {
+        address pool;
+        address creator; // the token's dev — receives the dev share of WETH fees
+        bool tokenIsToken0;
+        bool graduated;
+        uint256 positionTokenId;
+    }
+
+    struct PoolConfig {
+        uint24 feeTier; // e.g. 10_000 = 1% per swap, the "1%/1% both ends" analog
+        int24 tickLower0; // range start when token is token0 (must be > initial tick)
+        int24 tickUpper0; // range end when token is token0
+        uint128 tokenTotalSupply;
+        uint256 initialPriceWethPerToken; // WETH wei per 1e18 token units at launch
+        uint256 graduationPriceWethPerToken; // milestone price (e.g. ~15x launch)
+        uint16 maxBuyBps; // anti-sniper wallet cap during launch, e.g. 200 = 2% (0 = off)
+        uint32 maxBuyBlocks; // how many blocks the cap lasts, e.g. 360 (0 = off)
+    }
+
+    IUniswapV3Factory public immutable factory;
+    INonfungiblePositionManager public immutable positionManager;
+    FeeLocker public immutable locker;
+    address public immutable weth;
+
+    uint24 public immutable feeTier;
+    int24 public immutable tickLower0;
+    int24 public immutable tickUpper0;
+    uint128 public immutable tokenTotalSupply;
+    uint256 public immutable initialPriceWethPerToken;
+    uint256 public immutable graduationPriceWethPerToken;
+    uint16 public immutable maxBuyBps;
+    uint32 public immutable maxBuyBlocks;
+
+    /// @notice Platform website stamped into each token at creation.
+    string public officialWebsite;
+
+    /// @notice Flat fee (wei) charged to the dev at token creation and
+    /// forwarded to the treasury (locker.treasury()). Default 0.000005 ETH.
+    uint256 public creationFeeWei = 0.000005 ether;
+    /// @notice Hard cap so the owner can never set an abusive creation fee.
+    uint256 public constant MAX_CREATION_FEE_WEI = 0.001 ether;
+
+    mapping(address token => LaunchInfo) internal _launches;
+
+    event TokenLaunched(
+        address indexed token,
+        address indexed creator,
+        address pool,
+        uint256 positionTokenId,
+        bool tokenIsToken0,
+        string name,
+        string symbol,
+        LaunchToken.Metadata metadata
+    );
+    event Graduated(address indexed token, address pool, uint160 sqrtPriceX96);
+    event CreatorTransferred(address indexed token, address indexed oldCreator, address indexed newCreator);
+    event OfficialWebsiteSet(string website);
+    event CreationFeePaid(address indexed creator, address indexed token, uint256 fee);
+    event CreationFeeSet(uint256 weiAmount);
+
+    error ZeroAddress();
+    error InvalidPoolConfig();
+    error InvalidMetadata();
+    error UnknownToken();
+    error AlreadyGraduated();
+    error NotPastGraduationPrice();
+    error PoolPriceUnsafe();
+    error OnlyCreator();
+    error InsufficientCreationFee();
+    error CreationFeeTooHigh();
+    error CreationFeeTransferFailed();
+
+    constructor(
+        address owner_,
+        IUniswapV3Factory factory_,
+        INonfungiblePositionManager positionManager_,
+        FeeLocker locker_,
+        address weth_,
+        PoolConfig memory cfg,
+        string memory officialWebsite_
+    ) Ownable(owner_) {
+        if (
+            address(factory_) == address(0) || address(positionManager_) == address(0) || address(locker_) == address(0)
+                || weth_ == address(0)
+        ) revert ZeroAddress();
+        if (
+            cfg.tokenTotalSupply == 0 || cfg.initialPriceWethPerToken == 0 || cfg.tickLower0 >= cfg.tickUpper0
+                || cfg.graduationPriceWethPerToken <= cfg.initialPriceWethPerToken || cfg.maxBuyBps > 10_000
+        ) revert InvalidPoolConfig();
+
+        factory = factory_;
+        positionManager = positionManager_;
+        locker = locker_;
+        weth = weth_;
+        feeTier = cfg.feeTier;
+        tickLower0 = cfg.tickLower0;
+        tickUpper0 = cfg.tickUpper0;
+        tokenTotalSupply = cfg.tokenTotalSupply;
+        initialPriceWethPerToken = cfg.initialPriceWethPerToken;
+        graduationPriceWethPerToken = cfg.graduationPriceWethPerToken;
+        maxBuyBps = cfg.maxBuyBps;
+        maxBuyBlocks = cfg.maxBuyBlocks;
+        officialWebsite = officialWebsite_;
+    }
+
+    // ─────────────────────────────── token launch ───────────────────────────────
+
+    function createToken(string calldata name, string calldata symbol)
+        external
+        payable
+        nonReentrant
+        returns (address token)
+    {
+        LaunchToken.Metadata memory empty;
+        token = _createToken(name, symbol, empty, bytes32(0));
+    }
+
+    /// @param salt Client-chosen entropy. If a griefer poisons the predicted
+    /// pool (see below), retry with a fresh salt for a fresh token address.
+    function createToken(
+        string calldata name,
+        string calldata symbol,
+        LaunchToken.Metadata calldata metadata,
+        bytes32 salt
+    ) external payable nonReentrant returns (address token) {
+        token = _createToken(name, symbol, metadata, salt);
+    }
+
+    function _createToken(string memory name, string memory symbol, LaunchToken.Metadata memory metadata, bytes32 salt)
+        internal
+        returns (address token)
+    {
+        // Flat creation fee (charged in the native token, forwarded to treasury
+        // after the token is live; excess is refunded).
+        if (msg.value < creationFeeWei) revert InsufficientCreationFee();
+
+        _validateMetadataString(name);
+        _validateMetadataString(symbol);
+        _validateMetadataString(metadata.logoURI);
+        _validateMetadataString(metadata.website);
+        _validateMetadataString(metadata.telegram);
+        _validateMetadataString(metadata.discord);
+        _validateMetadataString(metadata.twitter);
+
+        // CREATE2 scoped to the creator: a griefer who poisons the pool of a
+        // predicted token address only blocks that one (creator, salt) combo,
+        // and each attack costs them more gas than the creator's retry.
+        token = address(
+            new LaunchToken{salt: keccak256(abi.encode(msg.sender, salt))}(
+                name, symbol, tokenTotalSupply, officialWebsite, metadata, maxBuyBps, maxBuyBlocks
+            )
+        );
+        // Exempt protocol plumbing from the launch guard before any transfers.
+        LaunchToken(token).setLimitExempt(address(positionManager), true);
+        LaunchToken(token).setLimitExempt(address(locker), true);
+
+        bool tokenIsToken0 = token < weth;
+        uint160 targetSqrtPriceX96 = _sqrtPriceX96For(initialPriceWethPerToken, tokenIsToken0);
+
+        // Handle third parties pre-creating (or pre-initializing) the pool:
+        // - not created           -> create + initialize at the launch price
+        // - created, uninitialized-> initialize at the launch price
+        // - initialized at/below our launch price -> harmless, the single-sided
+        //   order still mints entirely in tokens; proceed
+        // - initialized above it  -> the mint would need WETH we don't provide;
+        //   revert so the creator retries with a new salt
+        address pool = factory.getPool(token, weth, feeTier);
+        if (pool == address(0)) pool = factory.createPool(token, weth, feeTier);
+        LaunchToken(token).setLimitExempt(pool, true);
+        (uint160 currentSqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (currentSqrtPriceX96 == 0) {
+            IUniswapV3Pool(pool).initialize(targetSqrtPriceX96);
+        } else {
+            bool safe =
+                tokenIsToken0 ? currentSqrtPriceX96 <= targetSqrtPriceX96 : currentSqrtPriceX96 >= targetSqrtPriceX96;
+            if (!safe) revert PoolPriceUnsafe();
+        }
+
+        // Single-sided range order: the full supply sits just above the initial
+        // price; buyers pull tokens out, WETH accumulates into the position.
+        (int24 tickLower, int24 tickUpper) = tokenIsToken0 ? (tickLower0, tickUpper0) : (-tickUpper0, -tickLower0);
+
+        IERC20(token).forceApprove(address(positionManager), tokenTotalSupply);
+        (uint256 positionTokenId,, uint256 amount0Used, uint256 amount1Used) = positionManager.mint(
+            INonfungiblePositionManager.MintParams({
+                token0: tokenIsToken0 ? token : weth,
+                token1: tokenIsToken0 ? weth : token,
+                fee: feeTier,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                amount0Desired: tokenIsToken0 ? tokenTotalSupply : 0,
+                amount1Desired: tokenIsToken0 ? 0 : tokenTotalSupply,
+                amount0Min: 0, // pool is initialized atomically above; no price gap
+                amount1Min: 0,
+                recipient: address(locker),
+                deadline: block.timestamp
+            })
+        );
+        // solhint-disable-next-line no-unused-vars
+        (amount0Used, amount1Used); // amounts implied by the position; dust handled below
+
+        // Burn any rounding dust the position manager didn't take.
+        uint256 dust = IERC20(token).balanceOf(address(this));
+        if (dust > 0) LaunchToken(token).burn(dust);
+
+        _launches[token] = LaunchInfo({
+            pool: pool,
+            creator: msg.sender,
+            tokenIsToken0: tokenIsToken0,
+            graduated: false,
+            positionTokenId: positionTokenId
+        });
+        locker.register(token, positionTokenId, tokenIsToken0);
+
+        emit TokenLaunched(token, msg.sender, pool, positionTokenId, tokenIsToken0, name, symbol, metadata);
+
+        // Collect the flat creation fee to the treasury; refund any overpayment.
+        // Done last (CEI) and guarded by nonReentrant on the external entrypoints.
+        uint256 fee = creationFeeWei;
+        if (fee > 0) {
+            (bool okFee,) = locker.treasury().call{value: fee}("");
+            if (!okFee) revert CreationFeeTransferFailed();
+            emit CreationFeePaid(msg.sender, token, fee);
+        }
+        uint256 refund = msg.value - fee;
+        if (refund > 0) {
+            (bool okRefund,) = msg.sender.call{value: refund}("");
+            if (!okRefund) revert CreationFeeTransferFailed();
+        }
+    }
+
+    // ─────────────────────────────── graduation (gamification) ───────────────────
+
+    /// @notice Permissionless milestone poke: marks the token graduated once the
+    /// pool price has crossed the graduation price. Purely cosmetic — liquidity
+    /// never moves; frontends/indexers use the event for badges and sorting.
+    function checkGraduation(address token) external returns (bool graduated) {
+        LaunchInfo storage info = _launches[token];
+        if (info.creator == address(0)) revert UnknownToken();
+        if (info.graduated) revert AlreadyGraduated();
+
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(info.pool).slot0();
+        uint160 target = _sqrtPriceX96For(graduationPriceWethPerToken, info.tokenIsToken0);
+        bool past = info.tokenIsToken0 ? sqrtPriceX96 >= target : sqrtPriceX96 <= target;
+        if (!past) revert NotPastGraduationPrice();
+
+        info.graduated = true;
+        emit Graduated(token, info.pool, sqrtPriceX96);
+        return true;
+    }
+
+    // ──────────────────────────────────── views ───────────────────────────────────
+
+    function getLaunch(address token) external view returns (LaunchInfo memory) {
+        return _launches[token];
+    }
+
+    function creatorOf(address token) external view returns (address) {
+        return _launches[token].creator;
+    }
+
+    /// @notice Bonding-curve progress toward graduation in bps (0 = launch
+    /// price, 10_000 = graduated). The single-sided range order IS a bonding
+    /// curve (a V3 position is mathematically a virtual-reserve constant
+    /// product curve); this is the progress bar for frontends.
+    function curveProgress(address token) external view returns (uint256 bps) {
+        LaunchInfo storage info = _launches[token];
+        if (info.creator == address(0)) revert UnknownToken();
+        if (info.graduated) return 10_000;
+
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(info.pool).slot0();
+        uint256 price = _priceWethPerToken(sqrtPriceX96, info.tokenIsToken0);
+        if (price <= initialPriceWethPerToken) return 0;
+        if (price >= graduationPriceWethPerToken) return 10_000;
+        return ((price - initialPriceWethPerToken) * 10_000) / (graduationPriceWethPerToken - initialPriceWethPerToken);
+    }
+
+    /// @notice Pool sqrt price encoding `priceWethPerToken` for either ordering.
+    function _sqrtPriceX96For(uint256 priceWethPerToken, bool tokenIsToken0) internal pure returns (uint160) {
+        // pool price = token1 raw units per token0 raw unit
+        // tokenIsToken0:  price = priceWethPerToken / 1e18
+        // else (inverted): price = 1e18 / priceWethPerToken
+        uint256 ratioX192 = tokenIsToken0
+            ? Math.mulDiv(priceWethPerToken, 1 << 192, 1e18)
+            : Math.mulDiv(1e18, 1 << 192, priceWethPerToken);
+        return uint160(Math.sqrt(ratioX192));
+    }
+
+    /// @notice Decode a pool sqrt price back to WETH wei per 1e18 token units.
+    function _priceWethPerToken(uint160 sqrtPriceX96, bool tokenIsToken0) internal pure returns (uint256) {
+        if (tokenIsToken0) {
+            return Math.mulDiv(sqrtPriceX96, uint256(sqrtPriceX96) * 1e18, 1 << 192);
+        }
+        uint256 denom = Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96);
+        if (denom == 0) return type(uint256).max; // absurdly high token price; clamps to graduated
+        return Math.mulDiv(1 << 96, 1e18, denom);
+    }
+
+    // ─────────────────────────────────── admin ────────────────────────────────────
+
+    /// @notice Update the platform website stamped into FUTURE tokens.
+    function setOfficialWebsite(string calldata website_) external onlyOwner {
+        officialWebsite = website_;
+        emit OfficialWebsiteSet(website_);
+    }
+
+    /// @notice Update the flat creation fee (capped at MAX_CREATION_FEE_WEI).
+    /// Applies to future creations; the destination is always locker.treasury().
+    function setCreationFee(uint256 weiAmount) external onlyOwner {
+        if (weiAmount > MAX_CREATION_FEE_WEI) revert CreationFeeTooHigh();
+        creationFeeWei = weiAmount;
+        emit CreationFeeSet(weiAmount);
+    }
+
+    /// @notice Let a token's dev hand fee rights to a new address.
+    function transferCreator(address token, address newCreator) external {
+        LaunchInfo storage info = _launches[token];
+        if (msg.sender != info.creator) revert OnlyCreator();
+        if (newCreator == address(0)) revert ZeroAddress();
+        emit CreatorTransferred(token, info.creator, newCreator);
+        info.creator = newCreator;
+    }
+
+    // ────────────────────────────────── internals ─────────────────────────────────
+
+    /// @dev Allows any UTF-8 (emoji included); rejects only `"`, `\` and
+    /// control characters, which could inject into contractURI() JSON.
+    function _validateMetadataString(string memory s) internal pure {
+        bytes memory b = bytes(s);
+        if (b.length > 256) revert InvalidMetadata();
+        for (uint256 i = 0; i < b.length; i++) {
+            bytes1 ch = b[i];
+            if (ch < 0x20 || ch == 0x22 || ch == 0x5C) revert InvalidMetadata();
+        }
+    }
+}
