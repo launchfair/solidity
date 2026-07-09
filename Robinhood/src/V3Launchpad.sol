@@ -35,6 +35,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         bool tokenIsToken0;
         bool graduated;
         uint256 positionTokenId;
+        uint256 graduationWethAmount; // WETH-to-bond, snapshotted at creation (never retroactive)
     }
 
     struct PoolConfig {
@@ -58,10 +59,11 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
     int24 public immutable tickUpper0;
     uint128 public immutable tokenTotalSupply;
     uint256 public immutable initialPriceWethPerToken;
-    /// @notice WETH raised into a token's pool that bonds/graduates it. Global
-    /// and owner-settable (setGraduationWethAmount) — the manual "weth to bond"
-    /// knob. Measured as WETH held by the pool (net of sells) since launch.
-    uint256 public graduationWethAmount;
+    /// @notice Default WETH-to-bond for NEW tokens — the manual "weth to bond"
+    /// knob. Owner-settable (setGraduationWethAmount) but changes ONLY affect
+    /// future tokens: each token snapshots its own target at creation, so a
+    /// change is never retroactive. Measured as WETH held by the pool.
+    uint256 public defaultGraduationWethAmount;
     uint16 public immutable maxBuyBps;
     uint32 public immutable maxBuyBlocks;
 
@@ -132,7 +134,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         tickUpper0 = cfg.tickUpper0;
         tokenTotalSupply = cfg.tokenTotalSupply;
         initialPriceWethPerToken = cfg.initialPriceWethPerToken;
-        graduationWethAmount = cfg.graduationWethAmount;
+        defaultGraduationWethAmount = cfg.graduationWethAmount;
         maxBuyBps = cfg.maxBuyBps;
         maxBuyBlocks = cfg.maxBuyBlocks;
         officialWebsite = officialWebsite_;
@@ -243,7 +245,8 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
             creator: msg.sender,
             tokenIsToken0: tokenIsToken0,
             graduated: false,
-            positionTokenId: positionTokenId
+            positionTokenId: positionTokenId,
+            graduationWethAmount: defaultGraduationWethAmount // frozen for this token
         });
         locker.register(token, positionTokenId, tokenIsToken0);
 
@@ -276,7 +279,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         if (info.graduated) revert AlreadyGraduated();
 
         uint256 wethBonded = IERC20(weth).balanceOf(info.pool);
-        if (wethBonded < graduationWethAmount) revert NotEnoughWethBonded();
+        if (wethBonded < info.graduationWethAmount) revert NotEnoughWethBonded();
 
         info.graduated = true;
         emit Graduated(token, info.pool, wethBonded);
@@ -301,7 +304,7 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         if (info.creator == address(0)) revert UnknownToken();
         if (info.graduated) return 10_000;
 
-        uint256 grad = graduationWethAmount;
+        uint256 grad = info.graduationWethAmount;
         if (grad == 0) return 0;
         uint256 wethBonded = IERC20(weth).balanceOf(info.pool);
         if (wethBonded >= grad) return 10_000;
@@ -335,12 +338,11 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
         emit CreationFeeSet(weiAmount);
     }
 
-    /// @notice Manually set the WETH-raised amount that bonds/graduates a token.
-    /// Global and owner-only; applies to all tokens' graduation + progress
-    /// checks immediately (affects existing tokens too).
+    /// @notice Manually set the default WETH-to-bond for FUTURE tokens. Existing
+    /// tokens keep the target snapshotted at their creation — never retroactive.
     function setGraduationWethAmount(uint256 amount) external onlyOwner {
         if (amount == 0) revert InvalidPoolConfig();
-        graduationWethAmount = amount;
+        defaultGraduationWethAmount = amount;
         emit GraduationWethAmountSet(amount);
     }
 

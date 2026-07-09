@@ -86,7 +86,7 @@ contract Demo is Script {
         // Buyers bond WETH into the pool -> once it passes graduationWethAmount,
         // anyone can flag graduation. (Here we simulate 1.5 WETH bonded.)
         console2.log("Curve progress (bps):", pad.curveProgress(token));
-        console2.log("Graduation WETH target:", pad.graduationWethAmount());
+        console2.log("Graduation WETH target (this token):", pad.getLaunch(token).graduationWethAmount);
         weth.deposit{value: 1.5 ether}();
         weth.transfer(info.pool, 1.5 ether);
         console2.log("Curve progress after 1.5 WETH bonded (bps):", pad.curveProgress(token));

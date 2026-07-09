@@ -181,7 +181,7 @@ abstract contract V3LaunchpadTestBase is Test {
 
     function test_graduation_atWethTarget() public {
         V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
-        assertEq(pad.graduationWethAmount(), GRAD_WETH);
+        assertEq(info.graduationWethAmount, GRAD_WETH);
 
         // Below the WETH target: not bonded yet.
         _bondWeth(info.pool, GRAD_WETH - 1);
@@ -202,15 +202,29 @@ abstract contract V3LaunchpadTestBase is Test {
         assertEq(tokenId, info.positionTokenId);
     }
 
-    function test_setGraduationWethAmount_ownerOnly() public {
+    /// The bond target is snapshotted per token at creation — owner changes only
+    /// affect future tokens, never existing ones.
+    function test_setGraduationWethAmount_futureOnly() public {
+        assertEq(pad.getLaunch(token).graduationWethAmount, GRAD_WETH);
+        assertEq(pad.defaultGraduationWethAmount(), GRAD_WETH);
+
+        // Owner raises the default.
         vm.prank(owner);
         pad.setGraduationWethAmount(2 ether);
-        assertEq(pad.graduationWethAmount(), 2 ether);
+        assertEq(pad.defaultGraduationWethAmount(), 2 ether);
 
+        // Existing token is UNCHANGED (not retroactive).
+        assertEq(pad.getLaunch(token).graduationWethAmount, GRAD_WETH);
+
+        // A token created afterwards picks up the new default.
+        vm.prank(creator);
+        address token2 = pad.createToken{value: CREATION_FEE}("Later", "LTR");
+        assertEq(pad.getLaunch(token2).graduationWethAmount, 2 ether);
+
+        // Guards: reject 0, owner-only.
         vm.prank(owner);
         vm.expectRevert(V3Launchpad.InvalidPoolConfig.selector);
         pad.setGraduationWethAmount(0);
-
         vm.prank(alice);
         vm.expectRevert();
         pad.setGraduationWethAmount(1 ether);
