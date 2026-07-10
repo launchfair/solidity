@@ -156,4 +156,23 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(token.totalBurned(), out, "burned == bought back");
         assertEq(token.totalSupply(), supplyBefore - out, "supply reduced");
     }
+
+    function test_payoutThreshold_gatesProcess() public {
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
+        _setupPoolAndDistributor(token);
+        dist.setPayoutThreshold(address(token), 5 ether); // registrar (this) sets it
+
+        // Below threshold → not ready, process reverts.
+        weth.mint(address(dist), 3 ether);
+        dist.notify(address(token), 3 ether);
+        assertFalse(dist.readyToProcess(address(token)), "below threshold");
+        vm.expectRevert(LaunchFairV4Distributor.BelowThreshold.selector);
+        dist.process(address(token), 0);
+
+        // Cross the threshold → ready, process fires.
+        weth.mint(address(dist), 3 ether);
+        dist.notify(address(token), 3 ether); // 6 >= 5
+        assertTrue(dist.readyToProcess(address(token)), "threshold crossed");
+        assertGt(dist.process(address(token), 0), 0, "payout fired");
+    }
 }

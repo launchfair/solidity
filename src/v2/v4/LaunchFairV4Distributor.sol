@@ -17,6 +17,10 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 
+interface ICreatorRegistryV4 {
+    function creatorOf(address token) external view returns (address);
+}
+
 /// @notice Turns each mode token's accrued buy-side WETH fees into holder rewards
 /// on Uniswap V4. The V4 FeeLocker forwards the mechanism's WETH here; a
 /// permissionless `process(token)` buys the token's reward asset on its V4 pool
@@ -34,11 +38,15 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     mapping(address token => PoolKey) internal _buyback; // V4 pool to buy the asset on
     mapping(address token => bool) public registered;
     mapping(address token => uint256) public pendingWeth;
+    /// @notice Dev-set minimum pending WETH before a payout fires (anti-dust; the
+    /// keeper only processes once it's crossed). 0 = fire on any pending.
+    mapping(address token => uint256) public payoutThreshold;
 
     event LockerSet(address locker);
     event BuybackRegistered(address indexed token);
     event Notified(address indexed token, uint256 amount, uint256 pending);
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
+    event PayoutThresholdSet(address indexed token, uint256 threshold);
 
     error OnlyLocker();
     error OnlyRegistrar();
@@ -46,6 +54,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     error LockerAlreadySet();
     error NotRegistered();
     error NothingPending();
+    error BelowThreshold();
+    error NotAuthorized();
     error WrongMode();
     error Slippage();
     error ZeroAddress();
@@ -79,11 +89,34 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         emit Notified(token, amount, pendingWeth[token]);
     }
 
+    /// @notice The token's dev (creator) — or the launchpad — sets the minimum
+    /// pending WETH that must accrue before a payout fires.
+    function setPayoutThreshold(address token, uint256 amount) external {
+        if (msg.sender != registrar && msg.sender != _creator(token)) revert NotAuthorized();
+        payoutThreshold[token] = amount;
+        emit PayoutThresholdSet(token, amount);
+    }
+
+    /// @notice True when a payout would succeed — the keeper polls/reacts on this.
+    function readyToProcess(address token) external view returns (bool) {
+        uint256 p = pendingWeth[token];
+        return registered[token] && p > 0 && p >= payoutThreshold[token];
+    }
+
+    function _creator(address token) internal view returns (address) {
+        try ICreatorRegistryV4(registrar).creatorOf(token) returns (address c) {
+            return c;
+        } catch {
+            return address(0);
+        }
+    }
+
     /// @notice Permissionless: buy the token's reward asset with its pending WETH
     /// and distribute (Reward/Redistribute) or burn (Burn). `minOut` guards slippage.
     function process(address token, uint256 minOut) external nonReentrant returns (uint256 out) {
         uint256 wethIn = pendingWeth[token];
         if (wethIn == 0) revert NothingPending();
+        if (wethIn < payoutThreshold[token]) revert BelowThreshold();
         if (!registered[token]) revert NotRegistered();
         LaunchTokenV2.Mode m = LaunchTokenV2(token).mode();
         if (m == LaunchTokenV2.Mode.Base) revert WrongMode();
