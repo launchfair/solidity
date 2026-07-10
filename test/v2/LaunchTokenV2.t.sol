@@ -210,6 +210,22 @@ contract LaunchTokenV2Test is Test {
         LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Base, address(0));
         assertEq(t.VERSION(), "LaunchFair V2");
         assertEq(t.url(), "https://hood.launchfair.app");
+        assertEq(t.platformSite(), "https://hood.launchfair.app");
         assertEq(t.owner(), address(0), "renounced");
+
+        // contractURI is now a PLAIN, bot-readable https URL (not base64).
+        string memory uri = t.contractURI();
+        assertTrue(_startsWith(uri, "https://hood.launchfair.app/token/0x"), "plain URL");
+        assertFalse(_startsWith(uri, "data:"), "no base64 data URI");
+    }
+
+    function _startsWith(string memory s, string memory p) internal pure returns (bool) {
+        bytes memory sb = bytes(s);
+        bytes memory pb = bytes(p);
+        if (sb.length < pb.length) return false;
+        for (uint256 i = 0; i < pb.length; i++) {
+            if (sb[i] != pb[i]) return false;
+        }
+        return true;
     }
 }

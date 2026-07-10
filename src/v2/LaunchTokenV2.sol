@@ -16,7 +16,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /// @notice LaunchFair V2 token: base fair-launch mechanics plus an optional,
 /// V3-safe dividend tracker (Reward/Increasing) or buyback-burn (Burn).
@@ -283,32 +283,18 @@ contract LaunchTokenV2 is ERC20Burnable {
         return processAccount(msg.sender);
     }
 
-    // ── ERC-7572 contract metadata (with mode/version + site) ────────────────
+    /// @notice ERC-7572 contract metadata as a PLAIN, bot-readable https URL — no
+    /// base64 to decode. Points at the token's page on the platform
+    /// (`<platformWebsite>/token/<address>`), which carries Open Graph
+    /// name/image/description tags. Every field (name/symbol/socials/
+    /// platformWebsite) is ALSO a plain public getter, so bots can read everything
+    /// directly on-chain without even fetching the URL.
     function contractURI() external view returns (string memory) {
-        string memory link = bytes(website).length > 0 ? website : platformWebsite;
-        string memory json = string.concat(
-            '{"name":"',
-            name(),
-            '","symbol":"',
-            symbol(),
-            '","image":"',
-            logoURI,
-            '","external_link":"',
-            link,
-            '","extensions":{"website":"',
-            website,
-            '","telegram":"',
-            telegram,
-            '","discord":"',
-            discord,
-            '","x":"',
-            twitter,
-            '","platform_website":"',
-            platformWebsite,
-            '","launchfair_version":"',
-            VERSION,
-            '"}}'
-        );
-        return string.concat("data:application/json;base64,", Base64.encode(bytes(json)));
+        return string.concat(platformWebsite, "/token/", Strings.toHexString(uint256(uint160(address(this))), 20));
+    }
+
+    /// @notice The platform's site — a plain getter for bots/terminals.
+    function platformSite() external view returns (string memory) {
+        return platformWebsite;
     }
 }
