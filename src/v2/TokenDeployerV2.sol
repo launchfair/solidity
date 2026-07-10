@@ -22,6 +22,7 @@ contract TokenDeployerV2 {
         LaunchTokenV2.Mode mode;
         address rewardToken;
         address rewardPool;
+        uint256 minHoldForRewards;
     }
 
     /// @dev CREATE2 with the launchpad-chosen `salt`; `launchpad_` is the caller
@@ -40,6 +41,7 @@ contract TokenDeployerV2 {
                 p.mode,
                 p.rewardToken,
                 p.rewardPool,
+                p.minHoldForRewards,
                 msg.sender
             )
         );

@@ -28,8 +28,12 @@ contract LaunchTokenV2Test is Test {
     }
 
     function _deploy(LaunchTokenV2.Mode mode, address reward) internal returns (LaunchTokenV2 t) {
+        t = _deployMin(mode, reward, 0);
+    }
+
+    function _deployMin(LaunchTokenV2.Mode mode, address reward, uint256 minHold) internal returns (LaunchTokenV2 t) {
         t = new LaunchTokenV2(
-            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, reward, address(0), address(this)
+            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, reward, address(0), minHold, address(this)
         );
         t.excludeFromDividends(POOL, true); // simulate excluding the pool
     }
@@ -120,6 +124,33 @@ contract LaunchTokenV2Test is Test {
         t.fundRewards(400 ether);
         assertApproxEqAbs(t.withdrawableDividendOf(A), 750 ether, 100, "A gains nothing (0 balance)");
         assertApproxEqAbs(t.withdrawableDividendOf(B), 650 ether, 100, "B: 250 + 400");
+    }
+
+    function test_reward_minimumHold() public {
+        MockERC20 reward = new MockERC20("Reward", "RWD");
+        LaunchTokenV2 t = _deployMin(LaunchTokenV2.Mode.Reward, address(reward), 200_000 ether);
+        t.transfer(POOL, SUPPLY);
+        vm.prank(POOL);
+        t.transfer(A, 300_000 ether); // >= min → eligible
+        vm.prank(POOL);
+        t.transfer(B, 100_000 ether); // < min → NOT eligible
+        assertEq(t.totalShares(), 300_000 ether, "only A counts");
+
+        reward.mint(address(this), 1_000 ether);
+        reward.approve(address(t), 1_000 ether);
+        t.fundRewards(1_000 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(A), 1_000 ether, 100, "A gets all (B below min)");
+        assertEq(t.withdrawableDividendOf(B), 0, "B earns nothing below min");
+
+        // B tops up above the minimum → eligible for FUTURE rewards only.
+        vm.prank(POOL);
+        t.transfer(B, 150_000 ether); // B now 250k
+        assertEq(t.totalShares(), 550_000 ether, "B now counts");
+        reward.mint(address(this), 550 ether);
+        reward.approve(address(t), 550 ether);
+        t.fundRewards(550 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(B), 250 ether, 100, "B earns on the new round");
+        assertEq(t.withdrawableDividendOf(B) < 251 ether, true, "no retroactive earnings");
     }
 
     function test_excludedAccountDoesNotAccrue() public {

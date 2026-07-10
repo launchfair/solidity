@@ -143,9 +143,10 @@ contract LaunchFairV2 is Ownable, ReentrancyGuard {
         LaunchTokenV2.Metadata calldata metadata,
         bytes32 salt,
         LaunchTokenV2.Mode mode,
-        address rewardToken
+        address rewardToken,
+        uint256 minHold
     ) external payable nonReentrant returns (address token) {
-        token = _createToken(name, symbol, metadata, salt, mode, rewardToken, 0, 0);
+        token = _createToken(name, symbol, metadata, salt, mode, rewardToken, minHold, 0, 0);
     }
 
     function createAndBuy(
@@ -155,10 +156,11 @@ contract LaunchFairV2 is Ownable, ReentrancyGuard {
         bytes32 salt,
         LaunchTokenV2.Mode mode,
         address rewardToken,
+        uint256 minHold,
         uint256 minTokensOut
     ) external payable nonReentrant returns (address token) {
         if (msg.value <= creationFeeWei) revert InsufficientCreationFee();
-        token = _createToken(name, symbol, metadata, salt, mode, rewardToken, msg.value - creationFeeWei, minTokensOut);
+        token = _createToken(name, symbol, metadata, salt, mode, rewardToken, minHold, msg.value - creationFeeWei, minTokensOut);
     }
 
     function _createToken(
@@ -168,6 +170,7 @@ contract LaunchFairV2 is Ownable, ReentrancyGuard {
         bytes32 salt,
         LaunchTokenV2.Mode mode,
         address rewardToken,
+        uint256 minHold,
         uint256 devBuyWei,
         uint256 minTokensOut
     ) internal returns (address token) {
@@ -200,7 +203,8 @@ contract LaunchFairV2 is Ownable, ReentrancyGuard {
                 maxBuyBlocks: maxBuyBlocks,
                 mode: mode,
                 rewardToken: rewardToken,
-                rewardPool: rewardPool
+                rewardPool: rewardPool,
+                minHoldForRewards: minHold
             }),
             keccak256(abi.encode(msg.sender, salt))
         );

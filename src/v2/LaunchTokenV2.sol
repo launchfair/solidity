@@ -62,6 +62,10 @@ contract LaunchTokenV2 is ERC20Burnable {
     /// @notice This token's own WETH pool (buyback venue for Increasing/Burn).
     /// Set once by the launchpad right after the pool is created.
     address public pool;
+    /// @notice Minimum balance a holder must keep to earn rewards (dev-set at
+    /// creation; 0 = no minimum). Below it an account accrues nothing until it
+    /// tops back up — keeps dust wallets out and cheapens the keeper's pushes.
+    uint256 public immutable minHoldForRewards;
 
     // ── launch guard (unchanged from V1) ─────────────────────────────────────
     uint256 public immutable maxWalletAmount;
@@ -112,6 +116,7 @@ contract LaunchTokenV2 is ERC20Burnable {
         Mode mode_,
         address rewardToken_,
         address rewardPool_,
+        uint256 minHoldForRewards_,
         address launchpad_
     ) ERC20(name_, symbol_) {
         launchpad = launchpad_;
@@ -126,6 +131,7 @@ contract LaunchTokenV2 is ERC20Burnable {
         mode = mode_;
         rewardToken = rewardToken_;
         rewardPool = rewardPool_;
+        minHoldForRewards = minHoldForRewards_;
 
         // Plumbing never earns dividends. The launchpad (msg.sender) holds the
         // full supply only momentarily before it goes into the pool; pool / PM /
@@ -192,7 +198,9 @@ contract LaunchTokenV2 is ERC20Burnable {
 
     // ── dividend accounting ──────────────────────────────────────────────────
     function _syncShare(address account) internal {
-        uint256 newShare = excludedFromDividends[account] ? 0 : balanceOf(account);
+        uint256 bal = balanceOf(account);
+        // Below the dev-set minimum (or excluded) → no share, earns nothing.
+        uint256 newShare = (excludedFromDividends[account] || bal < minHoldForRewards) ? 0 : bal;
         uint256 old = shareOf[account];
         if (newShare == old) return;
         if (newShare > old) {
