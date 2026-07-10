@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// ██╗      █████╗ ██╗   ██╗███╗   ██╗ ██████╗██╗  ██╗███████╗ █████╗ ██╗██████╗
 // LaunchFair V2 — https://hood.launchfair.app
 // Every token of this contract is launched exclusively through LaunchFair V2 at
 // https://hood.launchfair.app (traceable on-chain via `website()` and the
@@ -57,6 +56,12 @@ contract LaunchTokenV2 is ERC20Burnable {
     /// @notice For Reward mode, the external token holders earn. Zero otherwise.
     /// For Increasing mode the distributed asset is THIS token (address(this)).
     address public immutable rewardToken;
+    /// @notice The reward token's WETH pool (Reward mode) — where the keeper
+    /// buys the reward token. Validated by the launchpad at creation.
+    address public immutable rewardPool;
+    /// @notice This token's own WETH pool (buyback venue for Increasing/Burn).
+    /// Set once by the launchpad right after the pool is created.
+    address public pool;
 
     // ── launch guard (unchanged from V1) ─────────────────────────────────────
     uint256 public immutable maxWalletAmount;
@@ -105,7 +110,8 @@ contract LaunchTokenV2 is ERC20Burnable {
         uint16 maxBuyBps_,
         uint32 maxBuyBlocks_,
         Mode mode_,
-        address rewardToken_
+        address rewardToken_,
+        address rewardPool_
     ) ERC20(name_, symbol_) {
         launchpad = msg.sender;
         platformWebsite = platformWebsite_;
@@ -118,6 +124,7 @@ contract LaunchTokenV2 is ERC20Burnable {
         limitEndBlock = maxBuyBlocks_ == 0 ? 0 : block.number + maxBuyBlocks_;
         mode = mode_;
         rewardToken = rewardToken_;
+        rewardPool = rewardPool_;
 
         // Plumbing never earns dividends. The launchpad (msg.sender) holds the
         // full supply only momentarily before it goes into the pool; pool / PM /
@@ -150,6 +157,13 @@ contract LaunchTokenV2 is ERC20Burnable {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
         limitExempt[account] = exempt;
         emit LimitExemptSet(account, exempt);
+    }
+
+    /// @notice Launchpad-only; records this token's own WETH pool (once) so the
+    /// distributor knows where to buy back for Increasing/Burn.
+    function setPool(address pool_) external {
+        if (msg.sender != launchpad) revert OnlyLaunchpad();
+        if (pool == address(0)) pool = pool_;
     }
 
     /// @notice Launchpad-only; exclude protocol plumbing from dividends.

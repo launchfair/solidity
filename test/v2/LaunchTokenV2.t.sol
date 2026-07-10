@@ -29,7 +29,7 @@ contract LaunchTokenV2Test is Test {
 
     function _deploy(LaunchTokenV2.Mode mode, address reward) internal returns (LaunchTokenV2 t) {
         t = new LaunchTokenV2(
-            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, reward
+            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, reward, address(0)
         );
         t.excludeFromDividends(POOL, true); // simulate excluding the pool
     }
