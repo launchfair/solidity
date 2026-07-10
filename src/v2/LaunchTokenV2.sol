@@ -119,10 +119,13 @@ contract LaunchTokenV2 is ERC20Burnable {
         mode = mode_;
         rewardToken = rewardToken_;
 
-        // Plumbing never earns dividends. Pool/PM/locker/distributor are added
-        // by the launchpad post-creation via excludeFromDividends().
+        // Plumbing never earns dividends. The launchpad (msg.sender) holds the
+        // full supply only momentarily before it goes into the pool; pool / PM /
+        // locker / distributor are excluded by the launchpad post-creation via
+        // excludeFromDividends().
         excludedFromDividends[address(this)] = true;
         excludedFromDividends[address(0)] = true;
+        excludedFromDividends[msg.sender] = true;
         limitExempt[msg.sender] = true;
 
         _mint(msg.sender, supply_);
