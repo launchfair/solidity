@@ -5,7 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 
-/// @notice ERC20 launched straight into a Uniswap V3 pool (noxa-style hybrid).
+/// @notice ERC20 launched straight into a Uniswap V3 pool (V3 single-sided hybrid).
 /// Freely transferable from creation — the pool IS the market from block one,
 /// which is what makes the token visible to every DEX terminal without paid
 /// data integrations. No owner, no mint, no fee knobs, no blacklist.

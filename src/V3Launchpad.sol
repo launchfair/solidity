@@ -11,7 +11,7 @@ import {LaunchToken} from "./LaunchToken.sol";
 import {FeeLocker} from "./FeeLocker.sol";
 import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager, IWETH} from "./interfaces/IUniswapV3.sol";
 
-/// @notice noxa-style hybrid launchpad: every token launches straight into a
+/// @notice V3 single-sided hybrid launchpad: every token launches straight into a
 /// REAL Uniswap V3 pool as a single-sided range order (full supply), so DEX
 /// terminals (GMGN, DexScreener, ...) index it from block one — no bonding
 /// curve phase, no custom data integration needed.

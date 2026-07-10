@@ -129,7 +129,7 @@ tokens are attributed to the site on-chain without off-chain submission.
 1. **Contracts + Foundry tests** — modes, dividend tracker, fee routing, keeper
    entrypoints. Test both token/WETH orderings; test pool/router exclusion; test
    treasury always paid. *No deploy until green.*
-2. **Keeper** — standalone service (like `noxa-listener`), swaps + distributes.
+2. **Keeper** — standalone service, swaps + distributes.
 3. **API** — index modes + metrics, expose fields + claimable.
 4. **Frontend** — create-mode UI + token-page rewards/claim.
 5. **Deploy + verify** new launchpad; migrate defaults; (ideally) external review.

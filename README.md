@@ -1,6 +1,6 @@
-# Fun Launchpad — V3 hybrid (noxa-style)
+# LaunchFair — V3 hybrid launchpad
 
-A token launchpad in the model of [fun.noxa.fi](https://fun.noxa.fi/): every token launches **straight into a real Uniswap V3 pool** as a single-sided range order, with the LP locked forever. Because the market is a normal V3 pool from block one, DEX terminals (GMGN, DexScreener, GeckoTerminal, …) index it automatically — no paid data integrations.
+A token launchpad where every token launches **straight into a real Uniswap V3 pool** as a single-sided range order, with the LP locked forever. Because the market is a normal V3 pool from block one, DEX terminals (GMGN, DexScreener, GeckoTerminal, …) index it automatically — no paid data integrations.
 
 **The curve is still here.** A single-sided V3 range order *is* a bonding curve — mathematically identical to a pump.fun-style virtual-reserve constant-product curve. All supply sits above the launch price, so price only moves by buyers walking it up a deterministic ladder. A token **bonds/graduates once `graduationWethAmount` of WETH has been raised into its pool** (net of sells, measured as `WETH.balanceOf(pool)`). Each token **snapshots its bond target at creation** from `defaultGraduationWethAmount` — the manual "WETH to bond" knob (`setGraduationWethAmount`, owner-settable). Changing it only affects **future** tokens; existing tokens keep the target they launched with (never retroactive). `V3Launchpad.curveProgress(token)` returns progress toward it in bps (0–10 000) for the frontend progress bar. The only differences from a standalone curve: it lives inside the pool (that's what makes it indexable), it never "sells out" (price can keep climbing past graduation), and there's no transfer lock.
 
