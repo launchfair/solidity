@@ -62,12 +62,31 @@ contract LaunchFairFeeLockerV2 is Ownable, ReentrancyGuard {
         uint8 mode,
         address caller,
         uint256 wethToTreasury,
-        uint256 creatorHalf,
+        uint256 wethToDev,
+        uint256 wethToMechanism,
         uint256 tokensBurned
     );
     event TreasurySet(address treasury);
     event LaunchpadSet(address launchpad);
     event DistributorSet(address distributor);
+    event ModeSplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps);
+
+    /// @notice WETH split for MODE tokens (Reward/Increasing/Burn), owner-tunable
+    /// and applied at claim time. treasury + dev + mechanism = 10000. The rest
+    /// (mechanism) funds holder rewards / buyback-burn. Base tokens ignore this
+    /// and always split 50/50 treasury/dev.
+    ///
+    /// Default 1:1:4 (dev 0.5% / treasury 0.5% / rewards 2% at a 3% pool; or
+    /// ~0.17/0.17/0.67 at the current 1% pool). Capped so treasury+dev can't
+    /// starve the mechanism, and the mechanism can't take everything.
+    uint16 public modeTreasuryBps = 1_667;
+    uint16 public modeDevBps = 1_666;
+
+    error InvalidSplit();
+
+    function modeMechanismBps() public view returns (uint16) {
+        return BPS - modeTreasuryBps - modeDevBps;
+    }
 
     constructor(address owner_, INonfungiblePositionManager pm_, IERC20 weth_, address treasury_) Ownable(owner_) {
         if (address(pm_) == address(0) || address(weth_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
@@ -96,6 +115,16 @@ contract LaunchFairFeeLockerV2 is Ownable, ReentrancyGuard {
         emit TreasurySet(treasury_);
     }
 
+    /// @notice Tune the MODE-token WETH split (applies to future claims). The
+    /// mechanism always keeps at least 20% so a mode token can't stop rewarding
+    /// holders. Base tokens are unaffected (always 50/50).
+    function setModeSplit(uint16 treasuryBps, uint16 devBps) external onlyOwner {
+        if (uint256(treasuryBps) + devBps > 8_000) revert InvalidSplit();
+        modeTreasuryBps = treasuryBps;
+        modeDevBps = devBps;
+        emit ModeSplitSet(treasuryBps, devBps, BPS - treasuryBps - devBps);
+    }
+
     function register(address token, uint256 tokenId, bool tokenIsToken0) external {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
         if (positions[token].exists) revert AlreadyRegistered();
@@ -107,7 +136,7 @@ contract LaunchFairFeeLockerV2 is Ownable, ReentrancyGuard {
     function claim(address token)
         public
         nonReentrant
-        returns (uint256 wethToTreasury, uint256 creatorHalf, uint256 tokensBurned)
+        returns (uint256 wethToTreasury, uint256 wethToDev, uint256 wethToMechanism, uint256 tokensBurned)
     {
         LockedPosition memory pos = positions[token];
         if (!pos.exists) revert UnknownToken();
@@ -130,22 +159,28 @@ contract LaunchFairFeeLockerV2 is Ownable, ReentrancyGuard {
 
         LaunchTokenV2.Mode m = LaunchTokenV2(token).mode();
         if (wethAmount > 0) {
-            wethToTreasury = (wethAmount * TREASURY_SHARE_BPS) / BPS;
-            creatorHalf = wethAmount - wethToTreasury;
-            if (wethToTreasury > 0) weth.safeTransfer(treasury, wethToTreasury);
+            if (m == LaunchTokenV2.Mode.Base) {
+                // Base: 50/50 treasury/dev (dev share -> treasury if no dev).
+                wethToTreasury = (wethAmount * TREASURY_SHARE_BPS) / BPS;
+                wethToDev = wethAmount - wethToTreasury;
+            } else {
+                // Mode token: owner-tuned split; the remainder funds the mechanism.
+                wethToTreasury = (wethAmount * modeTreasuryBps) / BPS;
+                wethToDev = (wethAmount * modeDevBps) / BPS;
+                wethToMechanism = wethAmount - wethToTreasury - wethToDev;
+            }
 
-            if (creatorHalf > 0) {
-                if (m == LaunchTokenV2.Mode.Base) {
-                    address dev = ICreatorRegistryV2(launchpad).creatorOf(token);
-                    weth.safeTransfer(dev == address(0) ? treasury : dev, creatorHalf);
-                } else {
-                    // Mode token: fund the reward/burn mechanism.
-                    weth.safeTransfer(distributor, creatorHalf);
-                    IDistributorV2(distributor).notify(token, creatorHalf);
-                }
+            if (wethToTreasury > 0) weth.safeTransfer(treasury, wethToTreasury);
+            if (wethToDev > 0) {
+                address dev = ICreatorRegistryV2(launchpad).creatorOf(token);
+                weth.safeTransfer(dev == address(0) ? treasury : dev, wethToDev);
+            }
+            if (wethToMechanism > 0) {
+                weth.safeTransfer(distributor, wethToMechanism);
+                IDistributorV2(distributor).notify(token, wethToMechanism);
             }
         }
-        emit FeesClaimed(token, uint8(m), msg.sender, wethToTreasury, creatorHalf, tokensBurned);
+        emit FeesClaimed(token, uint8(m), msg.sender, wethToTreasury, wethToDev, wethToMechanism, tokensBurned);
     }
 
     function claimMany(address[] calldata tokens) external {
