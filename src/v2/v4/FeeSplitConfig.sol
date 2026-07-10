@@ -3,10 +3,12 @@ pragma solidity ^0.8.24;
 
 // LaunchFair V2 (V4) — https://hood.launchfair.app
 
-/// @notice The 3 custom fee types for V4 mode tokens and how the collected fee
-/// (always converted to WETH first) is split. By rule treasury == dev and BOTH
-/// are paid in WETH; the remainder funds the reward/burn mechanism. Higher fee
-/// tiers hand holders a bigger share.
+/// @notice The 3 custom fee types for V4 mode tokens and how the BUY-side WETH
+/// fee is split. Buys pay their fee in WETH (split below); sells pay in the token
+/// and are BURNED (deflationary, no swap, no sell pressure) — so fees are only
+/// taken into this split from buys. By rule treasury == dev and BOTH are paid in
+/// WETH; the remainder funds the reward/burn mechanism. Higher fee tiers hand
+/// holders a bigger share.
 ///
 ///   pool fee   dev     treasury   rewards   (as % of the trade)
 ///   3%         0.5%    0.5%       2.0%
