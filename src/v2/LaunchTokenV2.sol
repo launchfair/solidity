@@ -111,9 +111,10 @@ contract LaunchTokenV2 is ERC20Burnable {
         uint32 maxBuyBlocks_,
         Mode mode_,
         address rewardToken_,
-        address rewardPool_
+        address rewardPool_,
+        address launchpad_
     ) ERC20(name_, symbol_) {
-        launchpad = msg.sender;
+        launchpad = launchpad_;
         platformWebsite = platformWebsite_;
         logoURI = meta.logoURI;
         website = meta.website;
@@ -132,10 +133,10 @@ contract LaunchTokenV2 is ERC20Burnable {
         // excludeFromDividends().
         excludedFromDividends[address(this)] = true;
         excludedFromDividends[address(0)] = true;
-        excludedFromDividends[msg.sender] = true;
-        limitExempt[msg.sender] = true;
+        excludedFromDividends[launchpad_] = true;
+        limitExempt[launchpad_] = true;
 
-        _mint(msg.sender, supply_);
+        _mint(launchpad_, supply_);
     }
 
     /// @notice Explicit zero owner so explorers report the token as renounced.
