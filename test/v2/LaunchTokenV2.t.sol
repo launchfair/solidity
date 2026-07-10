@@ -64,6 +64,37 @@ contract LaunchTokenV2Test is Test {
         assertEq(t.withdrawableDividendOf(A), 0, "nothing left after claim");
     }
 
+    function test_reward_autoPushNoClaim() public {
+        MockERC20 reward = new MockERC20("Reward", "RWD");
+        LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Reward, address(reward));
+        t.transfer(POOL, SUPPLY);
+        vm.prank(POOL);
+        t.transfer(A, 300_000 ether);
+        vm.prank(POOL);
+        t.transfer(B, 100_000 ether);
+
+        reward.mint(address(this), 1_000 ether);
+        reward.approve(address(t), 1_000 ether);
+        t.fundRewards(1_000 ether);
+
+        // Keeper pushes payouts — holders never call claim themselves.
+        t.processAccounts(_two(A, B));
+        assertApproxEqAbs(reward.balanceOf(A), 750 ether, 100, "A auto-received");
+        assertApproxEqAbs(reward.balanceOf(B), 250 ether, 100, "B auto-received");
+        assertEq(t.withdrawableDividendOf(A), 0, "A settled");
+        assertEq(t.withdrawableDividendOf(B), 0, "B settled");
+
+        // Idempotent: re-pushing with nothing owed does nothing.
+        t.processAccounts(_two(A, B));
+        assertApproxEqAbs(reward.balanceOf(A), 750 ether, 100, "no double-pay");
+    }
+
+    function _two(address x, address y) internal pure returns (address[] memory a) {
+        a = new address[](2);
+        a[0] = x;
+        a[1] = y;
+    }
+
     function test_reward_transferPreservesAccrued() public {
         MockERC20 reward = new MockERC20("Reward", "RWD");
         LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Reward, address(reward));

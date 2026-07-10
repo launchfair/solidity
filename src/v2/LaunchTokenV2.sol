@@ -247,14 +247,32 @@ contract LaunchTokenV2 is ERC20Burnable {
         return accumulativeDividendOf(account) - withdrawnDividends[account];
     }
 
-    /// @notice Claim your accrued rewards (reward token, or THIS token for
-    /// Increasing — which compounds into your position).
-    function claim() external returns (uint256 claimed) {
-        claimed = withdrawableDividendOf(msg.sender);
-        if (claimed == 0) return 0;
-        withdrawnDividends[msg.sender] += claimed;
-        IERC20(distributionAsset()).safeTransfer(msg.sender, claimed);
-        emit DividendClaimed(msg.sender, claimed);
+    /// @notice Pay out `account`'s accrued rewards TO `account`. Permissionless
+    /// and safe: it only ever sends a holder their OWN owed rewards, and the
+    /// bookkeeping is updated before the transfer (CEI), so it can't double-pay.
+    /// This is what makes rewards automatic — our keeper pushes payouts so
+    /// holders never have to claim. Returns the amount paid.
+    function processAccount(address account) public returns (uint256 amount) {
+        amount = withdrawableDividendOf(account);
+        if (amount == 0) return 0;
+        withdrawnDividends[account] += amount;
+        IERC20(distributionAsset()).safeTransfer(account, amount);
+        emit DividendClaimed(account, amount);
+    }
+
+    /// @notice Push payouts to a batch of holders — called by the keeper (with
+    /// the holder list from the indexer) so rewards land in wallets AUTOMATICALLY,
+    /// no claim required. Skips zero-owed accounts cheaply.
+    function processAccounts(address[] calldata accounts) external {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            processAccount(accounts[i]);
+        }
+    }
+
+    /// @notice Self-service claim — a trustless fallback if you'd rather not wait
+    /// for the automatic keeper push (or if the keeper is ever down).
+    function claim() external returns (uint256) {
+        return processAccount(msg.sender);
     }
 
     // ── ERC-7572 contract metadata (with mode/version + site) ────────────────

@@ -86,9 +86,14 @@ Permissionless-triggerable, but we run it:
 1. Watch vault WETH balances (or run on an interval / on `FeesClaimed`).
 2. Above a min threshold: swap WETH → reward token (Reward) or → this token
    (Increasing/Burn) on the V3 router with slippage guard.
-3. Reward/Increasing: `tracker.distribute(bought)` → holders' claimable grows.
-   Burn: `token.burn(bought)` → `totalBurned += bought`.
-4. Everything a keeper does is also callable by anyone (no trust needed); the
+3. Reward/Increasing: `fundRewards(bought)` → holders' balances accrue.
+   Burn: `fundBurn(bought)` → `totalBurned += bought`.
+4. **Auto-distribution (no claim):** the keeper then calls
+   `token.processAccounts(holderBatch)` (holder list from the indexer) to PUSH
+   each holder their owed rewards — they never call `claim()`. Traders pay no
+   extra gas; the keeper pays the push gas. `claim()` remains as a trustless
+   fallback if the keeper is ever down.
+5. Everything a keeper does is also callable by anyone (no trust needed); the
    keeper just guarantees liveness + good pricing (batching avoids dust swaps).
 
 ## Per-mode summary
