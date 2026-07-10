@@ -32,7 +32,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
 
     IPoolManager public immutable poolManager;
     IERC20 public immutable weth;
-    address public immutable registrar; // the launchpad; records buyback pools
+    address public registrar; // the launchpad; records buyback pools (owner-settable for wiring)
     address public locker;
 
     mapping(address token => PoolKey) internal _buyback; // V4 pool to buy the asset on
@@ -72,6 +72,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (locker_ == address(0)) revert ZeroAddress();
         locker = locker_;
         emit LockerSet(locker_);
+    }
+
+    /// @notice Point the distributor at the launchpad (deployed after this).
+    function setRegistrar(address registrar_) external onlyOwner {
+        if (registrar_ == address(0)) revert ZeroAddress();
+        registrar = registrar_;
     }
 
     /// @notice Launchpad records the V4 pool where a token's reward asset is bought.
