@@ -127,4 +127,63 @@ contract LaunchFairV4Test is Test, Deployers {
         LaunchTokenV2(token).processAccounts(who);
         assertGt(IERC20(token).balanceOf(HOLDER), before, "reward auto-pushed to wallet");
     }
+
+    function _createLottery() internal returns (address token, PoolKey memory key) {
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Lotto",
+                symbol: "LOTTO",
+                metadata: meta,
+                salt: bytes32(uint256(1)),
+                mode: LaunchTokenV2.Mode.Lottery,
+                fee: 100_000, // 10% fee -> a beefy pot
+                rewardToken: address(0), // WETH prize
+                rewardPoolKey: none,
+                minHold: 0,
+                payoutThreshold: 0
+            })
+        );
+        key = pad.getLaunch(token).key;
+    }
+
+    // Full lottery pipeline through the launchpad: launch -> buy (earns tickets)
+    // -> claim (funds the pot) -> commit to a future drand round -> settle (pays
+    // the verifiable winner + records the draw).
+    function test_endToEnd_lottery_launch_buy_draw() public {
+        (address token, PoolKey memory key) = _createLottery();
+        dist.setDrawOperator(address(this)); // this session acts as the keeper
+
+        // Launchpad wired the lottery: buys tracked from the pool, distributor draws.
+        assertEq(LaunchTokenV2(token).buySource(), address(manager), "buys tracked from pool");
+        assertEq(LaunchTokenV2(token).lotteryOperator(), address(dist), "distributor is operator");
+
+        // A buy hands tokens straight from the pool to the buyer -> tickets accrue.
+        _buy(key, token, 50_000 ether);
+        uint256 epoch = LaunchTokenV2(token).lotteryEpoch();
+        uint256 myTickets = LaunchTokenV2(token).ticketsOf(epoch, address(this));
+        assertGt(myTickets, 0, "buy earned tickets");
+        assertEq(LaunchTokenV2(token).totalTickets(epoch), myTickets, "sole ticket holder");
+
+        // Claim the buy-side fee -> mechanism WETH becomes the pot.
+        locker.claim(token);
+        uint256 pot = dist.pendingWeth(token);
+        assertGt(pot, 0, "pot funded");
+
+        // Commit to a future drand round, then settle with its beacon value.
+        uint256 round = 9_999_999;
+        dist.commitDraw(token, round);
+        bytes32 rnd = keccak256("drand-beacon");
+        uint256 wt = uint256(keccak256(abi.encode(rnd, token, round))) % LaunchTokenV2(token).totalTickets(epoch);
+        assertLt(wt, myTickets, "winning ticket falls in our range");
+
+        uint256 balBefore = weth.balanceOf(address(this));
+        dist.settleDraw(token, rnd, address(this), 0);
+
+        assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
+        assertEq(dist.pendingWeth(token), 0, "pot cleared");
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced");
+        assertEq(dist.drawCount(token), 1, "draw recorded in history");
+    }
 }

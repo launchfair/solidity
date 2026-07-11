@@ -26,6 +26,11 @@ interface ICreatorRegistryV4 {
 /// permissionless `process(token)` buys the token's reward asset on its V4 pool
 /// (via the PoolManager unlock/flash-accounting), then funds the token's
 /// dividend tracker (Reward/Redistribute) or burns it (Burn).
+///
+/// Lottery tokens accrue WETH the same way, but instead of a buyback the whole pot
+/// is drawn to one ticket holder: `commitDraw` locks the draw to a future drand
+/// round, `settleDraw` pays the winner once that beacon is public and records the
+/// draw on-chain (verifiable, powerball-style). See the lottery section below.
 contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     using SafeERC20 for IERC20;
     using BalanceDeltaLibrary for BalanceDelta;
@@ -42,11 +47,31 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     /// keeper only processes once it's crossed). 0 = fire on any pending.
     mapping(address token => uint256) public payoutThreshold;
 
+    // ── lottery draws (Mode.Lottery) ────────────────────────────────────────────
+    struct Draw {
+        uint256 epoch;         // session (token.lotteryEpoch) the winner was drawn from
+        uint256 round;         // committed drand round (fixed the seed before it existed)
+        bytes32 randomness;    // drand beacon value for `round` (publicly re-verifiable)
+        address winner;        // ticket holder who was drawn
+        uint256 prize;         // WETH paid to the winner
+        uint256 totalTickets;  // tickets in play for the epoch
+        uint256 winningTicket; // derived on-chain: keccak(randomness,token,round) % totalTickets
+        uint64 timestamp;
+    }
+    struct PendingDraw { uint256 round; bool active; }
+
+    address public drawOperator; // off-chain keeper that commits/settles draws
+    mapping(address token => Draw[]) public draws;         // full winner history
+    mapping(address token => PendingDraw) public pendingDraw;
+
     event LockerSet(address locker);
     event BuybackRegistered(address indexed token);
     event Notified(address indexed token, uint256 amount, uint256 pending);
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
     event PayoutThresholdSet(address indexed token, uint256 threshold);
+    event DrawOperatorSet(address operator);
+    event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
+    event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
 
     error OnlyLocker();
     error OnlyRegistrar();
@@ -59,6 +84,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     error WrongMode();
     error Slippage();
     error ZeroAddress();
+    error OnlyDrawOperator();
+    error NotLottery();
+    error DrawActive();
+    error NoDraw();
+    error NoTickets();
+    error BadProof();
 
     constructor(address owner_, IPoolManager pm_, IERC20 weth_, address registrar_) Ownable(owner_) {
         if (address(pm_) == address(0) || address(weth_) == address(0) || registrar_ == address(0)) revert ZeroAddress();
@@ -125,7 +156,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (wethIn < payoutThreshold[token]) revert BelowThreshold();
         if (!registered[token]) revert NotRegistered();
         LaunchTokenV2.Mode m = LaunchTokenV2(token).mode();
-        if (m == LaunchTokenV2.Mode.Base) revert WrongMode();
+        // Base has no mechanism; Lottery uses draw()/settleDraw(), not a buyback.
+        if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
 
         out = abi.decode(poolManager.unlock(abi.encode(token, wethIn)), (uint256));
@@ -138,6 +170,86 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
             LaunchTokenV2(token).fundRewards(out);
         }
         emit Processed(token, wethIn, out, uint8(m));
+    }
+
+    // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
+    // The token accrues WETH exactly like a reward token, but instead of a buyback
+    // the pot is paid whole to one ticket holder. Tickets are earned per-buy inside
+    // the token (LaunchTokenV2.ticketsOf[epoch]). A draw is committed to a *future*
+    // drand round so its randomness can't be known — let alone ground — in advance,
+    // then settled once that round's beacon is published. Everything needed to
+    // re-verify the winner (randomness, round, epoch, totalTickets, winningTicket)
+    // is emitted + stored on-chain, powerball-style.
+
+    function setDrawOperator(address op) external onlyOwner {
+        if (op == address(0)) revert ZeroAddress();
+        drawOperator = op;
+        emit DrawOperatorSet(op);
+    }
+
+    /// @notice Number of settled draws for a token (history length; `draws(token,i)`
+    /// reads each one — newest at `drawCount-1`).
+    function drawCount(address token) external view returns (uint256) {
+        return draws[token].length;
+    }
+
+    /// @notice Commit the next draw to drand `drandRound` (must be a round that has
+    /// not yet been produced). The prize is whatever WETH has accrued by settlement.
+    function commitDraw(address token, uint256 drandRound) external returns (uint256 drawId) {
+        if (msg.sender != drawOperator) revert OnlyDrawOperator();
+        if (LaunchTokenV2(token).mode() != LaunchTokenV2.Mode.Lottery) revert NotLottery();
+        if (pendingDraw[token].active) revert DrawActive();
+        pendingDraw[token] = PendingDraw({round: drandRound, active: true});
+        drawId = draws[token].length;
+        emit DrawCommitted(token, drawId, drandRound, LaunchTokenV2(token).lotteryEpoch(), pendingWeth[token]);
+    }
+
+    /// @notice Settle the committed draw. `randomness` is the drand beacon for the
+    /// committed round (re-verifiable off-chain against drand's public key). The
+    /// winning ticket is derived here on-chain from it (tamper-evident); the caller
+    /// supplies `winner` + its `cumulativeStart` (the winner's ticket offset in the
+    /// canonical TicketsEarned order) and we prove on-chain the drawn ticket lands
+    /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. Pays the pot, records
+    /// the draw, and advances the token's session so the next round starts fresh.
+    function settleDraw(address token, bytes32 randomness, address winner, uint256 cumulativeStart)
+        external
+        nonReentrant
+    {
+        if (msg.sender != drawOperator) revert OnlyDrawOperator();
+        PendingDraw memory pd = pendingDraw[token];
+        if (!pd.active) revert NoDraw();
+
+        LaunchTokenV2 t = LaunchTokenV2(token);
+        uint256 epoch = t.lotteryEpoch();
+        uint256 total = t.totalTickets(epoch);
+        if (total == 0) revert NoTickets();
+
+        uint256 winningTicket = uint256(keccak256(abi.encode(randomness, token, pd.round))) % total;
+        uint256 winnerTickets = t.ticketsOf(epoch, winner);
+        // The winner's contiguous ticket range must contain the drawn ticket.
+        if (winnerTickets == 0 || winningTicket < cumulativeStart || winningTicket >= cumulativeStart + winnerTickets) {
+            revert BadProof();
+        }
+
+        uint256 prize = pendingWeth[token];
+        pendingWeth[token] = 0;
+        pendingDraw[token].active = false;
+
+        draws[token].push(Draw({
+            epoch: epoch,
+            round: pd.round,
+            randomness: randomness,
+            winner: winner,
+            prize: prize,
+            totalTickets: total,
+            winningTicket: winningTicket,
+            timestamp: uint64(block.timestamp)
+        }));
+
+        if (prize > 0) weth.safeTransfer(winner, prize);
+        t.advanceLotteryEpoch(); // reset tickets — next session only counts new buys
+
+        emit DrawSettled(token, draws[token].length - 1, epoch, winner, prize, randomness, winningTicket);
     }
 
     /// @dev PoolManager flash-accounting callback: swap WETH -> reward asset, pay

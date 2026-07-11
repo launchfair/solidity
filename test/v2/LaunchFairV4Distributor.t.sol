@@ -175,4 +175,183 @@ contract V4DistributorTest is Test, Deployers {
         assertTrue(dist.readyToProcess(address(token)), "threshold crossed");
         assertGt(dist.process(address(token), 0), 0, "payout fired");
     }
+
+    // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
+    // Wire a Lottery token: distributor is its epoch operator + the draw keeper.
+    // "Buys" are transfers from buySource (this) so holders earn tickets ∝ amount.
+    function _setupLottery() internal returns (LaunchTokenV2 token) {
+        token = _deployToken(LaunchTokenV2.Mode.Lottery, address(0), address(0));
+        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist.setLocker(address(this));      // this feeds the pot via notify
+        dist.setDrawOperator(address(this)); // this is the keeper (commits/settles)
+        token.setBuySource(address(this));   // "buys" originate here → earn tickets
+        token.setLotteryOperator(address(dist)); // distributor advances the session
+    }
+
+    // Canonical ticket order = the order holders first appear: A gets [0, aTix),
+    // then B gets [aTix, aTix+bTix). Given a winning ticket, resolve (winner,start).
+    function _resolveWinner(LaunchTokenV2 token, uint256 winningTicket)
+        internal
+        view
+        returns (address winner, uint256 start)
+    {
+        uint256 aTix = token.ticketsOf(token.lotteryEpoch(), A);
+        return winningTicket < aTix ? (A, uint256(0)) : (B, aTix);
+    }
+
+    function test_lottery_drawPaysVerifiableWinner() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 300_000 ether); // A: tickets [0, 300_000e18)
+        token.transfer(B, 100_000 ether); // B: tickets [300_000e18, 400_000e18)
+        uint256 total = token.totalTickets(0);
+        assertEq(total, 400_000 ether, "ticket pool == bought amount");
+
+        uint256 pot = 10 ether;
+        weth.mint(address(dist), pot);
+        dist.notify(address(token), pot);
+
+        uint256 round = 4_000_123; // a future drand round (committed before it exists)
+        dist.commitDraw(address(token), round);
+
+        // The keeper fetches the drand beacon for `round` and derives the winner the
+        // same way the contract does — anyone can recompute this from on-chain data.
+        bytes32 rnd = keccak256("drand-beacon-value-for-round");
+        uint256 winningTicket = uint256(keccak256(abi.encode(rnd, address(token), round))) % total;
+        (address winner, uint256 start) = _resolveWinner(token, winningTicket);
+
+        uint256 balBefore = weth.balanceOf(winner);
+        dist.settleDraw(address(token), rnd, winner, start);
+
+        assertEq(weth.balanceOf(winner) - balBefore, pot, "winner paid the whole pot");
+        assertEq(dist.pendingWeth(address(token)), 0, "pot cleared");
+        assertEq(token.lotteryEpoch(), 1, "session advanced; old tickets no longer count");
+        assertEq(dist.drawCount(address(token)), 1, "draw recorded in history");
+
+        (
+            uint256 epoch,
+            uint256 rRound,
+            bytes32 storedRnd,
+            address wWinner,
+            uint256 prize,
+            uint256 tot,
+            uint256 wt,
+        ) = dist.draws(address(token), 0);
+        assertEq(epoch, 0, "drawn from epoch 0");
+        assertEq(rRound, round, "committed round stored");
+        assertEq(storedRnd, rnd, "randomness stored for re-verification");
+        assertEq(wWinner, winner, "winner stored");
+        assertEq(prize, pot, "prize stored");
+        assertEq(tot, total, "total tickets stored");
+        assertEq(wt, winningTicket, "winning ticket derived on-chain matches");
+    }
+
+    function test_lottery_badProofReverts() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 300_000 ether);
+        token.transfer(B, 100_000 ether);
+        weth.mint(address(dist), 5 ether);
+        dist.notify(address(token), 5 ether);
+        dist.commitDraw(address(token), 1);
+
+        bytes32 rnd = keccak256("x");
+        uint256 wt = uint256(keccak256(abi.encode(rnd, address(token), uint256(1)))) % token.totalTickets(0);
+        (address winner,) = _resolveWinner(token, wt);
+        // Lie about the winner's offset → the drawn ticket falls outside their range.
+        uint256 wrongStart = winner == A ? uint256(300_000 ether) : uint256(0);
+        vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
+        dist.settleDraw(address(token), rnd, winner, wrongStart);
+    }
+
+    function test_lottery_wrongWinnerReverts() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 400_000 ether); // A owns EVERY ticket
+        weth.mint(address(dist), 1 ether);
+        dist.notify(address(token), 1 ether);
+        dist.commitDraw(address(token), 7);
+        // B has zero tickets → can never be a valid winner.
+        vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
+        dist.settleDraw(address(token), keccak256("y"), B, 0);
+    }
+
+    function test_lottery_noTicketsReverts() public {
+        LaunchTokenV2 token = _setupLottery(); // nobody bought → no tickets
+        weth.mint(address(dist), 1 ether);
+        dist.notify(address(token), 1 ether);
+        dist.commitDraw(address(token), 9);
+        vm.expectRevert(LaunchFairV4Distributor.NoTickets.selector);
+        dist.settleDraw(address(token), keccak256("z"), A, 0);
+    }
+
+    function test_lottery_onlyOperator() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether);
+        vm.prank(A);
+        vm.expectRevert(LaunchFairV4Distributor.OnlyDrawOperator.selector);
+        dist.commitDraw(address(token), 1);
+
+        dist.commitDraw(address(token), 1);
+        vm.prank(A);
+        vm.expectRevert(LaunchFairV4Distributor.OnlyDrawOperator.selector);
+        dist.settleDraw(address(token), keccak256("q"), A, 0);
+    }
+
+    function test_lottery_doubleCommitReverts() public {
+        LaunchTokenV2 token = _setupLottery();
+        dist.commitDraw(address(token), 1);
+        vm.expectRevert(LaunchFairV4Distributor.DrawActive.selector);
+        dist.commitDraw(address(token), 2);
+    }
+
+    function test_lottery_settleWithoutCommitReverts() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether);
+        vm.expectRevert(LaunchFairV4Distributor.NoDraw.selector);
+        dist.settleDraw(address(token), keccak256("q"), A, 0);
+    }
+
+    function test_lottery_commitRejectsNonLottery() public {
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
+        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist.setDrawOperator(address(this));
+        vm.expectRevert(LaunchFairV4Distributor.NotLottery.selector);
+        dist.commitDraw(address(token), 1);
+    }
+
+    function test_lottery_processRevertsForLottery() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether);
+        weth.mint(address(dist), 1 ether);
+        dist.notify(address(token), 1 ether);
+        dist.registerBuyback(address(token), _pool(address(token))); // even if registered…
+        vm.expectRevert(LaunchFairV4Distributor.WrongMode.selector); // …process is not the lottery path
+        dist.process(address(token), 0);
+    }
+
+    // A second session only counts buys made after the previous draw settled.
+    function test_lottery_nextSessionIsFresh() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 300_000 ether);
+        token.transfer(B, 100_000 ether);
+        weth.mint(address(dist), 4 ether);
+        dist.notify(address(token), 4 ether);
+        dist.commitDraw(address(token), 1);
+        uint256 wt = uint256(keccak256(abi.encode(keccak256("r1"), address(token), uint256(1)))) % token.totalTickets(0);
+        (address w1, uint256 s1) = _resolveWinner(token, wt);
+        dist.settleDraw(address(token), keccak256("r1"), w1, s1);
+
+        // Epoch 1: only A buys again. Old (epoch 0) tickets are gone.
+        assertEq(token.lotteryEpoch(), 1);
+        assertEq(token.totalTickets(1), 0, "fresh session starts empty");
+        token.transfer(A, 50_000 ether);
+        assertEq(token.totalTickets(1), 50_000 ether, "only new buys count");
+
+        weth.mint(address(dist), 2 ether);
+        dist.notify(address(token), 2 ether);
+        dist.commitDraw(address(token), 2);
+        uint256 balBefore = weth.balanceOf(A);
+        // A owns the whole epoch-1 pool → A wins regardless of randomness.
+        dist.settleDraw(address(token), keccak256("r2"), A, 0);
+        assertEq(weth.balanceOf(A) - balBefore, 2 ether, "epoch-1 winner paid");
+        assertEq(dist.drawCount(address(token)), 2, "two draws in history");
+    }
 }

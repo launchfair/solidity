@@ -4,8 +4,8 @@ pragma solidity ^0.8.24;
 // LaunchFair V2 (V4) — https://hood.launchfair.app
 // Mode-token launchpad on Uniswap V4: create a token with a mode + fee tier,
 // launch it into a V4 pool as a single-sided locked position, and wire the fee
-// locker + reward distributor. Base tokens stay on V1/V3 — V4 is for the reward
-// modes (Reward / Redistribute / Burn).
+// locker + reward distributor. Base tokens stay on V1/V3 — V4 is for the mode
+// tokens (Reward / Redistribute / Burn / Lottery).
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -64,7 +64,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         string symbol;
         LaunchTokenV2.Metadata metadata;
         bytes32 salt;
-        LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Burn
+        LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Burn / Lottery
         uint24 fee; // 30000 / 50000 / 100000
         address rewardToken; // Reward mode only
         PoolKey rewardPoolKey; // Reward mode: the V4 pool to buy the reward token on
@@ -205,9 +205,18 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
         locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);
 
-        // Register the buyback pool: reward token's pool (Reward) or own pool.
-        PoolKey memory buybackKey = p.mode == LaunchTokenV2.Mode.Reward ? p.rewardPoolKey : key;
-        IDistributorV4Register(distributor).registerBuyback(token, buybackKey);
+        if (p.mode == LaunchTokenV2.Mode.Lottery) {
+            // Lottery: a buy is the pool handing tokens to the buyer, so tickets
+            // accrue on transfers from the PoolManager; the distributor runs the
+            // draw and advances each session. The pot is the accrued WETH — no
+            // buyback pool to register.
+            t.setBuySource(address(poolManager));
+            t.setLotteryOperator(distributor);
+        } else {
+            // Register the buyback pool: reward token's pool (Reward) or own pool.
+            PoolKey memory buybackKey = p.mode == LaunchTokenV2.Mode.Reward ? p.rewardPoolKey : key;
+            IDistributorV4Register(distributor).registerBuyback(token, buybackKey);
+        }
         if (p.payoutThreshold > 0) IDistributorV4Register(distributor).setPayoutThreshold(token, p.payoutThreshold);
 
         _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, exists: true});
