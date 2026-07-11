@@ -198,6 +198,54 @@ contract LaunchTokenV2Test is Test {
         assertEq(t.totalSupply(), supplyBefore - 5_000 ether, "supply down");
     }
 
+    function test_lottery_ticketsFromBuys_resetOnDraw() public {
+        LaunchTokenV2 t = new LaunchTokenV2(
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+        );
+        t.setBuySource(POOL);
+        t.setLotteryOperator(address(this)); // test acts as the lottery distributor
+        t.excludeFromDividends(POOL, true);
+        t.transfer(POOL, SUPPLY); // seed the "pool"
+
+        // Buys = transfers FROM the pool → earn tickets proportional to size.
+        vm.prank(POOL);
+        t.transfer(A, 300 ether);
+        vm.prank(POOL);
+        t.transfer(B, 100 ether);
+        uint256 e = t.lotteryEpoch();
+        assertEq(t.ticketsOf(e, A), 300 ether, "A tickets == buy size");
+        assertEq(t.ticketsOf(e, B), 100 ether, "B tickets");
+        assertEq(t.totalTickets(e), 400 ether, "session total");
+
+        // A normal transfer (not from the pool) earns NO tickets.
+        vm.prank(A);
+        t.transfer(B, 50 ether);
+        assertEq(t.ticketsOf(e, B), 100 ether, "no tickets on plain transfer");
+
+        // Draw advances the epoch → tickets reset; old session preserved.
+        uint256 closed = t.advanceLotteryEpoch();
+        assertEq(closed, e, "closed the old session");
+        uint256 e2 = t.lotteryEpoch();
+        assertEq(e2, e + 1, "new session started");
+        assertEq(t.totalTickets(e2), 0, "fresh session, zero tickets");
+        assertEq(t.ticketsOf(e, A), 300 ether, "old session tickets preserved");
+
+        // New buys count only toward the new session.
+        vm.prank(POOL);
+        t.transfer(A, 200 ether);
+        assertEq(t.ticketsOf(e2, A), 200 ether, "new session buy");
+        assertEq(t.ticketsOf(e, A), 300 ether, "old session unchanged");
+    }
+
+    function test_lottery_onlyOperatorAdvances() public {
+        LaunchTokenV2 t = new LaunchTokenV2(
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+        );
+        t.setLotteryOperator(address(0xABCD));
+        vm.expectRevert(LaunchTokenV2.NotAuthorized.selector);
+        t.advanceLotteryEpoch();
+    }
+
     function test_wrongModeReverts() public {
         LaunchTokenV2 base = _deploy(LaunchTokenV2.Mode.Base, address(0));
         vm.expectRevert(LaunchTokenV2.WrongMode.selector);

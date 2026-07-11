@@ -33,7 +33,8 @@ contract LaunchTokenV2 is ERC20Burnable {
         Base, // 0 — plain fair launch
         Reward, // 1 — distribute an external reward token to holders
         Increasing, // 2 — distribute THIS token to holders (pro-rata)
-        Burn // 3 — buy back and burn THIS token
+        Burn, // 3 — buy back and burn THIS token
+        Lottery // 4 — buys earn session tickets; a random winner takes the pot
     }
 
     struct Metadata {
@@ -48,6 +49,7 @@ contract LaunchTokenV2 is ERC20Burnable {
     error MaxBuyExceeded();
     error WrongMode();
     error NoShares();
+    error NotAuthorized();
 
     address public immutable launchpad;
 
@@ -104,6 +106,22 @@ contract LaunchTokenV2 is ERC20Burnable {
     event DividendsDistributed(uint256 amount);
     event DividendClaimed(address indexed account, uint256 amount);
     event MechanismBurn(uint256 amount);
+
+    // ── lottery (Mode.Lottery) ───────────────────────────────────────────────
+    /// @notice The pool tokens are bought from — a transfer FROM here to a real
+    /// wallet is a "buy" that earns lottery tickets. Set once by the launchpad.
+    address public buySource;
+    /// @notice The lottery distributor allowed to close a session after a draw.
+    address public lotteryOperator;
+    /// @notice Current lottery session. Tickets reset each draw via a fresh epoch.
+    uint256 public lotteryEpoch;
+    /// @notice tickets[epoch][holder] — proportional to their buys that session.
+    mapping(uint256 => mapping(address => uint256)) public ticketsOf;
+    /// @notice Total tickets in a session (the odds denominator).
+    mapping(uint256 => uint256) public totalTickets;
+
+    event TicketsEarned(uint256 indexed epoch, address indexed buyer, uint256 tickets);
+    event LotterySessionAdvanced(uint256 indexed closedEpoch, uint256 newEpoch);
 
     constructor(
         string memory name_,
@@ -173,6 +191,30 @@ contract LaunchTokenV2 is ERC20Burnable {
         if (pool == address(0)) pool = pool_;
     }
 
+    /// @notice Launchpad-only (once): the pool address a buy comes FROM, so the
+    /// token can credit lottery tickets on buys.
+    function setBuySource(address src) external {
+        if (msg.sender != launchpad) revert OnlyLaunchpad();
+        if (buySource == address(0)) buySource = src;
+    }
+
+    /// @notice Launchpad-only (once): the lottery distributor allowed to close a
+    /// session after settling a draw.
+    function setLotteryOperator(address op) external {
+        if (msg.sender != launchpad) revert OnlyLaunchpad();
+        if (lotteryOperator == address(0)) lotteryOperator = op;
+    }
+
+    /// @notice Close the current lottery session and start a fresh one (tickets
+    /// reset). Called by the lottery distributor immediately after a draw is
+    /// settled, so the winner is picked from the just-closed session.
+    function advanceLotteryEpoch() external returns (uint256 closed) {
+        if (msg.sender != lotteryOperator) revert NotAuthorized();
+        closed = lotteryEpoch;
+        lotteryEpoch = closed + 1;
+        emit LotterySessionAdvanced(closed, lotteryEpoch);
+    }
+
     /// @notice Launchpad-only; exclude protocol plumbing from dividends.
     function excludeFromDividends(address account, bool excluded) external {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
@@ -193,6 +235,16 @@ contract LaunchTokenV2 is ERC20Burnable {
         if (mode == Mode.Reward || mode == Mode.Increasing) {
             if (from != address(0)) _syncShare(from);
             if (to != address(0)) _syncShare(to);
+        }
+
+        // Lottery: a buy (tokens leaving the pool to a real wallet) earns tickets
+        // for the CURRENT session, proportional to the amount bought. Tickets are
+        // per-session and reset when the draw advances the epoch.
+        if (mode == Mode.Lottery && value > 0 && from == buySource && to != address(0) && !excludedFromDividends[to]) {
+            uint256 e = lotteryEpoch;
+            ticketsOf[e][to] += value;
+            totalTickets[e] += value;
+            emit TicketsEarned(e, to, value);
         }
     }
 
