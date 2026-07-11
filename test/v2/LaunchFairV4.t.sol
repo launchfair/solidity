@@ -171,9 +171,12 @@ contract LaunchFairV4Test is Test, Deployers {
         uint256 pot = dist.pendingWeth(token);
         assertGt(pot, 0, "pot funded");
 
-        // Commit to a future drand round, then settle with its beacon value.
+        // Commit closes ticket sales (advances the session, reserves the pot)…
         uint256 round = 9_999_999;
         dist.commitDraw(token, round);
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced at commit");
+
+        // …then settle with the beacon for the committed round.
         bytes32 rnd = keccak256("drand-beacon");
         uint256 wt = uint256(keccak256(abi.encode(rnd, token, round))) % LaunchTokenV2(token).totalTickets(epoch);
         assertLt(wt, myTickets, "winning ticket falls in our range");
@@ -182,8 +185,6 @@ contract LaunchFairV4Test is Test, Deployers {
         dist.settleDraw(token, rnd, address(this), 0);
 
         assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
-        assertEq(dist.pendingWeth(token), 0, "pot cleared");
-        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced");
         assertEq(dist.drawCount(token), 1, "draw recorded in history");
     }
 }

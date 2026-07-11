@@ -28,9 +28,12 @@ interface ICreatorRegistryV4 {
 /// dividend tracker (Reward/Redistribute) or burns it (Burn).
 ///
 /// Lottery tokens accrue WETH the same way, but instead of a buyback the whole pot
-/// is drawn to one ticket holder: `commitDraw` locks the draw to a future drand
-/// round, `settleDraw` pays the winner once that beacon is public and records the
-/// draw on-chain (verifiable, powerball-style). See the lottery section below.
+/// is drawn to one ticket holder. `commitDraw` closes the session (freezes the
+/// tickets, reserves the pot) and locks the draw to a *future* drand round;
+/// `settleDraw` pays the winner once that beacon is public and records the draw
+/// on-chain (verifiable, powerball-style). Ticket sales for the drawn session end
+/// at commit — buys after that count toward the next session — so no one can act
+/// on the randomness once it's revealed. See the lottery section below.
 contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     using SafeERC20 for IERC20;
     using BalanceDeltaLibrary for BalanceDelta;
@@ -58,7 +61,9 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         uint256 winningTicket; // derived on-chain: keccak(randomness,token,round) % totalTickets
         uint64 timestamp;
     }
-    struct PendingDraw { uint256 round; bool active; }
+    // A committed-but-unsettled draw: its session (epoch) and pot are frozen at
+    // commit; only the drand beacon for `round` is still outstanding.
+    struct PendingDraw { uint256 round; uint256 epoch; uint256 prize; bool active; }
 
     address public drawOperator; // off-chain keeper that commits/settles draws
     mapping(address token => Draw[]) public draws;         // full winner history
@@ -72,6 +77,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     event DrawOperatorSet(address operator);
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
+    event DrawCanceled(address indexed token, uint256 epoch, uint256 prizeReturned);
 
     error OnlyLocker();
     error OnlyRegistrar();
@@ -193,15 +199,27 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         return draws[token].length;
     }
 
-    /// @notice Commit the next draw to drand `drandRound` (must be a round that has
-    /// not yet been produced). The prize is whatever WETH has accrued by settlement.
+    /// @notice Close the current session and commit its draw to drand `drandRound`
+    /// (which must not yet have been produced, so the seed can't be known/ground in
+    /// advance). Ticket sales for this draw end here: the epoch is advanced so later
+    /// buys count toward the next session, and the current pot is reserved as the
+    /// prize. Reverts on an empty session so no draw locks with nothing to win.
     function commitDraw(address token, uint256 drandRound) external returns (uint256 drawId) {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
-        if (LaunchTokenV2(token).mode() != LaunchTokenV2.Mode.Lottery) revert NotLottery();
+        LaunchTokenV2 t = LaunchTokenV2(token);
+        if (t.mode() != LaunchTokenV2.Mode.Lottery) revert NotLottery();
         if (pendingDraw[token].active) revert DrawActive();
-        pendingDraw[token] = PendingDraw({round: drandRound, active: true});
+
+        uint256 epoch = t.lotteryEpoch();
+        if (t.totalTickets(epoch) == 0) revert NoTickets();
+
+        uint256 prize = pendingWeth[token];
+        pendingWeth[token] = 0;                 // reserve the pot for this draw…
+        t.advanceLotteryEpoch();                // …and close ticket sales for `epoch`.
+
+        pendingDraw[token] = PendingDraw({round: drandRound, epoch: epoch, prize: prize, active: true});
         drawId = draws[token].length;
-        emit DrawCommitted(token, drawId, drandRound, LaunchTokenV2(token).lotteryEpoch(), pendingWeth[token]);
+        emit DrawCommitted(token, drawId, drandRound, epoch, prize);
     }
 
     /// @notice Settle the committed draw. `randomness` is the drand beacon for the
@@ -209,8 +227,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     /// winning ticket is derived here on-chain from it (tamper-evident); the caller
     /// supplies `winner` + its `cumulativeStart` (the winner's ticket offset in the
     /// canonical TicketsEarned order) and we prove on-chain the drawn ticket lands
-    /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. Pays the pot, records
-    /// the draw, and advances the token's session so the next round starts fresh.
+    /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. The session and pot
+    /// were frozen at commit, so this just pays the reserved prize and records it.
     function settleDraw(address token, bytes32 randomness, address winner, uint256 cumulativeStart)
         external
         nonReentrant
@@ -220,36 +238,44 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (!pd.active) revert NoDraw();
 
         LaunchTokenV2 t = LaunchTokenV2(token);
-        uint256 epoch = t.lotteryEpoch();
-        uint256 total = t.totalTickets(epoch);
-        if (total == 0) revert NoTickets();
+        uint256 total = t.totalTickets(pd.epoch); // frozen at commit (epoch already advanced)
 
         uint256 winningTicket = uint256(keccak256(abi.encode(randomness, token, pd.round))) % total;
-        uint256 winnerTickets = t.ticketsOf(epoch, winner);
+        uint256 winnerTickets = t.ticketsOf(pd.epoch, winner);
         // The winner's contiguous ticket range must contain the drawn ticket.
         if (winnerTickets == 0 || winningTicket < cumulativeStart || winningTicket >= cumulativeStart + winnerTickets) {
             revert BadProof();
         }
 
-        uint256 prize = pendingWeth[token];
-        pendingWeth[token] = 0;
-        pendingDraw[token].active = false;
+        delete pendingDraw[token];
 
         draws[token].push(Draw({
-            epoch: epoch,
+            epoch: pd.epoch,
             round: pd.round,
             randomness: randomness,
             winner: winner,
-            prize: prize,
+            prize: pd.prize,
             totalTickets: total,
             winningTicket: winningTicket,
             timestamp: uint64(block.timestamp)
         }));
 
-        if (prize > 0) weth.safeTransfer(winner, prize);
-        t.advanceLotteryEpoch(); // reset tickets — next session only counts new buys
+        if (pd.prize > 0) weth.safeTransfer(winner, pd.prize);
 
-        emit DrawSettled(token, draws[token].length - 1, epoch, winner, prize, randomness, winningTicket);
+        emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, pd.prize, randomness, winningTicket);
+    }
+
+    /// @notice Emergency recovery: abandon a committed draw whose beacon can't be
+    /// settled (e.g. a bad committed round). Returns the reserved pot to `pendingWeth`
+    /// so it rolls into the next draw. The already-closed session is not reopened —
+    /// its tickets stay reset — so use only when a draw is genuinely stuck.
+    function cancelDraw(address token) external {
+        if (msg.sender != drawOperator) revert OnlyDrawOperator();
+        PendingDraw memory pd = pendingDraw[token];
+        if (!pd.active) revert NoDraw();
+        delete pendingDraw[token];
+        pendingWeth[token] += pd.prize;
+        emit DrawCanceled(token, pd.epoch, pd.prize);
     }
 
     /// @dev PoolManager flash-accounting callback: swap WETH -> reward asset, pay
