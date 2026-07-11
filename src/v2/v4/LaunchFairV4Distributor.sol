@@ -16,16 +16,22 @@ import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
+import {IV3SwapRouter} from "../../interfaces/IUniswapV3.sol";
 
 interface ICreatorRegistryV4 {
     function creatorOf(address token) external view returns (address);
 }
 
-/// @notice Turns each mode token's accrued buy-side WETH fees into holder rewards
-/// on Uniswap V4. The V4 FeeLocker forwards the mechanism's WETH here; a
-/// permissionless `process(token)` buys the token's reward asset on its V4 pool
-/// (via the PoolManager unlock/flash-accounting), then funds the token's
-/// dividend tracker (Reward/Redistribute) or burns it (Burn).
+/// @notice Turns each mode token's accrued buy-side WETH fees into holder rewards.
+/// The V4 FeeLocker forwards the mechanism's WETH here; a permissionless
+/// `process(token)` buys the token's reward asset, then funds the token's dividend
+/// tracker (Reward/Redistribute) or burns it (Burn).
+///
+/// The buyback runs on whichever venue the reward asset actually lives on: the
+/// token's own **V4** pool (Redistribute/Burn), or — for a Reward token whose dev
+/// chose an external reward — either a **V4** pool (PoolManager unlock/flash
+/// accounting) or a **V3** pool (SwapRouter02 exact-input). Most established tokens
+/// on this chain trade on V3, so a reward token is not restricted to V4-only.
 ///
 /// Lottery tokens accrue WETH the same way, but instead of a buyback the whole pot
 /// is drawn to one ticket holder. `commitDraw` closes the session (freezes the
@@ -39,11 +45,19 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     using BalanceDeltaLibrary for BalanceDelta;
 
     IPoolManager public immutable poolManager;
+    IV3SwapRouter public immutable v3Router; // SwapRouter02, for reward tokens on V3
     IERC20 public immutable weth;
     address public registrar; // the launchpad; records buyback pools (owner-settable for wiring)
     address public locker;
 
-    mapping(address token => PoolKey) internal _buyback; // V4 pool to buy the asset on
+    // Where a token's reward asset is bought.
+    enum Venue { V4, V3 }
+    struct BuybackRoute {
+        Venue venue;
+        uint24 v3Fee;  // venue == V3: the V3 pool fee tier
+        PoolKey v4Key; // venue == V4: the V4 pool key
+    }
+    mapping(address token => BuybackRoute) internal _buyback;
     mapping(address token => bool) public registered;
     mapping(address token => uint256) public pendingWeth;
     /// @notice Dev-set minimum pending WETH before a payout fires (anti-dust; the
@@ -70,7 +84,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     mapping(address token => PendingDraw) public pendingDraw;
 
     event LockerSet(address locker);
-    event BuybackRegistered(address indexed token);
+    event BuybackRegistered(address indexed token, uint8 venue);
     event Notified(address indexed token, uint256 amount, uint256 pending);
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
     event PayoutThresholdSet(address indexed token, uint256 threshold);
@@ -97,9 +111,15 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     error NoTickets();
     error BadProof();
 
-    constructor(address owner_, IPoolManager pm_, IERC20 weth_, address registrar_) Ownable(owner_) {
-        if (address(pm_) == address(0) || address(weth_) == address(0) || registrar_ == address(0)) revert ZeroAddress();
+    constructor(address owner_, IPoolManager pm_, IV3SwapRouter v3Router_, IERC20 weth_, address registrar_)
+        Ownable(owner_)
+    {
+        if (
+            address(pm_) == address(0) || address(v3Router_) == address(0) || address(weth_) == address(0)
+                || registrar_ == address(0)
+        ) revert ZeroAddress();
         poolManager = pm_;
+        v3Router = v3Router_;
         weth = weth_;
         registrar = registrar_;
     }
@@ -117,12 +137,27 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         registrar = registrar_;
     }
 
-    /// @notice Launchpad records the V4 pool where a token's reward asset is bought.
+    /// @notice Launchpad records the **V4** pool where a token's reward asset is bought.
     function registerBuyback(address token, PoolKey calldata key) external {
         if (msg.sender != registrar) revert OnlyRegistrar();
-        _buyback[token] = key;
+        _buyback[token] = BuybackRoute({venue: Venue.V4, v3Fee: 0, v4Key: key});
         registered[token] = true;
-        emit BuybackRegistered(token);
+        emit BuybackRegistered(token, uint8(Venue.V4));
+    }
+
+    /// @notice Launchpad records that a token's reward asset is bought on a **V3**
+    /// pool (WETH/asset at fee tier `fee`) via SwapRouter02.
+    function registerBuybackV3(address token, uint24 fee) external {
+        if (msg.sender != registrar) revert OnlyRegistrar();
+        PoolKey memory empty;
+        _buyback[token] = BuybackRoute({venue: Venue.V3, v3Fee: fee, v4Key: empty});
+        registered[token] = true;
+        emit BuybackRegistered(token, uint8(Venue.V3));
+    }
+
+    /// @notice The venue (0 = V4, 1 = V3) a token's reward buyback runs on.
+    function buybackVenue(address token) external view returns (uint8) {
+        return uint8(_buyback[token].venue);
     }
 
     /// @notice Called by the V4 FeeLocker after forwarding `amount` WETH here.
@@ -166,7 +201,9 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
 
-        out = abi.decode(poolManager.unlock(abi.encode(token, wethIn)), (uint256));
+        out = _buyback[token].venue == Venue.V3
+            ? _buyV3(token, wethIn)
+            : abi.decode(poolManager.unlock(abi.encode(token, wethIn)), (uint256));
         if (out < minOut) revert Slippage();
 
         if (m == LaunchTokenV2.Mode.Burn) {
@@ -278,13 +315,32 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         emit DrawCanceled(token, pd.epoch, pd.prize);
     }
 
+    /// @dev Buy the reward asset on a Uniswap V3 pool via SwapRouter02. `minOut` is
+    /// enforced by the caller (process) on the returned amount, so a plain
+    /// exact-input single-hop suffices here.
+    function _buyV3(address token, uint256 wethIn) internal returns (uint256 out) {
+        address asset = LaunchTokenV2(token).distributionAsset();
+        weth.forceApprove(address(v3Router), wethIn);
+        out = v3Router.exactInputSingle(
+            IV3SwapRouter.ExactInputSingleParams({
+                tokenIn: address(weth),
+                tokenOut: asset,
+                fee: _buyback[token].v3Fee,
+                recipient: address(this),
+                amountIn: wethIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
     /// @dev PoolManager flash-accounting callback: swap WETH -> reward asset, pay
     /// the WETH owed, take the asset bought. Returns the asset amount received.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
         (address token, uint256 wethIn) = abi.decode(data, (address, uint256));
 
-        PoolKey memory key = _buyback[token];
+        PoolKey memory key = _buyback[token].v4Key;
         Currency assetCur = Currency.wrap(LaunchTokenV2(token).distributionAsset());
         Currency wethCur = Currency.wrap(address(weth));
         bool zeroForOne = Currency.unwrap(key.currency0) == address(weth); // WETH is the input

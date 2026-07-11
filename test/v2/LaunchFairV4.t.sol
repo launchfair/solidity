@@ -16,6 +16,7 @@ import {TokenDeployerV2} from "../../src/v2/TokenDeployerV2.sol";
 import {LaunchFairV4} from "../../src/v2/v4/LaunchFairV4.sol";
 import {LaunchFairV4FeeLocker} from "../../src/v2/v4/LaunchFairV4FeeLocker.sol";
 import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.sol";
+import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
 
 contract MockWethT is ERC20 {
     constructor() ERC20("WETH", "WETH") {}
@@ -24,11 +25,43 @@ contract MockWethT is ERC20 {
     }
 }
 
+/// @notice Minimal V3 factory stand-in: records which (tokenA, tokenB, fee) pools
+/// "exist" so the launchpad's reward-pool validation can pass.
+contract MockV3FactoryT {
+    mapping(bytes32 => address) internal _pools;
+
+    function setPool(address a, address b, uint24 fee, address pool) external {
+        _pools[_k(a, b, fee)] = pool;
+    }
+
+    function getPool(address a, address b, uint24 fee) external view returns (address) {
+        return _pools[_k(a, b, fee)];
+    }
+
+    function _k(address a, address b, uint24 fee) internal pure returns (bytes32) {
+        (address x, address y) = a < b ? (a, b) : (b, a);
+        return keccak256(abi.encode(x, y, fee));
+    }
+}
+
+/// @notice Minimal SwapRouter02 stand-in: pulls WETH and mints 2x the reward token
+/// (a mintable MockWethT) to the recipient.
+contract MockV3RouterT {
+    function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external returns (uint256 out) {
+        MockWethT(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        out = p.amountIn * 2;
+        require(out >= p.amountOutMinimum, "slip");
+        MockWethT(p.tokenOut).mint(p.recipient, out);
+    }
+}
+
 /// @notice Capstone: launch a Redistribute token through LaunchFairV4, trade to
 /// generate fees, claim, process, and confirm a holder is auto-rewarded — the
 /// whole V4 pipeline behind one entry point.
 contract LaunchFairV4Test is Test, Deployers {
     MockWethT weth;
+    MockV3FactoryT v3factory;
+    MockV3RouterT v3router;
     TokenDeployerV2 tokenDeployer;
     LaunchFairV4FeeLocker locker;
     LaunchFairV4Distributor dist;
@@ -41,14 +74,18 @@ contract LaunchFairV4Test is Test, Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         weth = new MockWethT();
+        v3factory = new MockV3FactoryT();
+        v3router = new MockV3RouterT();
 
         tokenDeployer = new TokenDeployerV2();
         locker = new LaunchFairV4FeeLocker(address(this), manager, IERC20(address(weth)), TREASURY);
         // registrar placeholder = this; repointed to the launchpad below.
-        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist = new LaunchFairV4Distributor(
+            address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this)
+        );
         pad = new LaunchFairV4(
-            address(this), manager, locker, address(dist), tokenDeployer, address(weth),
-            SUPPLY, 1e18, int24(200), int24(200), int24(60_000), 0, 0, "https://hood.launchfair.app"
+            address(this), manager, IUniswapV3Factory(address(v3factory)), locker, address(dist), tokenDeployer,
+            address(weth), SUPPLY, 1e18, int24(200), int24(200), int24(60_000), 0, 0, "https://hood.launchfair.app"
         );
 
         locker.setLaunchpad(address(pad));
@@ -71,6 +108,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Increasing, // Redistribute
                 fee: 30_000,
                 rewardToken: address(0),
+                rewardIsV3: false,
+                rewardV3Fee: 0,
                 rewardPoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0
@@ -128,6 +167,74 @@ contract LaunchFairV4Test is Test, Deployers {
         assertGt(IERC20(token).balanceOf(HOLDER), before, "reward auto-pushed to wallet");
     }
 
+    // A Reward token whose reward asset trades on Uniswap V3 (not an exclusive V4
+    // pool): the dev picks it, the launchpad validates the V3 pool exists and wires
+    // a V3 buyback, and process() routes the swap through SwapRouter02.
+    function test_endToEnd_reward_v3RewardToken() public {
+        MockWethT reward = new MockWethT();
+        v3factory.setPool(address(weth), address(reward), 10_000, address(0xBEEF)); // pool exists
+
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "RewV3",
+                symbol: "RV3",
+                metadata: meta,
+                salt: bytes32(uint256(2)),
+                mode: LaunchTokenV2.Mode.Reward,
+                fee: 30_000,
+                rewardToken: address(reward),
+                rewardIsV3: true,
+                rewardV3Fee: 10_000,
+                rewardPoolKey: none,
+                minHold: 0,
+                payoutThreshold: 0
+            })
+        );
+        assertEq(dist.buybackVenue(token), 1, "wired to a V3 buyback");
+
+        PoolKey memory key = pad.getLaunch(token).key;
+        _buy(key, token, 50_000 ether);
+        IERC20(token).transfer(HOLDER, IERC20(token).balanceOf(address(this)));
+
+        locker.claim(token);
+        assertGt(dist.pendingWeth(token), 0, "mechanism WETH pending");
+
+        uint256 out = dist.process(token, 0);
+        assertGt(out, 0, "reward bought via V3 router");
+        assertGt(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "HOLDER accrued the reward");
+
+        vm.prank(HOLDER);
+        LaunchTokenV2(token).claim();
+        assertGt(reward.balanceOf(HOLDER), 0, "HOLDER received the V3-bought reward token");
+    }
+
+    // A V3 reward whose pool doesn't exist is rejected at creation (no un-routable
+    // buyback can be locked in).
+    function test_reward_v3_rejectsMissingPool() public {
+        MockWethT reward = new MockWethT(); // factory has no pool registered for it
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        vm.expectRevert(LaunchFairV4.InvalidRewardPool.selector);
+        pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Bad",
+                symbol: "BAD",
+                metadata: meta,
+                salt: bytes32(uint256(3)),
+                mode: LaunchTokenV2.Mode.Reward,
+                fee: 30_000,
+                rewardToken: address(reward),
+                rewardIsV3: true,
+                rewardV3Fee: 10_000,
+                rewardPoolKey: none,
+                minHold: 0,
+                payoutThreshold: 0
+            })
+        );
+    }
+
     function _createLottery() internal returns (address token, PoolKey memory key) {
         LaunchTokenV2.Metadata memory meta;
         PoolKey memory none;
@@ -140,6 +247,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Lottery,
                 fee: 100_000, // 10% fee -> a beefy pot
                 rewardToken: address(0), // WETH prize
+                rewardIsV3: false,
+                rewardV3Fee: 0,
                 rewardPoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0

@@ -23,9 +23,11 @@ import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 import {TokenDeployerV2} from "../TokenDeployerV2.sol";
 import {LaunchFairV4FeeLocker} from "./LaunchFairV4FeeLocker.sol";
 import {LiquidityMath} from "./LiquidityMath.sol";
+import {IUniswapV3Factory} from "../../interfaces/IUniswapV3.sol";
 
 interface IDistributorV4Register {
     function registerBuyback(address token, PoolKey calldata key) external;
+    function registerBuybackV3(address token, uint24 fee) external;
     function setPayoutThreshold(address token, uint256 amount) external;
 }
 
@@ -33,6 +35,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     IPoolManager public immutable poolManager;
+    IUniswapV3Factory public immutable v3Factory; // validates V3 reward pools exist
     LaunchFairV4FeeLocker public immutable locker;
     address public immutable distributor;
     TokenDeployerV2 public immutable deployer;
@@ -67,7 +70,12 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Burn / Lottery
         uint24 fee; // 30000 / 50000 / 100000
         address rewardToken; // Reward mode only
-        PoolKey rewardPoolKey; // Reward mode: the V4 pool to buy the reward token on
+        // Reward mode: where the reward token is bought. `rewardIsV3` picks the
+        // venue — a Uniswap V3 pool (WETH/reward at `rewardV3Fee`) or a V4 pool
+        // (`rewardPoolKey`). Most established tokens on this chain are V3.
+        bool rewardIsV3;
+        uint24 rewardV3Fee; // Reward + V3: the V3 pool fee tier
+        PoolKey rewardPoolKey; // Reward + V4: the V4 pool to buy the reward token on
         uint256 minHold; // min balance to earn rewards
         uint256 payoutThreshold; // min pending WETH before a payout fires
     }
@@ -83,6 +91,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     error InvalidFee();
     error InvalidMode();
     error InvalidRewardToken();
+    error InvalidRewardPool();
     error InvalidMetadata();
     error InsufficientCreationFee();
     error CreationFeeTransferFailed();
@@ -91,6 +100,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     constructor(
         address owner_,
         IPoolManager pm_,
+        IUniswapV3Factory v3Factory_,
         LaunchFairV4FeeLocker locker_,
         address distributor_,
         TokenDeployerV2 deployer_,
@@ -105,10 +115,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         string memory website_
     ) Ownable(owner_) {
         if (
-            address(pm_) == address(0) || address(locker_) == address(0) || distributor_ == address(0)
-                || address(deployer_) == address(0) || weth_ == address(0)
+            address(pm_) == address(0) || address(v3Factory_) == address(0) || address(locker_) == address(0)
+                || distributor_ == address(0) || address(deployer_) == address(0) || weth_ == address(0)
         ) revert ZeroAddress();
         poolManager = pm_;
+        v3Factory = v3Factory_;
         locker = locker_;
         distributor = distributor_;
         deployer = deployer_;
@@ -139,6 +150,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         if (p.mode == LaunchTokenV2.Mode.Reward) {
             if (p.rewardToken == address(0) || p.rewardToken == weth) revert InvalidRewardToken();
             rewardToken = p.rewardToken;
+            // For a V3 reward, the WETH/reward pool at the chosen fee must exist —
+            // otherwise the buyback would be permanently unroutable.
+            if (p.rewardIsV3 && v3Factory.getPool(weth, rewardToken, p.rewardV3Fee) == address(0)) {
+                revert InvalidRewardPool();
+            }
         }
 
         token = deployer.deploy(
@@ -212,8 +228,12 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // buyback pool to register.
             t.setBuySource(address(poolManager));
             t.setLotteryOperator(distributor);
+        } else if (p.mode == LaunchTokenV2.Mode.Reward && p.rewardIsV3) {
+            // Reward token bought on a Uniswap V3 pool (WETH/reward at rewardV3Fee).
+            IDistributorV4Register(distributor).registerBuybackV3(token, p.rewardV3Fee);
         } else {
-            // Register the buyback pool: reward token's pool (Reward) or own pool.
+            // V4 buyback pool: the reward token's pool (Reward) or the token's own
+            // pool (Redistribute / Burn buy back the token itself).
             PoolKey memory buybackKey = p.mode == LaunchTokenV2.Mode.Reward ? p.rewardPoolKey : key;
             IDistributorV4Register(distributor).registerBuyback(token, buybackKey);
         }

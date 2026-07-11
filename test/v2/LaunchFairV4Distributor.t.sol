@@ -12,11 +12,27 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 import {LaunchTokenV2} from "../../src/v2/LaunchTokenV2.sol";
 import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.sol";
+import {IV3SwapRouter} from "../../src/interfaces/IUniswapV3.sol";
 
 contract MockToken is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
     function mint(address to, uint256 amt) external {
         _mint(to, amt);
+    }
+}
+
+/// @notice Stand-in for SwapRouter02: pulls WETH from the caller and mints a fixed
+/// multiple of the reward token to the recipient — enough to exercise the
+/// distributor's V3 buyback path (approve -> swap -> receive) without a real V3
+/// pool. tokenOut must be a MockToken (mintable).
+contract MockV3Router {
+    uint256 public rate = 2; // reward out per WETH in
+
+    function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external returns (uint256 out) {
+        IERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        out = p.amountIn * rate;
+        require(out >= p.amountOutMinimum, "slippage");
+        MockToken(p.tokenOut).mint(p.recipient, out);
     }
 }
 
@@ -26,6 +42,7 @@ contract MockToken is ERC20 {
 contract V4DistributorTest is Test, Deployers {
     LaunchFairV4Distributor dist;
     MockToken weth;
+    MockV3Router v3router;
     address constant A = address(0xA1);
     address constant B = address(0xB2);
     uint256 constant SUPPLY = 1_000_000_000 ether;
@@ -62,7 +79,7 @@ contract V4DistributorTest is Test, Deployers {
             ZERO_BYTES
         );
 
-        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
         dist.registerBuyback(address(token), key);
 
@@ -76,6 +93,7 @@ contract V4DistributorTest is Test, Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         weth = new MockToken("WETH", "WETH");
+        v3router = new MockV3Router();
     }
 
     function test_redistribute_buysBackAndDistributes() public {
@@ -117,7 +135,7 @@ contract V4DistributorTest is Test, Deployers {
             ZERO_BYTES
         );
 
-        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
         dist.registerBuyback(address(token), rkey); // buy the REWARD token here
 
@@ -139,6 +157,50 @@ contract V4DistributorTest is Test, Deployers {
         token.claim();
         assertGt(reward.balanceOf(A), 0, "A received the reward token");
         assertEq(reward.balanceOf(address(token)), out - reward.balanceOf(A), "rest still claimable in token");
+    }
+
+    // A Reward token whose reward asset lives on a Uniswap V3 pool: the buyback
+    // routes through SwapRouter02 instead of the V4 PoolManager.
+    function test_reward_v3_buysExternalTokenOnV3AndDistributes() public {
+        MockToken reward = new MockToken("RewardV3", "RV3");
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Reward, address(reward), address(0));
+
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        dist.setLocker(address(this));
+        dist.registerBuybackV3(address(token), 10_000); // buy the reward on a V3 pool
+        assertEq(dist.buybackVenue(address(token)), 1, "venue = V3");
+
+        token.excludeFromDividends(address(dist), true);
+        token.transfer(A, 300_000 ether);
+        token.transfer(B, 100_000 ether);
+
+        uint256 wethIn = 10 ether;
+        weth.mint(address(dist), wethIn);
+        dist.notify(address(token), wethIn);
+        uint256 out = dist.process(address(token), 0);
+
+        assertEq(out, wethIn * v3router.rate(), "bought reward via the V3 router");
+        assertEq(weth.balanceOf(address(dist)), 0, "all pending WETH swapped");
+        assertApproxEqRel(token.withdrawableDividendOf(A), token.withdrawableDividendOf(B) * 3, 0.01e18, "A ~3x B");
+        vm.prank(A);
+        token.claim();
+        assertGt(reward.balanceOf(A), 0, "A received the V3-bought reward token");
+    }
+
+    function test_reward_v3_slippageGuards() public {
+        MockToken reward = new MockToken("RewardV3", "RV3");
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Reward, address(reward), address(0));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        dist.setLocker(address(this));
+        dist.registerBuybackV3(address(token), 10_000);
+        token.excludeFromDividends(address(dist), true);
+        token.transfer(A, 100_000 ether);
+
+        weth.mint(address(dist), 5 ether);
+        dist.notify(address(token), 5 ether); // out would be 10 ether
+        vm.expectRevert(LaunchFairV4Distributor.Slippage.selector);
+        dist.process(address(token), 100 ether); // demand more than the swap yields
+        assertEq(dist.pendingWeth(address(token)), 5 ether, "revert rolled back the pending debit");
     }
 
     function test_burn_buysBackAndBurns() public {
@@ -181,7 +243,7 @@ contract V4DistributorTest is Test, Deployers {
     // "Buys" are transfers from buySource (this) so holders earn tickets ∝ amount.
     function _setupLottery() internal returns (LaunchTokenV2 token) {
         token = _deployToken(LaunchTokenV2.Mode.Lottery, address(0), address(0));
-        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));      // this feeds the pot via notify
         dist.setDrawOperator(address(this)); // this is the keeper (commits/settles)
         token.setBuySource(address(this));   // "buys" originate here → earn tickets
@@ -318,7 +380,7 @@ contract V4DistributorTest is Test, Deployers {
 
     function test_lottery_commitRejectsNonLottery() public {
         LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
-        dist = new LaunchFairV4Distributor(address(this), manager, IERC20(address(weth)), address(this));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setDrawOperator(address(this));
         vm.expectRevert(LaunchFairV4Distributor.NotLottery.selector);
         dist.commitDraw(address(token), 1);

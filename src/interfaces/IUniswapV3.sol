@@ -8,6 +8,22 @@ interface IUniswapV3Factory {
     function createPool(address tokenA, address tokenB, uint24 fee) external returns (address);
 }
 
+/// @notice SwapRouter02's exact-input single-hop swap (no deadline in the struct).
+/// Used to buy a reward token that lives on a Uniswap V3 pool.
+interface IV3SwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
 interface IWETH {
     function deposit() external payable;
 }
