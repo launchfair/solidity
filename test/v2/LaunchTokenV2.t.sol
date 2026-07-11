@@ -217,11 +217,6 @@ contract LaunchTokenV2Test is Test {
         assertEq(t.ticketsOf(e, B), 100 ether, "B tickets");
         assertEq(t.totalTickets(e), 400 ether, "session total");
 
-        // A normal transfer (not from the pool) earns NO tickets.
-        vm.prank(A);
-        t.transfer(B, 50 ether);
-        assertEq(t.ticketsOf(e, B), 100 ether, "no tickets on plain transfer");
-
         // Draw advances the epoch → tickets reset; old session preserved.
         uint256 closed = t.advanceLotteryEpoch();
         assertEq(closed, e, "closed the old session");
@@ -235,6 +230,51 @@ contract LaunchTokenV2Test is Test {
         t.transfer(A, 200 ether);
         assertEq(t.ticketsOf(e2, A), 200 ether, "new session buy");
         assertEq(t.ticketsOf(e, A), 300 ether, "old session unchanged");
+    }
+
+    // Selling (or transferring out) removes tickets: your odds track tokens bought
+    // this session and STILL held. A buy→sell round-trip nets zero.
+    function test_lottery_sellRemovesTickets() public {
+        LaunchTokenV2 t = new LaunchTokenV2(
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+        );
+        t.setBuySource(POOL);
+        t.setLotteryOperator(address(this));
+        t.excludeFromDividends(POOL, true);
+        t.transfer(POOL, SUPPLY);
+        uint256 e = t.lotteryEpoch();
+
+        vm.prank(POOL);
+        t.transfer(A, 300 ether); // A buys 300
+        vm.prank(POOL);
+        t.transfer(B, 100 ether); // B buys 100
+        assertEq(t.totalTickets(e), 400 ether, "start");
+
+        // A sells 100 back to the pool → tickets drop by 100.
+        vm.prank(A);
+        t.transfer(POOL, 100 ether);
+        assertEq(t.ticketsOf(e, A), 200 ether, "sell removed tickets");
+        assertEq(t.totalTickets(e), 300 ether, "pool total shrank");
+
+        // A transfers 50 to B → A loses those tickets; B (a receiver) gains none.
+        vm.prank(A);
+        t.transfer(B, 50 ether);
+        assertEq(t.ticketsOf(e, A), 150 ether, "transfer out removed tickets");
+        assertEq(t.ticketsOf(e, B), 100 ether, "receiver earns no tickets");
+        assertEq(t.totalTickets(e), 250 ether, "total tracks net held");
+
+        // Wash trade: B buys 200 more then dumps it all → nets zero tickets.
+        vm.prank(POOL);
+        t.transfer(B, 200 ether); // B tickets 300
+        vm.prank(B);
+        t.transfer(POOL, 300 ether); // dump 300
+        assertEq(t.ticketsOf(e, B), 0, "wash trade nets zero");
+
+        // A dumps the rest → fully out, zero odds.
+        vm.prank(A);
+        t.transfer(POOL, 150 ether);
+        assertEq(t.ticketsOf(e, A), 0, "full seller has no tickets");
+        assertEq(t.totalTickets(e), 0, "nobody eligible after everyone sold");
     }
 
     function test_lottery_onlyOperatorAdvances() public {

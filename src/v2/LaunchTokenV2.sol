@@ -34,7 +34,7 @@ contract LaunchTokenV2 is ERC20Burnable {
         Reward, // 1 — distribute an external reward token to holders
         Increasing, // 2 — distribute THIS token to holders (pro-rata)
         Burn, // 3 — buy back and burn THIS token
-        Lottery // 4 — buys earn session tickets; a random winner takes the pot
+        Lottery // 4 — buys earn tickets (lost on sell); a random holder takes the pot
     }
 
     struct Metadata {
@@ -115,12 +115,14 @@ contract LaunchTokenV2 is ERC20Burnable {
     address public lotteryOperator;
     /// @notice Current lottery session. Tickets reset each draw via a fresh epoch.
     uint256 public lotteryEpoch;
-    /// @notice tickets[epoch][holder] — proportional to their buys that session.
+    /// @notice tickets[epoch][holder] — tokens the holder BOUGHT this session and
+    /// STILL HOLDS. Buys add tickets; any move out (sell/transfer/burn) removes
+    /// them, so selling drops your odds to zero and a buy→sell round-trip nets none.
     mapping(uint256 => mapping(address => uint256)) public ticketsOf;
     /// @notice Total tickets in a session (the odds denominator).
     mapping(uint256 => uint256) public totalTickets;
 
-    event TicketsEarned(uint256 indexed epoch, address indexed buyer, uint256 tickets);
+    event TicketsChanged(uint256 indexed epoch, address indexed holder, uint256 newTickets);
     event LotterySessionAdvanced(uint256 indexed closedEpoch, uint256 newEpoch);
 
     constructor(
@@ -237,14 +239,33 @@ contract LaunchTokenV2 is ERC20Burnable {
             if (to != address(0)) _syncShare(to);
         }
 
-        // Lottery: a buy (tokens leaving the pool to a real wallet) earns tickets
-        // for the CURRENT session, proportional to the amount bought. Tickets are
-        // per-session and reset when the draw advances the epoch.
-        if (mode == Mode.Lottery && value > 0 && from == buySource && to != address(0) && !excludedFromDividends[to]) {
+        // Lottery tickets track tokens BOUGHT this session and STILL HELD:
+        //   • a buy (tokens leaving the pool to a wallet) ADDS tickets;
+        //   • any move OUT of a wallet — sell (to the pool), transfer, or burn —
+        //     REMOVES tickets (down to zero).
+        // So selling drops your odds to zero, a buy→sell round-trip nets nothing,
+        // and moving tokens to another wallet can't launder tickets (the receiver
+        // only earns tickets by buying from the pool). Tickets are per-session and
+        // reset when the draw advances the epoch.
+        if (mode == Mode.Lottery && value > 0) {
             uint256 e = lotteryEpoch;
-            ticketsOf[e][to] += value;
-            totalTickets[e] += value;
-            emit TicketsEarned(e, to, value);
+            if (from == buySource) {
+                if (to != address(0) && !excludedFromDividends[to]) {
+                    uint256 nt = ticketsOf[e][to] + value;
+                    ticketsOf[e][to] = nt;
+                    totalTickets[e] += value;
+                    emit TicketsChanged(e, to, nt);
+                }
+            } else if (from != address(0)) {
+                uint256 held = ticketsOf[e][from];
+                if (held > 0) {
+                    uint256 cut = value < held ? value : held;
+                    uint256 nt = held - cut;
+                    ticketsOf[e][from] = nt;
+                    totalTickets[e] -= cut;
+                    emit TicketsChanged(e, from, nt);
+                }
+            }
         }
     }
 

@@ -93,7 +93,11 @@ Shares are updated on transfer **without touching balances**, so the V4 pool is 
 
 **Launch guard.** During `limitEndBlock` (L1-block based), non-exempt wallets can't exceed `maxWalletAmount` (anti-snipe). Plumbing is limit-exempt.
 
-**Lottery tickets.** In `_update`, a transfer **from `buySource` (the PoolManager)** to a non-excluded wallet credits `ticketsOf[epoch][to] += value` and `totalTickets[epoch] += value`. Tickets are per-session; `advanceLotteryEpoch` (distributor-only) resets them by moving to a fresh epoch.
+**Lottery tickets.** In `_update`, tickets track **tokens bought this session and still held**:
+- a **buy** (transfer *from* `buySource`, the PoolManager) adds `ticketsOf[epoch][to] += value`;
+- any **move out** of a wallet — sell (to the pool), transfer, or burn — removes `min(value, held)` from the sender's tickets.
+
+So selling drops your odds to zero, a buy→sell round-trip nets nothing, and a receiver only earns tickets by buying from the pool (transfers can't launder tickets). Tickets are per-session; `advanceLotteryEpoch` (distributor-only) resets them via a fresh epoch. `TicketsChanged(epoch, holder, newTickets)` is emitted on every change so the keeper/verifier can reconstruct final balances.
 
 Set-once launchpad wiring: `setPool`, `setBuySource`, `setLotteryOperator`. `owner()` returns `address(0)` (renounced appearance). `contractURI()` is a plain bot-readable URL; every metadata field is also a plain getter.
 
@@ -135,6 +139,8 @@ Draw history is on-chain: `drawCount(token)` + `draws(token, i)` return `{epoch,
 
 **Randomness = drand.** The keeper commits to a future drand round (its BLS-signed beacon doesn't exist yet, so it can't be known or ground), then settles once it's public. `prevrandao` on this chain is constant, so it can't be used.
 
+**Self-paying & self-funding.** The prize is **pushed** to the winner inside `settleDraw` — there is no claim step. Meanwhile new buy-fees keep flowing to `pendingWeth`, which becomes the **next** session's pot, so rounds fund themselves with no extra plumbing. A keeper is still required for *timing* — someone has to bring the drand beacon on-chain (the contract can't fetch it) and pick the commit round — but the payout itself is automatic.
+
 ---
 
 ## 4. Security review
@@ -152,7 +158,7 @@ if (winnerTickets == 0 || winningTicket < cumulativeStart
 ```
 The operator supplies both `winner` and `cumulativeStart`. Setting **`cumulativeStart = winningTicket`** satisfies the check for **any** ticket holder with `winnerTickets > 0` (then `wt ≥ wt` and `wt < wt + winnerTickets`). So the on-chain check only guarantees *"the named winner holds ≥ 1 ticket in the drawn epoch"* — **not** that they own the drawn ticket.
 
-Consequences: a malicious or compromised `drawOperator` could direct the prize to any ticket holder (e.g., an address it controls that bought a minimal ticket). No funds leave the ticket-holder set, and it is **publicly detectable** (anyone recomputes the true winner from `TicketsEarned` + the drand beacon), but on-chain it is not prevented.
+Consequences: a malicious or compromised `drawOperator` could direct the prize to any ticket holder (e.g., an address it controls that bought a minimal ticket **and still holds it** — sold-out addresses now have zero tickets and are rejected). No funds leave the current-holder set, and it is **publicly detectable** (anyone recomputes the true winner from `TicketsChanged` + the drand beacon), but on-chain it is not prevented.
 
 Today this is acceptable *because* the operator is our own keeper and the draw is auditable — but it should be stated plainly, not sold as a trustless proof. Options, if you want to reduce trust:
 - Enforce a **canonical on-chain ticket ordering** (e.g., a running cumulative index emitted/stored at buy time) and check `cumulativeStart` against it — costs gas per buy.
@@ -167,9 +173,9 @@ Today this is acceptable *because* the operator is our own keeper and the draw i
 
 Tickets accrue on `PoolManager → wallet` transfers. If the production swap router `take`s the output **to itself** and then forwards to the user, the **router** earns the tickets (and could even become the drawn "winner"), while the buyer gets none. Verify the router used on this chain settles output straight to the recipient; if not, exclude that router (and consider crediting the ultimate recipient instead). The direct-`take` pattern (used by the standard V4 router and the test harness) works correctly.
 
-### 4.4 [LOW · economic, by design] Tickets reward buy **volume**, not holding
+### 4.4 [RESOLVED] Tickets now track holding, not just buy volume
 
-A buyer can `buy → sell` round-trip and **keep the tickets** while holding nothing at draw time; tickets are also **farmable by wash-trading**. This matches the requested "each buy = tickets" design, and every farmed ticket pays fees that *fund the pot* — but note that (a) the winner need not still hold the token, and (b) a whale can buy influence over the odds (proportionally, at fee cost). If "holders win" is desired instead, credit tickets on net-held balance rather than buy value.
+*Previously* tickets rewarded buy volume and were kept after selling, so they were wash-farmable and the winner need not still hold. **Fixed:** a move out of a wallet (sell/transfer/burn) now removes tickets, so a `buy → sell` round-trip nets zero, a fully-sold holder has zero odds (and is rejected on-chain by the `winnerTickets > 0` check), and only current holders of this session's buys are eligible. Tickets = tokens bought this session and still held.
 
 ### 4.5 [LOW · griefing] Permissionless `fundRewards` + tiny `totalShares` can inflate `magnifiedDividendPerShare`
 

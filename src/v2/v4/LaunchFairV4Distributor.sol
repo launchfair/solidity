@@ -263,7 +263,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     /// committed round (re-verifiable off-chain against drand's public key). The
     /// winning ticket is derived here on-chain from it (tamper-evident); the caller
     /// supplies `winner` + its `cumulativeStart` (the winner's ticket offset in the
-    /// canonical TicketsEarned order) and we prove on-chain the drawn ticket lands
+    /// canonical TicketsChanged order) and we prove on-chain the drawn ticket lands
     /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. The session and pot
     /// were frozen at commit, so this pays out the reserved prize and records it.
     ///
