@@ -39,7 +39,9 @@ interface ICreatorRegistryV4 {
 /// `settleDraw` pays the winner once that beacon is public and records the draw
 /// on-chain (verifiable, powerball-style). Ticket sales for the drawn session end
 /// at commit — buys after that count toward the next session — so no one can act
-/// on the randomness once it's revealed. See the lottery section below.
+/// on the randomness once it's revealed. The prize is the WETH pot, paid as WETH
+/// or as a dev-chosen prize token bought with it on the same V3/V4 venue as a
+/// reward buyback. See the lottery section below.
 contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     using SafeERC20 for IERC20;
     using BalanceDeltaLibrary for BalanceDelta;
@@ -201,9 +203,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
 
-        out = _buyback[token].venue == Venue.V3
-            ? _buyV3(token, wethIn)
-            : abi.decode(poolManager.unlock(abi.encode(token, wethIn)), (uint256));
+        out = _buyAsset(token, LaunchTokenV2(token).distributionAsset(), wethIn);
         if (out < minOut) revert Slippage();
 
         if (m == LaunchTokenV2.Mode.Burn) {
@@ -265,11 +265,18 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     /// supplies `winner` + its `cumulativeStart` (the winner's ticket offset in the
     /// canonical TicketsEarned order) and we prove on-chain the drawn ticket lands
     /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. The session and pot
-    /// were frozen at commit, so this just pays the reserved prize and records it.
-    function settleDraw(address token, bytes32 randomness, address winner, uint256 cumulativeStart)
-        external
-        nonReentrant
-    {
+    /// were frozen at commit, so this pays out the reserved prize and records it.
+    ///
+    /// The prize is the reserved WETH pot, paid either as WETH (default) or as the
+    /// dev-chosen prize token bought with it on the token's registered V3/V4 venue
+    /// (`minPrizeOut` guards that swap; ignored for a WETH prize).
+    function settleDraw(
+        address token,
+        bytes32 randomness,
+        address winner,
+        uint256 cumulativeStart,
+        uint256 minPrizeOut
+    ) external nonReentrant {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         PendingDraw memory pd = pendingDraw[token];
         if (!pd.active) revert NoDraw();
@@ -297,7 +304,16 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
             timestamp: uint64(block.timestamp)
         }));
 
-        if (pd.prize > 0) weth.safeTransfer(winner, pd.prize);
+        if (pd.prize > 0) {
+            address prizeToken = t.rewardToken(); // 0 => WETH prize
+            if (prizeToken == address(0)) {
+                weth.safeTransfer(winner, pd.prize);
+            } else {
+                uint256 bought = _buyAsset(token, prizeToken, pd.prize);
+                if (bought < minPrizeOut) revert Slippage();
+                IERC20(prizeToken).safeTransfer(winner, bought);
+            }
+        }
 
         emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, pd.prize, randomness, winningTicket);
     }
@@ -315,11 +331,18 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         emit DrawCanceled(token, pd.epoch, pd.prize);
     }
 
-    /// @dev Buy the reward asset on a Uniswap V3 pool via SwapRouter02. `minOut` is
-    /// enforced by the caller (process) on the returned amount, so a plain
-    /// exact-input single-hop suffices here.
-    function _buyV3(address token, uint256 wethIn) internal returns (uint256 out) {
-        address asset = LaunchTokenV2(token).distributionAsset();
+    /// @dev Buy `asset` with `wethIn` on the token's registered buyback venue (V3
+    /// SwapRouter02 or V4 PoolManager). The caller enforces slippage on the return.
+    /// Used both for reward buybacks and for converting a lottery pot to its prize
+    /// token, so the target asset is passed in rather than derived.
+    function _buyAsset(address token, address asset, uint256 wethIn) internal returns (uint256 out) {
+        return _buyback[token].venue == Venue.V3
+            ? _buyV3(token, asset, wethIn)
+            : abi.decode(poolManager.unlock(abi.encode(token, asset, wethIn)), (uint256));
+    }
+
+    /// @dev Buy `asset` on a Uniswap V3 pool via SwapRouter02 (exact-input single-hop).
+    function _buyV3(address token, address asset, uint256 wethIn) internal returns (uint256 out) {
         weth.forceApprove(address(v3Router), wethIn);
         out = v3Router.exactInputSingle(
             IV3SwapRouter.ExactInputSingleParams({
@@ -334,14 +357,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         );
     }
 
-    /// @dev PoolManager flash-accounting callback: swap WETH -> reward asset, pay
-    /// the WETH owed, take the asset bought. Returns the asset amount received.
+    /// @dev PoolManager flash-accounting callback: swap WETH -> `asset`, pay the
+    /// WETH owed, take the asset bought. Returns the asset amount received.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
-        (address token, uint256 wethIn) = abi.decode(data, (address, uint256));
+        (address token, address asset, uint256 wethIn) = abi.decode(data, (address, address, uint256));
 
         PoolKey memory key = _buyback[token].v4Key;
-        Currency assetCur = Currency.wrap(LaunchTokenV2(token).distributionAsset());
+        Currency assetCur = Currency.wrap(asset);
         Currency wethCur = Currency.wrap(address(weth));
         bool zeroForOne = Currency.unwrap(key.currency0) == address(weth); // WETH is the input
 

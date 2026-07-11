@@ -290,7 +290,7 @@ contract V4DistributorTest is Test, Deployers {
         (address winner, uint256 start) = _resolveWinner(token, 0, winningTicket);
 
         uint256 balBefore = weth.balanceOf(winner);
-        dist.settleDraw(address(token), rnd, winner, start);
+        dist.settleDraw(address(token), rnd, winner, start, 0);
 
         assertEq(weth.balanceOf(winner) - balBefore, pot, "winner paid the whole pot");
         assertEq(dist.drawCount(address(token)), 1, "draw recorded in history");
@@ -327,7 +327,7 @@ contract V4DistributorTest is Test, Deployers {
         // Lie about the winner's offset → the drawn ticket falls outside their range.
         uint256 wrongStart = winner == A ? uint256(300_000 ether) : uint256(0);
         vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
-        dist.settleDraw(address(token), rnd, winner, wrongStart);
+        dist.settleDraw(address(token), rnd, winner, wrongStart, 0);
     }
 
     function test_lottery_wrongWinnerReverts() public {
@@ -338,7 +338,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 7);
         // B has zero tickets in the drawn epoch → can never be a valid winner.
         vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
-        dist.settleDraw(address(token), keccak256("y"), B, 0);
+        dist.settleDraw(address(token), keccak256("y"), B, 0, 0);
     }
 
     // An empty session can't be committed — nothing to draw.
@@ -360,7 +360,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 1);
         vm.prank(A);
         vm.expectRevert(LaunchFairV4Distributor.OnlyDrawOperator.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0);
+        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
     }
 
     function test_lottery_doubleCommitReverts() public {
@@ -375,7 +375,7 @@ contract V4DistributorTest is Test, Deployers {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
         vm.expectRevert(LaunchFairV4Distributor.NoDraw.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0);
+        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
     }
 
     function test_lottery_commitRejectsNonLottery() public {
@@ -411,7 +411,7 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(dist.drawCount(address(token)), 0, "no draw recorded");
         // Nothing pending now → settle reverts.
         vm.expectRevert(LaunchFairV4Distributor.NoDraw.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0);
+        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
     }
 
     // A second session only counts buys made after the previous draw was committed.
@@ -428,7 +428,7 @@ contract V4DistributorTest is Test, Deployers {
 
         uint256 wt = _ticketFor(address(token), keccak256("r1"), 1, token.totalTickets(0));
         (address w1, uint256 s1) = _resolveWinner(token, 0, wt);
-        dist.settleDraw(address(token), keccak256("r1"), w1, s1);
+        dist.settleDraw(address(token), keccak256("r1"), w1, s1, 0);
 
         // Epoch 1: only A buys again. Old (epoch 0) tickets are gone.
         token.transfer(A, 50_000 ether);
@@ -439,8 +439,51 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 2); // closes epoch 1 → now epoch 2
         uint256 balBefore = weth.balanceOf(A);
         // A owns the whole epoch-1 pool → A wins regardless of randomness.
-        dist.settleDraw(address(token), keccak256("r2"), A, 0);
+        dist.settleDraw(address(token), keccak256("r2"), A, 0, 0);
         assertEq(weth.balanceOf(A) - balBefore, 2 ether, "epoch-1 winner paid");
         assertEq(dist.drawCount(address(token)), 2, "two draws in history");
+    }
+
+    // A lottery whose prize is a dev-chosen token (bought with the pot on V3),
+    // rather than WETH: the winner is paid in that token.
+    function _setupLotteryWithPrize(address prize) internal returns (LaunchTokenV2 token) {
+        token = _deployToken(LaunchTokenV2.Mode.Lottery, prize, address(0)); // prize == rewardToken
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        dist.setLocker(address(this));
+        dist.setDrawOperator(address(this));
+        token.setBuySource(address(this));
+        token.setLotteryOperator(address(dist));
+        dist.registerBuybackV3(address(token), 10_000); // prize bought on a V3 pool
+    }
+
+    function test_lottery_tokenPrize_boughtAndPaidToWinner() public {
+        MockToken prize = new MockToken("Prize", "PRZ");
+        LaunchTokenV2 token = _setupLotteryWithPrize(address(prize));
+        token.transfer(A, 200_000 ether); // A owns every ticket
+
+        uint256 pot = 3 ether;
+        weth.mint(address(dist), pot);
+        dist.notify(address(token), pot);
+        dist.commitDraw(address(token), 1);
+        dist.settleDraw(address(token), keccak256("r"), A, 0, 0);
+
+        // Pot swapped to the prize token (mock rate 2x) and paid to the winner.
+        assertEq(prize.balanceOf(A), pot * v3router.rate(), "winner paid in the prize token");
+        assertEq(weth.balanceOf(A), 0, "not paid in WETH");
+        assertEq(weth.balanceOf(address(dist)), 0, "pot fully swapped");
+        (,,,, uint256 recordedPrize,,,) = dist.draws(address(token), 0);
+        assertEq(recordedPrize, pot, "draw records the WETH pot value");
+    }
+
+    function test_lottery_tokenPrize_slippageGuards() public {
+        MockToken prize = new MockToken("Prize", "PRZ");
+        LaunchTokenV2 token = _setupLotteryWithPrize(address(prize));
+        token.transfer(A, 100_000 ether);
+        weth.mint(address(dist), 2 ether);
+        dist.notify(address(token), 2 ether);
+        dist.commitDraw(address(token), 1);
+        // out would be 4 (2 * rate); demanding more must revert.
+        vm.expectRevert(LaunchFairV4Distributor.Slippage.selector);
+        dist.settleDraw(address(token), keccak256("r"), A, 0, 100 ether);
     }
 }

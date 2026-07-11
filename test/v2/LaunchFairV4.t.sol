@@ -291,9 +291,53 @@ contract LaunchFairV4Test is Test, Deployers {
         assertLt(wt, myTickets, "winning ticket falls in our range");
 
         uint256 balBefore = weth.balanceOf(address(this));
-        dist.settleDraw(token, rnd, address(this), 0);
+        dist.settleDraw(token, rnd, address(this), 0, 0);
 
         assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
         assertEq(dist.drawCount(token), 1, "draw recorded in history");
+    }
+
+    // A lottery whose prize is a dev-chosen token that trades on V3: the launchpad
+    // wires the prize's V3 buyback venue, and at settle the pot is swapped to the
+    // prize token and paid to the winner.
+    function test_endToEnd_lottery_v3PrizeToken() public {
+        MockWethT prize = new MockWethT();
+        v3factory.setPool(address(weth), address(prize), 10_000, address(0xBEEF));
+
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "LottoTok",
+                symbol: "LTK",
+                metadata: meta,
+                salt: bytes32(uint256(4)),
+                mode: LaunchTokenV2.Mode.Lottery,
+                fee: 100_000,
+                rewardToken: address(prize), // token prize (not WETH)
+                rewardIsV3: true,
+                rewardV3Fee: 10_000,
+                rewardPoolKey: none,
+                minHold: 0,
+                payoutThreshold: 0
+            })
+        );
+        assertEq(dist.buybackVenue(token), 1, "prize bought on V3");
+        assertEq(LaunchTokenV2(token).rewardToken(), address(prize), "prize token recorded");
+
+        PoolKey memory key = pad.getLaunch(token).key;
+        dist.setDrawOperator(address(this));
+        _buy(key, token, 50_000 ether); // this session earns all tickets
+        uint256 epoch = LaunchTokenV2(token).lotteryEpoch();
+
+        locker.claim(token);
+        assertGt(dist.pendingWeth(token), 0, "pot funded");
+
+        dist.commitDraw(token, 42);
+        dist.settleDraw(token, keccak256("beacon"), address(this), 0, 0);
+
+        assertGt(prize.balanceOf(address(this)), 0, "winner paid in the V3 prize token");
+        assertEq(dist.drawCount(token), 1, "draw recorded");
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced");
     }
 }
