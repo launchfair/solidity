@@ -169,9 +169,9 @@ Today this is acceptable *because* the operator is our own keeper and the draw i
 - Switch to **winner-claims-with-a-Merkle-proof**: the operator posts a Merkle root of `(offset → buyer)` at settle; the winner claims by proving membership at `winningTicket`.
 - Keep the trusted-keeper model and **document** it (multisig/hardened key for the operator; a public verifier script).
 
-### 4.2 [MEDIUM · slippage] Buybacks and token-prize swaps run with `minOut = 0` from the keeper
+### 4.2 [LOW · slippage] Buyback slippage bounded; lottery token-prize swap still `minPrizeOut = 0`
 
-`process` and `settleDraw` both accept a `minOut`/`minPrizeOut`, but the keeper currently passes `0`, so the WETH→asset swaps (reward buybacks **and** lottery token prizes) can be **sandwiched**. The contracts are fine — wire a **V3/V4 quoter** in the keeper and pass a real minimum before real value flows. (Already tracked as the pre-mainnet TODO.)
+**Buybacks** (`process`): the keeper now static-calls `process` to quote the expected out and submits `minOut = (100 − SLIPPAGE_PCT)%` (default 15%), so a sandwich beyond the tolerance reverts and it retries — no longer `0`. **Remaining:** the lottery **token-prize** swap in `settleDraw` still passes `minPrizeOut = 0` (only affects lotteries whose prize is a dev token, not WETH prizes) — a small follow-up to quote it the same way.
 
 ### 4.3 [MEDIUM · integration] `buySource = PoolManager` assumes the router `take`s tokens **directly to the buyer**
 
@@ -204,7 +204,7 @@ The pot lives in the distributor and is moved only by `settleDraw`/`cancelDraw` 
 ## 5. Pre-mainnet checklist
 
 - [ ] **Deploy script** for the V4 stack + wiring: locker↔distributor↔launchpad, `drawOperator`, the **VRF coordinator** (`distributor.setVrf` + `vrf.setPoster(keeper)`), the SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` + V3 factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` addresses. *(not written yet)*
-- [ ] **Keeper `minOut`/`minPrizeOut`** via a real V3/V4 quote (fixes §4.2).
+- [x] **Keeper buyback `minOut`** — quoted at 15% (done). *Follow-up:* lottery token-prize `minPrizeOut` (§4.2).
 - [ ] Decide the **lottery trust model** (§4.1) — keep trusted-keeper + document, or harden to on-chain/Merkle selection.
 - [ ] Confirm the production **swap router's `take` recipient** (§4.3).
 - [ ] Put `owner` + `drawOperator` behind a **multisig / hardened key**.

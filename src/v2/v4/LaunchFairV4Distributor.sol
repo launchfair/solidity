@@ -71,6 +71,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// @notice Dev-set minimum pending WETH before a payout fires (anti-dust; the
     /// keeper only processes once it's crossed). 0 = fire on any pending.
     mapping(address token => uint256) public payoutThreshold;
+    /// @notice Dev-set minimum blocks between payouts/draws (a block-based timer).
+    /// Measured in L1 blocks (~12s). 0 = no timer (fire as soon as ready) — which is
+    /// what Redistribute uses ("insta"); Reward/Lottery set an interval.
+    mapping(address token => uint256) public payoutIntervalBlocks;
+    /// @notice L1 block of the token's last payout/draw (the timer's anchor).
+    mapping(address token => uint256) public lastPayoutBlock;
 
     // ── lottery draws (Mode.Lottery) ────────────────────────────────────────────
     struct Draw {
@@ -105,6 +111,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event Notified(address indexed token, uint256 amount, uint256 pending);
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
     event PayoutThresholdSet(address indexed token, uint256 threshold);
+    event PayoutIntervalSet(address indexed token, uint256 intervalBlocks);
     event DrawOperatorSet(address operator);
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
@@ -119,6 +126,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     error NotRegistered();
     error NothingPending();
     error BelowThreshold();
+    error TimerNotElapsed();
     error NotAuthorized();
     error WrongMode();
     error Slippage();
@@ -197,10 +205,24 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit PayoutThresholdSet(token, amount);
     }
 
+    /// @notice The token's dev (creator) — or the launchpad — sets the block-based
+    /// timer: minimum L1 blocks between payouts/draws. 0 = fire as soon as ready.
+    function setPayoutInterval(address token, uint256 intervalBlocks) external {
+        if (msg.sender != registrar && msg.sender != _creator(token)) revert NotAuthorized();
+        payoutIntervalBlocks[token] = intervalBlocks;
+        emit PayoutIntervalSet(token, intervalBlocks);
+    }
+
+    /// @notice Whether the token's block-timer has elapsed since its last payout.
+    function timerElapsed(address token) public view returns (bool) {
+        return block.number >= lastPayoutBlock[token] + payoutIntervalBlocks[token];
+    }
+
     /// @notice True when a payout would succeed — the keeper polls/reacts on this.
+    /// Gated by both the dev's pending-WETH threshold and the block timer.
     function readyToProcess(address token) external view returns (bool) {
         uint256 p = pendingWeth[token];
-        return registered[token] && p > 0 && p >= payoutThreshold[token];
+        return registered[token] && p > 0 && p >= payoutThreshold[token] && timerElapsed(token);
     }
 
     function _creator(address token) internal view returns (address) {
@@ -217,11 +239,13 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         uint256 wethIn = pendingWeth[token];
         if (wethIn == 0) revert NothingPending();
         if (wethIn < payoutThreshold[token]) revert BelowThreshold();
+        if (!timerElapsed(token)) revert TimerNotElapsed();
         if (!registered[token]) revert NotRegistered();
         LaunchTokenV2.Mode m = LaunchTokenV2(token).mode();
         // Base has no mechanism; Lottery uses draw()/settleDraw(), not a buyback.
         if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
+        lastPayoutBlock[token] = block.number; // reset the dev's block timer
 
         out = _buyAsset(token, LaunchTokenV2(token).distributionAsset(), wethIn);
         if (out < minOut) revert Slippage();
@@ -284,10 +308,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (t.mode() != LaunchTokenV2.Mode.Lottery) revert NotLottery();
         if (vrf == address(0)) revert VrfNotSet();
         if (pendingDraw[token].active) revert DrawActive();
+        if (!timerElapsed(token)) revert TimerNotElapsed();
 
         uint256 epoch = t.lotteryEpoch();
         if (t.totalTickets(epoch) == 0) revert NoTickets();
 
+        lastPayoutBlock[token] = block.number;  // reset the dev's block timer
         uint256 prize = pendingWeth[token];
         pendingWeth[token] = 0;                 // reserve the pot for this draw…
         t.advanceLotteryEpoch();                // …and close ticket sales for `epoch`.

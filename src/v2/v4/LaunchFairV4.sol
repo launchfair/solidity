@@ -29,6 +29,7 @@ interface IDistributorV4Register {
     function registerBuyback(address token, PoolKey calldata key) external;
     function registerBuybackV3(address token, uint24 fee) external;
     function setPayoutThreshold(address token, uint256 amount) external;
+    function setPayoutInterval(address token, uint256 intervalBlocks) external;
 }
 
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
@@ -80,6 +81,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         PoolKey rewardPoolKey; // V4: the pool to buy the asset on
         uint256 minHold; // min balance to earn rewards
         uint256 payoutThreshold; // min pending WETH before a payout fires
+        // Block-based timer (L1 blocks, ~12s): min blocks between payouts/draws.
+        // Reward/Lottery set this; Redistribute leaves it 0 ("insta").
+        uint256 payoutIntervalBlocks;
     }
 
     event TokenLaunchedV4(
@@ -245,6 +249,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             IDistributorV4Register(distributor).registerBuyback(token, key);
         }
         if (p.payoutThreshold > 0) IDistributorV4Register(distributor).setPayoutThreshold(token, p.payoutThreshold);
+        if (p.payoutIntervalBlocks > 0) {
+            IDistributorV4Register(distributor).setPayoutInterval(token, p.payoutIntervalBlocks);
+        }
 
         _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, exists: true});
     }

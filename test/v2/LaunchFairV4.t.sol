@@ -116,7 +116,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 rewardV3Fee: 0,
                 rewardPoolKey: none,
                 minHold: 0,
-                payoutThreshold: 0
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
             })
         );
         key = pad.getLaunch(token).key;
@@ -199,7 +200,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 rewardV3Fee: 10_000,
                 rewardPoolKey: none,
                 minHold: 0,
-                payoutThreshold: 0
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
             })
         );
         assertEq(dist.buybackVenue(token), 1, "wired to a V3 buyback");
@@ -240,7 +242,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 rewardV3Fee: 10_000,
                 rewardPoolKey: none,
                 minHold: 0,
-                payoutThreshold: 0
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
             })
         );
     }
@@ -261,7 +264,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 rewardV3Fee: 0,
                 rewardPoolKey: none,
                 minHold: 0,
-                payoutThreshold: 0
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
             })
         );
         key = pad.getLaunch(token).key;
@@ -331,7 +335,8 @@ contract LaunchFairV4Test is Test, Deployers {
                 rewardV3Fee: 10_000,
                 rewardPoolKey: none,
                 minHold: 0,
-                payoutThreshold: 0
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
             })
         );
         assertEq(dist.buybackVenue(token), 1, "prize bought on V3");

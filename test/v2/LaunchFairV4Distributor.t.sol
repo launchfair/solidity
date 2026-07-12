@@ -225,6 +225,31 @@ contract V4DistributorTest is Test, Deployers {
         assertGt(dist.process(address(token), 0), 0, "payout fired");
     }
 
+    // The dev's block timer gates the buyback cadence.
+    function test_payoutInterval_gatesByBlockTimer() public {
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Increasing, address(0), address(0));
+        _setupPoolAndDistributor(token);
+        token.transfer(A, 300_000 ether);
+        dist.setPayoutInterval(address(token), 100); // at most once per 100 blocks
+
+        weth.mint(address(dist), 5 ether);
+        dist.notify(address(token), 5 ether);
+
+        assertFalse(dist.readyToProcess(address(token)), "timer not elapsed yet");
+        vm.expectRevert(LaunchFairV4Distributor.TimerNotElapsed.selector);
+        dist.process(address(token), 0);
+
+        vm.roll(block.number + 100);
+        assertTrue(dist.readyToProcess(address(token)), "timer elapsed");
+        dist.process(address(token), 0);
+        assertEq(dist.lastPayoutBlock(address(token)), block.number, "timer reset to now");
+
+        // The next payout must wait another full interval.
+        weth.mint(address(dist), 5 ether);
+        dist.notify(address(token), 5 ether);
+        assertFalse(dist.readyToProcess(address(token)), "must wait the interval again");
+    }
+
     // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
     // Wire a Lottery token: distributor is its epoch operator + the draw keeper.
     // "Buys" are transfers from buySource (this) so holders earn tickets ∝ amount.
@@ -509,5 +534,21 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(A, 100_000 ether);
         vm.expectRevert(LaunchFairV4Distributor.VrfNotSet.selector);
         dist.commitDraw(address(token), 1);
+    }
+
+    // The dev's block timer also gates how often draws can be committed.
+    function test_lottery_intervalGatesCommit() public {
+        LaunchTokenV2 token = _setupLottery();
+        dist.setPayoutInterval(address(token), 50);
+        token.transfer(A, 100_000 ether);
+        weth.mint(address(dist), 1 ether);
+        dist.notify(address(token), 1 ether);
+
+        vm.expectRevert(LaunchFairV4Distributor.TimerNotElapsed.selector);
+        dist.commitDraw(address(token), 1);
+
+        vm.roll(block.number + 50);
+        dist.commitDraw(address(token), 1); // now allowed
+        assertEq(dist.lastPayoutBlock(address(token)), block.number, "timer reset on commit");
     }
 }
