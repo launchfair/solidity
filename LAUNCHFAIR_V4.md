@@ -9,6 +9,7 @@ Scope: the Uniswap-V4 mode-token stack in `src/v2/` + `src/v2/v4/`.
 | `LaunchFairV4` | Launchpad — creates a token, opens its V4 pool, locks liquidity, wires the mechanism. |
 | `LaunchFairV4FeeLocker` | Owns each token's LP forever; on `claim` collects fees, burns the sell side, splits the buy side. |
 | `LaunchFairV4Distributor` | Turns mechanism WETH into holder rewards (buyback) or a lottery draw. |
+| `LaunchFairVRFCoordinator` | Our own reusable randomness coordinator — brings the (free) drand beacon on-chain and fans it out to every lottery. |
 | `FeeSplitConfig` | The 3/5/10% fee tiers and how the buy-side WETH splits (treasury/dev/mechanism). |
 | `LiquidityMath` | Single-sided liquidity amounts (copied from Uniswap's audited `LiquidityAmounts`). |
 
@@ -132,7 +133,9 @@ Set-once launchpad wiring: `setPool`, `setBuySource`, `setLotteryOperator`. `own
 
 **Lottery path.** The pot is the accrued mechanism WETH. Two-phase, powerball-style:
 1. `commitDraw(token, drandRound)` (operator-only): requires the current session has tickets, then **advances the epoch (closing ticket sales), reserves the pot** as `pd.prize`, and locks the draw to a **future drand round** whose randomness can't yet be known. Buys after this count toward the next session.
-2. `settleDraw(token, randomness, winner, cumulativeStart, minPrizeOut)` (operator-only, `nonReentrant`): derives `winningTicket = keccak256(randomness, token, round) % totalTickets` **on-chain**, checks the winner (see §4.1), records the `Draw`, and pays the reserved prize — **WETH**, or a **dev-chosen prize token** bought with the pot on the same V3/V4 venue (`minPrizeOut` guards that swap).
+2. `settleDraw(token, winner, cumulativeStart, minPrizeOut)` (operator-only, `nonReentrant`): the randomness is **sourced from the VRF coordinator** (pushed to the distributor when the beacon is posted, or pulled from it here) — the keeper can't feed its own value. It derives `winningTicket = keccak256(randomness, token, round) % totalTickets` **on-chain**, checks the winner (see §4.1), records the `Draw`, and pays the reserved prize — **WETH**, or a **dev-chosen prize token** bought with the pot on the same V3/V4 venue (`minPrizeOut` guards that swap).
+
+**Randomness plumbing (`LaunchFairVRFCoordinator`).** Our own contract, deployed once and shared by every lottery — no third-party VRF, no per-request fee (drand is free). A `commitDraw` calls `requestRandomness(round)`; the keeper `postRandomness(round, beacon)` **once** per round, which fans the value out to every lottery on that round (self-emitting) and records it write-once. `settleDraw` reads it from there, so the keeper is trusted only to post the *real* drand value (publicly checkable), not to fabricate one.
 3. `cancelDraw(token)` (operator-only): recovery for a stuck draw — returns the reserved pot to `pendingWeth`.
 
 Draw history is on-chain: `drawCount(token)` + `draws(token, i)` return `{epoch, round, randomness, winner, prize, totalTickets, winningTicket, timestamp}`, re-verifiable off-chain from `TicketsEarned` events + the drand beacon.
@@ -159,6 +162,8 @@ if (winnerTickets == 0 || winningTicket < cumulativeStart
 The operator supplies both `winner` and `cumulativeStart`. Setting **`cumulativeStart = winningTicket`** satisfies the check for **any** ticket holder with `winnerTickets > 0` (then `wt ≥ wt` and `wt < wt + winnerTickets`). So the on-chain check only guarantees *"the named winner holds ≥ 1 ticket in the drawn epoch"* — **not** that they own the drawn ticket.
 
 Consequences: a malicious or compromised `drawOperator` could direct the prize to any ticket holder (e.g., an address it controls that bought a minimal ticket **and still holds it** — sold-out addresses now have zero tickets and are rejected). No funds leave the current-holder set, and it is **publicly detectable** (anyone recomputes the true winner from `TicketsChanged` + the drand beacon), but on-chain it is not prevented.
+
+Note the **randomness itself is no longer keeper-supplied**: `settleDraw` reads it from the VRF coordinator (posted write-once per round, publicly checkable against drand), so the keeper can't grind the *seed* — the remaining trust is only in the winner *selection* it submits.
 
 Today this is acceptable *because* the operator is our own keeper and the draw is auditable — but it should be stated plainly, not sold as a trustless proof. Options, if you want to reduce trust:
 - Enforce a **canonical on-chain ticket ordering** (e.g., a running cumulative index emitted/stored at buy time) and check `cumulativeStart` against it — costs gas per buy.
@@ -199,7 +204,7 @@ The pot lives in the distributor and is moved only by `settleDraw`/`cancelDraw` 
 
 ## 5. Pre-mainnet checklist
 
-- [ ] **Deploy script** for the V4 stack + wiring (locker↔distributor↔launchpad, `drawOperator`, the SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` + V3 factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` addresses). *(not written yet)*
+- [ ] **Deploy script** for the V4 stack + wiring: locker↔distributor↔launchpad, `drawOperator`, the **VRF coordinator** (`distributor.setVrf` + `vrf.setPoster(keeper)`), the SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` + V3 factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` addresses. *(not written yet)*
 - [ ] **Keeper `minOut`/`minPrizeOut`** via a real V3/V4 quote (fixes §4.2).
 - [ ] Decide the **lottery trust model** (§4.1) — keep trusted-keeper + document, or harden to on-chain/Merkle selection.
 - [ ] Confirm the production **swap router's `take` recipient** (§4.3).

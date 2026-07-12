@@ -17,9 +17,15 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 import {IV3SwapRouter} from "../../interfaces/IUniswapV3.sol";
+import {IRandomnessConsumer} from "./LaunchFairVRFCoordinator.sol";
 
 interface ICreatorRegistryV4 {
     function creatorOf(address token) external view returns (address);
+}
+
+interface IVRFCoordinator {
+    function requestRandomness(uint256 round) external returns (uint256 requestId);
+    function randomnessOf(uint256 round) external view returns (bytes32);
 }
 
 /// @notice Turns each mode token's accrued buy-side WETH fees into holder rewards.
@@ -42,7 +48,7 @@ interface ICreatorRegistryV4 {
 /// on the randomness once it's revealed. The prize is the WETH pot, paid as WETH
 /// or as a dev-chosen prize token bought with it on the same V3/V4 venue as a
 /// reward buyback. See the lottery section below.
-contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
+contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, IRandomnessConsumer {
     using SafeERC20 for IERC20;
     using BalanceDeltaLibrary for BalanceDelta;
 
@@ -78,12 +84,21 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         uint64 timestamp;
     }
     // A committed-but-unsettled draw: its session (epoch) and pot are frozen at
-    // commit; only the drand beacon for `round` is still outstanding.
-    struct PendingDraw { uint256 round; uint256 epoch; uint256 prize; bool active; }
+    // commit. `randomness` is delivered by the VRF coordinator (0 until then).
+    struct PendingDraw {
+        uint256 round;
+        uint256 epoch;
+        uint256 prize;
+        uint256 requestId; // the coordinator request this draw waits on
+        bytes32 randomness; // pushed by the coordinator (or pulled at settle)
+        bool active;
+    }
 
     address public drawOperator; // off-chain keeper that commits/settles draws
+    address public vrf; // the shared LaunchFairVRFCoordinator (randomness source)
     mapping(address token => Draw[]) public draws;         // full winner history
     mapping(address token => PendingDraw) public pendingDraw;
+    mapping(uint256 requestId => address token) public requestToken; // VRF callback routing
 
     event LockerSet(address locker);
     event BuybackRegistered(address indexed token, uint8 venue);
@@ -94,6 +109,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
     event DrawCanceled(address indexed token, uint256 epoch, uint256 prizeReturned);
+    event VrfSet(address vrf);
+    event RandomnessReady(address indexed token, uint256 indexed requestId, bytes32 randomness);
 
     error OnlyLocker();
     error OnlyRegistrar();
@@ -112,6 +129,9 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
     error NoDraw();
     error NoTickets();
     error BadProof();
+    error OnlyVrf();
+    error VrfNotSet();
+    error RandomnessNotReady();
 
     constructor(address owner_, IPoolManager pm_, IV3SwapRouter v3Router_, IERC20 weth_, address registrar_)
         Ownable(owner_)
@@ -230,6 +250,27 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         emit DrawOperatorSet(op);
     }
 
+    /// @notice Point the distributor at the shared VRF coordinator (randomness
+    /// source for lottery draws). Owner-settable so a new coordinator can be wired.
+    function setVrf(address vrf_) external onlyOwner {
+        if (vrf_ == address(0)) revert ZeroAddress();
+        vrf = vrf_;
+        emit VrfSet(vrf_);
+    }
+
+    /// @notice VRF coordinator push: deliver the drand beacon for a committed draw.
+    /// Best-effort — if this ever reverts, settleDraw pulls the value directly.
+    function fulfillRandomness(uint256 requestId, bytes32 randomness) external {
+        if (msg.sender != vrf) revert OnlyVrf();
+        address token = requestToken[requestId];
+        if (token == address(0)) return;
+        PendingDraw storage pd = pendingDraw[token];
+        if (pd.active && pd.requestId == requestId && pd.randomness == bytes32(0)) {
+            pd.randomness = randomness;
+            emit RandomnessReady(token, requestId, randomness);
+        }
+    }
+
     /// @notice Number of settled draws for a token (history length; `draws(token,i)`
     /// reads each one — newest at `drawCount-1`).
     function drawCount(address token) external view returns (uint256) {
@@ -245,6 +286,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         LaunchTokenV2 t = LaunchTokenV2(token);
         if (t.mode() != LaunchTokenV2.Mode.Lottery) revert NotLottery();
+        if (vrf == address(0)) revert VrfNotSet();
         if (pendingDraw[token].active) revert DrawActive();
 
         uint256 epoch = t.lotteryEpoch();
@@ -254,25 +296,30 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         pendingWeth[token] = 0;                 // reserve the pot for this draw…
         t.advanceLotteryEpoch();                // …and close ticket sales for `epoch`.
 
-        pendingDraw[token] = PendingDraw({round: drandRound, epoch: epoch, prize: prize, active: true});
+        // Ask the shared coordinator for the beacon at this future round; it will
+        // push it back via fulfillRandomness (or we pull it at settle).
+        uint256 reqId = IVRFCoordinator(vrf).requestRandomness(drandRound);
+        requestToken[reqId] = token;
+        pendingDraw[token] =
+            PendingDraw({round: drandRound, epoch: epoch, prize: prize, requestId: reqId, randomness: 0, active: true});
         drawId = draws[token].length;
         emit DrawCommitted(token, drawId, drandRound, epoch, prize);
     }
 
-    /// @notice Settle the committed draw. `randomness` is the drand beacon for the
-    /// committed round (re-verifiable off-chain against drand's public key). The
-    /// winning ticket is derived here on-chain from it (tamper-evident); the caller
-    /// supplies `winner` + its `cumulativeStart` (the winner's ticket offset in the
-    /// canonical TicketsChanged order) and we prove on-chain the drawn ticket lands
-    /// in `[cumulativeStart, cumulativeStart + winnerTickets)`. The session and pot
-    /// were frozen at commit, so this pays out the reserved prize and records it.
+    /// @notice Settle the committed draw. The drand beacon comes from the VRF
+    /// coordinator — pushed to us at post, or pulled here if that push reverted —
+    /// so the keeper can't substitute its own value. The winning ticket is derived
+    /// on-chain from it (tamper-evident); the caller supplies `winner` + its
+    /// `cumulativeStart` (the winner's ticket offset in the canonical TicketsChanged
+    /// order) and we prove on-chain the drawn ticket lands in `[cumulativeStart,
+    /// cumulativeStart + winnerTickets)`. The session and pot were frozen at commit,
+    /// so this pays out the reserved prize and records it.
     ///
     /// The prize is the reserved WETH pot, paid either as WETH (default) or as the
     /// dev-chosen prize token bought with it on the token's registered V3/V4 venue
     /// (`minPrizeOut` guards that swap; ignored for a WETH prize).
     function settleDraw(
         address token,
-        bytes32 randomness,
         address winner,
         uint256 cumulativeStart,
         uint256 minPrizeOut
@@ -280,6 +327,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         PendingDraw memory pd = pendingDraw[token];
         if (!pd.active) revert NoDraw();
+
+        bytes32 randomness = pd.randomness;
+        if (randomness == bytes32(0)) randomness = IVRFCoordinator(vrf).randomnessOf(pd.round); // pull fallback
+        if (randomness == bytes32(0)) revert RandomnessNotReady();
 
         LaunchTokenV2 t = LaunchTokenV2(token);
         uint256 total = t.totalTickets(pd.epoch); // frozen at commit (epoch already advanced)

@@ -12,6 +12,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 import {LaunchTokenV2} from "../../src/v2/LaunchTokenV2.sol";
 import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.sol";
+import {LaunchFairVRFCoordinator} from "../../src/v2/v4/LaunchFairVRFCoordinator.sol";
 import {IV3SwapRouter} from "../../src/interfaces/IUniswapV3.sol";
 
 contract MockToken is ERC20 {
@@ -41,6 +42,7 @@ contract MockV3Router {
 /// swap -> fund/burn. The test contract acts as launchpad (holds supply) + locker.
 contract V4DistributorTest is Test, Deployers {
     LaunchFairV4Distributor dist;
+    LaunchFairVRFCoordinator vrf;
     MockToken weth;
     MockV3Router v3router;
     address constant A = address(0xA1);
@@ -244,10 +246,19 @@ contract V4DistributorTest is Test, Deployers {
     function _setupLottery() internal returns (LaunchTokenV2 token) {
         token = _deployToken(LaunchTokenV2.Mode.Lottery, address(0), address(0));
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        vrf = new LaunchFairVRFCoordinator(address(this), address(this)); // owner + poster = this
         dist.setLocker(address(this));      // this feeds the pot via notify
         dist.setDrawOperator(address(this)); // this is the keeper (commits/settles)
+        dist.setVrf(address(vrf));           // randomness source
         token.setBuySource(address(this));   // "buys" originate here → earn tickets
         token.setLotteryOperator(address(dist)); // distributor advances the session
+    }
+
+    // Deliver the drand beacon for a round via the coordinator (it pushes to the
+    // distributor), then settle. Mirrors the keeper: post once, then settle.
+    function _settle(LaunchTokenV2 token, uint256 round, bytes32 rnd, address winner, uint256 start) internal {
+        vrf.postRandomness(round, rnd);
+        dist.settleDraw(address(token), winner, start, 0);
     }
 
     // Canonical ticket order = the order holders first appear: A gets [0, aTix),
@@ -290,7 +301,7 @@ contract V4DistributorTest is Test, Deployers {
         (address winner, uint256 start) = _resolveWinner(token, 0, winningTicket);
 
         uint256 balBefore = weth.balanceOf(winner);
-        dist.settleDraw(address(token), rnd, winner, start, 0);
+        _settle(token, round, rnd, winner, start);
 
         assertEq(weth.balanceOf(winner) - balBefore, pot, "winner paid the whole pot");
         assertEq(dist.drawCount(address(token)), 1, "draw recorded in history");
@@ -326,8 +337,9 @@ contract V4DistributorTest is Test, Deployers {
         (address winner,) = _resolveWinner(token, 0, wt);
         // Lie about the winner's offset → the drawn ticket falls outside their range.
         uint256 wrongStart = winner == A ? uint256(300_000 ether) : uint256(0);
+        vrf.postRandomness(1, rnd);
         vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
-        dist.settleDraw(address(token), rnd, winner, wrongStart, 0);
+        dist.settleDraw(address(token), winner, wrongStart, 0);
     }
 
     function test_lottery_wrongWinnerReverts() public {
@@ -336,9 +348,10 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
         dist.commitDraw(address(token), 7);
+        vrf.postRandomness(7, keccak256("y"));
         // B has zero tickets in the drawn epoch → can never be a valid winner.
         vm.expectRevert(LaunchFairV4Distributor.BadProof.selector);
-        dist.settleDraw(address(token), keccak256("y"), B, 0, 0);
+        dist.settleDraw(address(token), B, 0, 0);
     }
 
     // An empty session can't be committed — nothing to draw.
@@ -360,7 +373,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 1);
         vm.prank(A);
         vm.expectRevert(LaunchFairV4Distributor.OnlyDrawOperator.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
+        dist.settleDraw(address(token), A, 0, 0);
     }
 
     function test_lottery_doubleCommitReverts() public {
@@ -375,7 +388,7 @@ contract V4DistributorTest is Test, Deployers {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
         vm.expectRevert(LaunchFairV4Distributor.NoDraw.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
+        dist.settleDraw(address(token), A, 0, 0);
     }
 
     function test_lottery_commitRejectsNonLottery() public {
@@ -411,7 +424,7 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(dist.drawCount(address(token)), 0, "no draw recorded");
         // Nothing pending now → settle reverts.
         vm.expectRevert(LaunchFairV4Distributor.NoDraw.selector);
-        dist.settleDraw(address(token), keccak256("q"), A, 0, 0);
+        dist.settleDraw(address(token), A, 0, 0);
     }
 
     // A second session only counts buys made after the previous draw was committed.
@@ -428,7 +441,7 @@ contract V4DistributorTest is Test, Deployers {
 
         uint256 wt = _ticketFor(address(token), keccak256("r1"), 1, token.totalTickets(0));
         (address w1, uint256 s1) = _resolveWinner(token, 0, wt);
-        dist.settleDraw(address(token), keccak256("r1"), w1, s1, 0);
+        _settle(token, 1, keccak256("r1"), w1, s1);
 
         // Epoch 1: only A buys again. Old (epoch 0) tickets are gone.
         token.transfer(A, 50_000 ether);
@@ -439,7 +452,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 2); // closes epoch 1 → now epoch 2
         uint256 balBefore = weth.balanceOf(A);
         // A owns the whole epoch-1 pool → A wins regardless of randomness.
-        dist.settleDraw(address(token), keccak256("r2"), A, 0, 0);
+        _settle(token, 2, keccak256("r2"), A, 0);
         assertEq(weth.balanceOf(A) - balBefore, 2 ether, "epoch-1 winner paid");
         assertEq(dist.drawCount(address(token)), 2, "two draws in history");
     }
@@ -449,8 +462,10 @@ contract V4DistributorTest is Test, Deployers {
     function _setupLotteryWithPrize(address prize) internal returns (LaunchTokenV2 token) {
         token = _deployToken(LaunchTokenV2.Mode.Lottery, prize, address(0)); // prize == rewardToken
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        vrf = new LaunchFairVRFCoordinator(address(this), address(this));
         dist.setLocker(address(this));
         dist.setDrawOperator(address(this));
+        dist.setVrf(address(vrf));
         token.setBuySource(address(this));
         token.setLotteryOperator(address(dist));
         dist.registerBuybackV3(address(token), 10_000); // prize bought on a V3 pool
@@ -465,7 +480,7 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), pot);
         dist.notify(address(token), pot);
         dist.commitDraw(address(token), 1);
-        dist.settleDraw(address(token), keccak256("r"), A, 0, 0);
+        _settle(token, 1, keccak256("r"), A, 0);
 
         // Pot swapped to the prize token (mock rate 2x) and paid to the winner.
         assertEq(prize.balanceOf(A), pot * v3router.rate(), "winner paid in the prize token");
@@ -482,8 +497,32 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), 2 ether);
         dist.notify(address(token), 2 ether);
         dist.commitDraw(address(token), 1);
+        vrf.postRandomness(1, keccak256("r"));
         // out would be 4 (2 * rate); demanding more must revert.
         vm.expectRevert(LaunchFairV4Distributor.Slippage.selector);
-        dist.settleDraw(address(token), keccak256("r"), A, 0, 100 ether);
+        dist.settleDraw(address(token), A, 0, 100 ether);
+    }
+
+    // Randomness must be delivered before a draw can settle.
+    function test_lottery_settleBeforeRandomnessReverts() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether);
+        weth.mint(address(dist), 1 ether);
+        dist.notify(address(token), 1 ether);
+        dist.commitDraw(address(token), 5); // committed, but the beacon isn't posted
+        vm.expectRevert(LaunchFairV4Distributor.RandomnessNotReady.selector);
+        dist.settleDraw(address(token), A, 0, 0);
+    }
+
+    // commitDraw without a wired coordinator reverts.
+    function test_lottery_commitRequiresVrf() public {
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Lottery, address(0), address(0));
+        dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
+        dist.setDrawOperator(address(this));
+        token.setLotteryOperator(address(dist));
+        token.setBuySource(address(this));
+        token.transfer(A, 100_000 ether);
+        vm.expectRevert(LaunchFairV4Distributor.VrfNotSet.selector);
+        dist.commitDraw(address(token), 1);
     }
 }

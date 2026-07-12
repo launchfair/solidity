@@ -16,6 +16,7 @@ import {TokenDeployerV2} from "../../src/v2/TokenDeployerV2.sol";
 import {LaunchFairV4} from "../../src/v2/v4/LaunchFairV4.sol";
 import {LaunchFairV4FeeLocker} from "../../src/v2/v4/LaunchFairV4FeeLocker.sol";
 import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.sol";
+import {LaunchFairVRFCoordinator} from "../../src/v2/v4/LaunchFairVRFCoordinator.sol";
 import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
 
 contract MockWethT is ERC20 {
@@ -65,6 +66,7 @@ contract LaunchFairV4Test is Test, Deployers {
     TokenDeployerV2 tokenDeployer;
     LaunchFairV4FeeLocker locker;
     LaunchFairV4Distributor dist;
+    LaunchFairVRFCoordinator vrf;
     LaunchFairV4 pad;
 
     address constant TREASURY = address(0x7EA);
@@ -88,10 +90,12 @@ contract LaunchFairV4Test is Test, Deployers {
             address(weth), SUPPLY, 1e18, int24(200), int24(200), int24(60_000), 0, 0, "https://hood.launchfair.app"
         );
 
+        vrf = new LaunchFairVRFCoordinator(address(this), address(this)); // owner + poster = this
         locker.setLaunchpad(address(pad));
         locker.setDistributor(address(dist));
         dist.setLocker(address(locker));
         dist.setRegistrar(address(pad));
+        dist.setVrf(address(vrf));
 
         vm.deal(address(this), 1 ether);
     }
@@ -285,13 +289,15 @@ contract LaunchFairV4Test is Test, Deployers {
         dist.commitDraw(token, round);
         assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced at commit");
 
-        // …then settle with the beacon for the committed round.
+        // …the keeper posts the beacon to the coordinator (which pushes it to the
+        // distributor), then settles — the randomness comes from the coordinator.
         bytes32 rnd = keccak256("drand-beacon");
         uint256 wt = uint256(keccak256(abi.encode(rnd, token, round))) % LaunchTokenV2(token).totalTickets(epoch);
         assertLt(wt, myTickets, "winning ticket falls in our range");
+        vrf.postRandomness(round, rnd);
 
         uint256 balBefore = weth.balanceOf(address(this));
-        dist.settleDraw(token, rnd, address(this), 0, 0);
+        dist.settleDraw(token, address(this), 0, 0);
 
         assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
         assertEq(dist.drawCount(token), 1, "draw recorded in history");
@@ -334,7 +340,8 @@ contract LaunchFairV4Test is Test, Deployers {
         assertGt(dist.pendingWeth(token), 0, "pot funded");
 
         dist.commitDraw(token, 42);
-        dist.settleDraw(token, keccak256("beacon"), address(this), 0, 0);
+        vrf.postRandomness(42, keccak256("beacon"));
+        dist.settleDraw(token, address(this), 0, 0);
 
         assertGt(prize.balanceOf(address(this)), 0, "winner paid in the V3 prize token");
         assertEq(dist.drawCount(token), 1, "draw recorded");
