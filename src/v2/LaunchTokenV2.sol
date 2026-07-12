@@ -8,9 +8,8 @@ pragma solidity ^0.8.24;
 //   Base       — plain fair launch (identical to V1).
 //   Reward     — holders earn a dev-chosen external token, funded by LP fees.
 //   Increasing — holders earn THIS token back (pro-rata), funded by LP fees.
-//   Burn       — LP fees buy back and burn THIS token (deflationary).
-// Rewards are CLAIMABLE (V3 can't rebase balances); a keeper batches the fee
-// buybacks and funds the on-chain dividend tracker below.
+//   Lottery    — buys earn tickets; a random holder wins the accrued pot.
+// A keeper batches the fee buybacks and funds the on-chain dividend tracker below.
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
@@ -19,7 +18,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /// @notice LaunchFair V2 token: base fair-launch mechanics plus an optional,
-/// V3-safe dividend tracker (Reward/Increasing) or buyback-burn (Burn).
+/// V4-safe dividend tracker (Reward/Increasing) or a lottery.
 contract LaunchTokenV2 is ERC20Burnable {
     using SafeERC20 for IERC20;
 
@@ -32,9 +31,8 @@ contract LaunchTokenV2 is ERC20Burnable {
     enum Mode {
         Base, // 0 — plain fair launch
         Reward, // 1 — distribute an external reward token to holders
-        Increasing, // 2 — distribute THIS token to holders (pro-rata)
-        Burn, // 3 — buy back and burn THIS token
-        Lottery // 4 — buys earn tickets (lost on sell); a random holder takes the pot
+        Increasing, // 2 — auto-compounding: distribute THIS token to holders (balance grows)
+        Lottery // 3 — buys earn tickets (lost on sell); a random holder takes the pot
     }
 
     struct Metadata {
@@ -61,7 +59,7 @@ contract LaunchTokenV2 is ERC20Burnable {
     /// @notice The reward token's WETH pool (Reward mode) — where the keeper
     /// buys the reward token. Validated by the launchpad at creation.
     address public immutable rewardPool;
-    /// @notice This token's own WETH pool (buyback venue for Increasing/Burn).
+    /// @notice This token's own WETH pool (buyback venue for Increasing).
     /// Set once by the launchpad right after the pool is created.
     address public pool;
     /// @notice Minimum balance a holder must keep to earn rewards (dev-set at
@@ -99,13 +97,10 @@ contract LaunchTokenV2 is ERC20Burnable {
     mapping(address => bool) public excludedFromDividends;
     /// @notice Total distribution-asset ever distributed to holders.
     uint256 public totalDistributed;
-    /// @notice Total THIS-token ever burned by the Burn mechanism.
-    uint256 public totalBurned;
 
     event ExcludedFromDividends(address indexed account, bool excluded);
     event DividendsDistributed(uint256 amount);
     event DividendClaimed(address indexed account, uint256 amount);
-    event MechanismBurn(uint256 amount);
 
     // ── lottery (Mode.Lottery) ───────────────────────────────────────────────
     /// @notice The pool tokens are bought from — a transfer FROM here to a real
@@ -187,7 +182,7 @@ contract LaunchTokenV2 is ERC20Burnable {
     }
 
     /// @notice Launchpad-only; records this token's own WETH pool (once) so the
-    /// distributor knows where to buy back for Increasing/Burn.
+    /// distributor knows where to buy back for Increasing.
     function setPool(address pool_) external {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
         if (pool == address(0)) pool = pool_;
@@ -306,17 +301,6 @@ contract LaunchTokenV2 is ERC20Burnable {
         magnifiedDividendPerShare += (amount * MAGNITUDE) / totalShares;
         totalDistributed += amount;
         emit DividendsDistributed(amount);
-    }
-
-    /// @notice Burn `amount` of THIS token for the Burn mechanism (pulled from
-    /// the caller — our keeper, after buying back with LP fees). Tracked
-    /// separately from V3 sell-fee burns via `MechanismBurn`.
-    function fundBurn(uint256 amount) external {
-        if (mode != Mode.Burn) revert WrongMode();
-        if (amount == 0) return;
-        _burn(msg.sender, amount);
-        totalBurned += amount;
-        emit MechanismBurn(amount);
     }
 
     function accumulativeDividendOf(address account) public view returns (uint256) {

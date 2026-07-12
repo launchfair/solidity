@@ -56,7 +56,7 @@ contract V4FeeLockerTest is Test, Deployers {
 
         LaunchTokenV2.Metadata memory meta;
         token = new LaunchTokenV2(
-            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", meta, 0, 0, LaunchTokenV2.Mode.Burn, address(0), address(0), 0, address(this)
+            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", meta, 0, 0, LaunchTokenV2.Mode.Increasing, address(0), address(0), 0, address(this)
         );
 
         tokenIsCurrency0 = address(token) < address(weth);

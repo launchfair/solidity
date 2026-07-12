@@ -31,10 +31,10 @@ interface IVRFCoordinator {
 /// @notice Turns each mode token's accrued buy-side WETH fees into holder rewards.
 /// The V4 FeeLocker forwards the mechanism's WETH here; a permissionless
 /// `process(token)` buys the token's reward asset, then funds the token's dividend
-/// tracker (Reward/Redistribute) or burns it (Burn).
+/// tracker (Reward/Redistribute).
 ///
 /// The buyback runs on whichever venue the reward asset actually lives on: the
-/// token's own **V4** pool (Redistribute/Burn), or — for a Reward token whose dev
+/// token's own **V4** pool (Redistribute), or — for a Reward token whose dev
 /// chose an external reward — either a **V4** pool (PoolManager unlock/flash
 /// accounting) or a **V3** pool (SwapRouter02 exact-input). Most established tokens
 /// on this chain trade on V3, so a reward token is not restricted to V4-only.
@@ -212,7 +212,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     }
 
     /// @notice Permissionless: buy the token's reward asset with its pending WETH
-    /// and distribute (Reward/Redistribute) or burn (Burn). `minOut` guards slippage.
+    /// and distribute it to holders (Reward / Redistribute). `minOut` guards slippage.
     function process(address token, uint256 minOut) external nonReentrant returns (uint256 out) {
         uint256 wethIn = pendingWeth[token];
         if (wethIn == 0) revert NothingPending();
@@ -226,12 +226,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         out = _buyAsset(token, LaunchTokenV2(token).distributionAsset(), wethIn);
         if (out < minOut) revert Slippage();
 
-        if (m == LaunchTokenV2.Mode.Burn) {
-            LaunchTokenV2(token).fundBurn(out);
-        } else {
-            IERC20(LaunchTokenV2(token).distributionAsset()).forceApprove(token, out);
-            LaunchTokenV2(token).fundRewards(out);
-        }
+        IERC20(LaunchTokenV2(token).distributionAsset()).forceApprove(token, out);
+        LaunchTokenV2(token).fundRewards(out);
         emit Processed(token, wethIn, out, uint8(m));
     }
 

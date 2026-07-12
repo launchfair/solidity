@@ -37,9 +37,9 @@ contract MockV3Router {
     }
 }
 
-/// @notice End-to-end V4 test of the reward/redistribute/burn buyback: a real
+/// @notice End-to-end V4 test of the reward/redistribute buyback: a real
 /// PoolManager + token/WETH pool with liquidity, funded WETH -> process() ->
-/// swap -> fund/burn. The test contract acts as launchpad (holds supply) + locker.
+/// swap -> fund. The test contract acts as launchpad (holds supply) + locker.
 contract V4DistributorTest is Test, Deployers {
     LaunchFairV4Distributor dist;
     LaunchFairVRFCoordinator vrf;
@@ -205,25 +205,10 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(dist.pendingWeth(address(token)), 5 ether, "revert rolled back the pending debit");
     }
 
-    function test_burn_buysBackAndBurns() public {
-        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
-        _setupPoolAndDistributor(token);
-        token.transfer(A, 300_000 ether);
-
-        uint256 supplyBefore = token.totalSupply();
-        uint256 wethIn = 10 ether;
-        weth.mint(address(dist), wethIn);
-        dist.notify(address(token), wethIn);
-
-        uint256 out = dist.process(address(token), 0);
-        assertGt(out, 0, "bought back token");
-        assertEq(token.totalBurned(), out, "burned == bought back");
-        assertEq(token.totalSupply(), supplyBefore - out, "supply reduced");
-    }
-
     function test_payoutThreshold_gatesProcess() public {
-        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Increasing, address(0), address(0));
         _setupPoolAndDistributor(token);
+        token.transfer(A, 300_000 ether); // a holder so the buyback has shares to fund
         dist.setPayoutThreshold(address(token), 5 ether); // registrar (this) sets it
 
         // Below threshold → not ready, process reverts.
@@ -392,7 +377,7 @@ contract V4DistributorTest is Test, Deployers {
     }
 
     function test_lottery_commitRejectsNonLottery() public {
-        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Burn, address(0), address(0));
+        LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Increasing, address(0), address(0));
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setDrawOperator(address(this));
         vm.expectRevert(LaunchFairV4Distributor.NotLottery.selector);

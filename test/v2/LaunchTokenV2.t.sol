@@ -188,16 +188,6 @@ contract LaunchTokenV2Test is Test {
         assertApproxEqAbs(t.balanceOf(A), before + 750 ether, 100, "claimed tokens compound into balance");
     }
 
-    // ── Burn mode ────────────────────────────────────────────────────────────
-    function test_burn_reducesSupplyAndTracks() public {
-        LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Burn, address(0));
-        uint256 supplyBefore = t.totalSupply();
-        // Launchpad (this) holds tokens; burn 5000 via the mechanism.
-        t.fundBurn(5_000 ether);
-        assertEq(t.totalBurned(), 5_000 ether, "tracked");
-        assertEq(t.totalSupply(), supplyBefore - 5_000 ether, "supply down");
-    }
-
     function test_lottery_ticketsFromBuys_resetOnDraw() public {
         LaunchTokenV2 t = new LaunchTokenV2(
             "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
@@ -289,9 +279,7 @@ contract LaunchTokenV2Test is Test {
     function test_wrongModeReverts() public {
         LaunchTokenV2 base = _deploy(LaunchTokenV2.Mode.Base, address(0));
         vm.expectRevert(LaunchTokenV2.WrongMode.selector);
-        base.fundRewards(1);
-        vm.expectRevert(LaunchTokenV2.WrongMode.selector);
-        base.fundBurn(1);
+        base.fundRewards(1); // only Reward / Increasing accept rewards
     }
 
     function test_metadataAndBranding() public {

@@ -5,7 +5,7 @@ pragma solidity ^0.8.24;
 // Mode-token launchpad on Uniswap V4: create a token with a mode + fee tier,
 // launch it into a V4 pool as a single-sided locked position, and wire the fee
 // locker + reward distributor. Base tokens stay on V1/V3 — V4 is for the mode
-// tokens (Reward / Redistribute / Burn / Lottery).
+// tokens (Reward / Redistribute / Lottery).
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -67,10 +67,10 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         string symbol;
         LaunchTokenV2.Metadata metadata;
         bytes32 salt;
-        LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Burn / Lottery
+        LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Lottery
         uint24 fee; // 30000 / 50000 / 100000
         // The reward asset: required for Reward mode, optional for Lottery (the
-        // prize token — 0 pays the pot in WETH). Ignored for Redistribute / Burn.
+        // prize token — 0 pays the pot in WETH). Ignored for Redistribute.
         address rewardToken;
         // Where that asset is bought. `rewardIsV3` picks the venue — a Uniswap V3
         // pool (WETH/asset at `rewardV3Fee`) or a V4 pool (`rewardPoolKey`). Most
@@ -241,7 +241,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // Reward: buy the dev's reward token on its V3 or V4 pool.
             _registerRewardVenue(token, p);
         } else {
-            // Redistribute / Burn buy back the token's own V4 pool.
+            // Redistribute buys back the token's own V4 pool.
             IDistributorV4Register(distributor).registerBuyback(token, key);
         }
         if (p.payoutThreshold > 0) IDistributorV4Register(distributor).setPayoutThreshold(token, p.payoutThreshold);
