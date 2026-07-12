@@ -97,6 +97,10 @@ contract LaunchTokenV2 is ERC20Burnable {
     mapping(address => bool) public excludedFromDividends;
     /// @notice Total distribution-asset ever distributed to holders.
     uint256 public totalDistributed;
+    /// @notice Increasing mode only: THIS-token held by the contract as the
+    /// un-realized reflection pool. It's netted out of `balanceOf(this)` so the
+    /// accrued-but-unrealized amount isn't double-counted (Σ balanceOf == supply).
+    uint256 internal _reflectionHeld;
 
     event ExcludedFromDividends(address indexed account, bool excluded);
     event DividendsDistributed(uint256 amount);
@@ -222,10 +226,18 @@ contract LaunchTokenV2 is ERC20Burnable {
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        // Launch guard: cap non-exempt wallets during the launch window.
-        if (limitActive() && to != address(0) && !limitExempt[to] && balanceOf(to) + value > maxWalletAmount) {
+        // Launch guard: cap non-exempt wallets during the launch window (raw balance).
+        if (limitActive() && to != address(0) && !limitExempt[to] && super.balanceOf(to) + value > maxWalletAmount) {
             revert MaxBuyExceeded();
         }
+
+        // Increasing (auto-compound): realize the sender's accrued reflection into
+        // its real balance first, so its full (grown) balanceOf is transferable and
+        // the reward compounds into the share it keeps.
+        if (mode == Mode.Increasing && from != address(0) && !excludedFromDividends[from]) {
+            _realize(from);
+        }
+
         super._update(from, to, value);
 
         // Keep dividend shares in sync (only matters for reward-bearing modes).
@@ -266,7 +278,9 @@ contract LaunchTokenV2 is ERC20Burnable {
 
     // ── dividend accounting ──────────────────────────────────────────────────
     function _syncShare(address account) internal {
-        uint256 bal = balanceOf(account);
+        // Share tracks the REALIZED (raw) balance; the pending reflection is derived
+        // from it, so using the raw balance here avoids a circular definition.
+        uint256 bal = super.balanceOf(account);
         // Below the dev-set minimum (or excluded) → no share, earns nothing.
         uint256 newShare = (excludedFromDividends[account] || bal < minHoldForRewards) ? 0 : bal;
         uint256 old = shareOf[account];
@@ -298,6 +312,9 @@ contract LaunchTokenV2 is ERC20Burnable {
         if (totalShares == 0) revert NoShares();
         if (amount == 0) return;
         IERC20(distributionAsset()).safeTransferFrom(msg.sender, address(this), amount);
+        // Increasing: the pulled THIS-token is the reflection pool (netted out of
+        // balanceOf(this)); holders' balances grow immediately, no push needed.
+        if (mode == Mode.Increasing) _reflectionHeld += amount;
         magnifiedDividendPerShare += (amount * MAGNITUDE) / totalShares;
         totalDistributed += amount;
         emit DividendsDistributed(amount);
@@ -312,17 +329,51 @@ contract LaunchTokenV2 is ERC20Burnable {
         return accumulativeDividendOf(account) - withdrawnDividends[account];
     }
 
-    /// @notice Pay out `account`'s accrued rewards TO `account`. Permissionless
-    /// and safe: it only ever sends a holder their OWN owed rewards, and the
-    /// bookkeeping is updated before the transfer (CEI), so it can't double-pay.
-    /// This is what makes rewards automatic — our keeper pushes payouts so
-    /// holders never have to claim. Returns the amount paid.
+    /// @notice ERC20 balance. For **Increasing** (auto-compounding) mode the accrued
+    /// reflection is folded straight in — `balanceOf` grows on each buyback, no
+    /// claim. The contract's own reflection pool is netted out so the accrued-but-
+    /// unrealized tokens aren't double-counted (Σ balanceOf stays == totalSupply);
+    /// excluded/plumbing accounts (incl. the V4 pool) read their raw balance, so the
+    /// pool always sees exact amounts. Other modes are the plain ERC20 balance.
+    function balanceOf(address account) public view override returns (uint256) {
+        if (mode != Mode.Increasing) return super.balanceOf(account);
+        if (account == address(this)) {
+            uint256 raw = super.balanceOf(account);
+            return raw > _reflectionHeld ? raw - _reflectionHeld : 0;
+        }
+        if (excludedFromDividends[account]) return super.balanceOf(account);
+        return super.balanceOf(account) + withdrawableDividendOf(account);
+    }
+
+    /// @dev Increasing mode: fold `account`'s accrued reflection into its real
+    /// balance (moving it out of the reflection pool). Uses super._update so it
+    /// doesn't re-enter this override; the caller syncs the share afterwards.
+    function _realize(address account) internal {
+        uint256 amount = withdrawableDividendOf(account);
+        if (amount == 0) return;
+        withdrawnDividends[account] += amount;
+        _reflectionHeld -= amount;
+        super._update(address(this), account, amount);
+        emit DividendClaimed(account, amount);
+    }
+
+    /// @notice Realize `account`'s accrued rewards. Permissionless and safe: only
+    /// ever credits a holder their OWN owed amount, bookkeeping updated before any
+    /// transfer (CEI). For **Reward** it delivers the external reward token to the
+    /// wallet (the keeper pushes so holders never claim); for **Increasing** it just
+    /// folds the reflection into the balance (which already grows on its own — this
+    /// is only a manual realize, not required). Returns the amount realized.
     function processAccount(address account) public returns (uint256 amount) {
         amount = withdrawableDividendOf(account);
         if (amount == 0) return 0;
-        withdrawnDividends[account] += amount;
-        IERC20(distributionAsset()).safeTransfer(account, amount);
-        emit DividendClaimed(account, amount);
+        if (mode == Mode.Increasing) {
+            _realize(account);
+            _syncShare(account); // the realize grew the raw balance; sync its share
+        } else {
+            withdrawnDividends[account] += amount;
+            IERC20(distributionAsset()).safeTransfer(account, amount);
+            emit DividendClaimed(account, amount);
+        }
     }
 
     /// @notice Push payouts to a batch of holders — called by the keeper (with

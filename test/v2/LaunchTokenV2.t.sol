@@ -168,24 +168,60 @@ contract LaunchTokenV2Test is Test {
     }
 
     // ── Increasing mode (asset == this token) ────────────────────────────────
-    function test_increasing_distributesOwnToken() public {
+    // Sum of every account's balanceOf must always equal totalSupply — the
+    // reflection must not double-count the accrued-but-unrealized pool.
+    function _assertSupplyInvariant(LaunchTokenV2 t) internal view {
+        uint256 sum = t.balanceOf(address(this)) + t.balanceOf(A) + t.balanceOf(B) + t.balanceOf(POOL)
+            + t.balanceOf(address(t));
+        assertApproxEqAbs(sum, t.totalSupply(), 100, "sum of balanceOf == totalSupply");
+    }
+
+    function test_increasing_autoCompoundsIntoBalance() public {
         LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Increasing, address(0));
-        // Keep some supply on the launchpad (this) to fund the buyback with.
         t.transfer(A, 300_000 ether);
         t.transfer(B, 100_000 ether);
         assertEq(t.totalShares(), 400_000 ether);
 
-        // Fund 1000 of THIS token (simulating a buyback).
+        uint256 aBefore = t.balanceOf(A);
+        uint256 bBefore = t.balanceOf(B);
+
+        // Fund 1000 THIS-token (a buyback). Balances grow IMMEDIATELY — no claim,
+        // no keeper push.
         t.approve(address(t), 1_000 ether);
         t.fundRewards(1_000 ether);
 
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 750 ether, 100);
-        assertApproxEqAbs(t.withdrawableDividendOf(B), 250 ether, 100);
+        assertApproxEqAbs(t.balanceOf(A), aBefore + 750 ether, 100, "A auto-grew 3/4 with no claim");
+        assertApproxEqAbs(t.balanceOf(B), bBefore + 250 ether, 100, "B auto-grew 1/4 with no claim");
+        assertEq(t.balanceOf(address(t)), 0, "reflection pool netted out of the contract's balance");
+        _assertSupplyInvariant(t);
 
-        uint256 before = t.balanceOf(A);
+        // A transfer realizes A's reflection into its real balance and preserves value.
+        uint256 aBal = t.balanceOf(A);
         vm.prank(A);
-        t.claim();
-        assertApproxEqAbs(t.balanceOf(A), before + 750 ether, 100, "claimed tokens compound into balance");
+        t.transfer(B, 50_000 ether);
+        assertApproxEqAbs(t.balanceOf(A), aBal - 50_000 ether, 100, "A down exactly by the transfer");
+        _assertSupplyInvariant(t);
+
+        // A second buyback compounds on the already-grown balances.
+        t.approve(address(t), 500 ether);
+        t.fundRewards(500 ether);
+        _assertSupplyInvariant(t);
+    }
+
+    // The V4 pool (excluded) must NOT rebase — its balance stays exact so trading
+    // isn't corrupted.
+    function test_increasing_excludedPoolBalanceStaysExact() public {
+        LaunchTokenV2 t = _deploy(LaunchTokenV2.Mode.Increasing, address(0));
+        t.transfer(A, 200_000 ether);
+        t.transfer(POOL, 500_000 ether); // the "pool" holds liquidity (excluded)
+        uint256 poolBal = t.balanceOf(POOL);
+
+        t.approve(address(t), 1_000 ether);
+        t.fundRewards(1_000 ether); // only A has a share
+
+        assertEq(t.balanceOf(POOL), poolBal, "pool balance unchanged by reflection");
+        assertApproxEqAbs(t.balanceOf(A), 200_000 ether + 1_000 ether, 100, "A got the whole reflection");
+        _assertSupplyInvariant(t);
     }
 
     function test_lottery_ticketsFromBuys_resetOnDraw() public {

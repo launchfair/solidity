@@ -158,17 +158,23 @@ contract LaunchFairV4Test is Test, Deployers {
         uint256 pending = dist.pendingWeth(token);
         assertGt(pending, 0, "mechanism WETH pending");
 
-        // Process -> buy back the token -> distribute to HOLDER.
+        // Process -> buy back the token -> auto-compound into HOLDER's balance.
+        // Redistribute is auto-compounding: the balance grows on the buyback itself,
+        // no claim and no push.
+        uint256 beforeProcess = IERC20(token).balanceOf(HOLDER);
         uint256 out = dist.process(token, 0);
         assertGt(out, 0, "bought back for rewards");
-        assertGt(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "HOLDER accrued");
+        assertGt(IERC20(token).balanceOf(HOLDER), beforeProcess, "balance auto-grew on the buyback");
+        assertGt(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "reflection accrued");
 
-        // Auto-push -> reward lands in HOLDER's wallet (no claim).
-        uint256 before = IERC20(token).balanceOf(HOLDER);
+        // A manual realize only folds the reflection into the raw balance — the
+        // displayed balanceOf is unchanged (it already reflected the growth).
+        uint256 grown = IERC20(token).balanceOf(HOLDER);
         address[] memory who = new address[](1);
         who[0] = HOLDER;
         LaunchTokenV2(token).processAccounts(who);
-        assertGt(IERC20(token).balanceOf(HOLDER), before, "reward auto-pushed to wallet");
+        assertApproxEqAbs(IERC20(token).balanceOf(HOLDER), grown, 100, "realize doesn't change balanceOf");
+        assertEq(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "reflection realized");
     }
 
     // A Reward token whose reward asset trades on Uniswap V3 (not an exclusive V4

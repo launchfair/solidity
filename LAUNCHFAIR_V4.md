@@ -40,8 +40,8 @@ Everything is **immutable and mostly permissionless** — no proxy, no pause. Th
                                                                  ▼
                                                     ┌───────────────────────────┐
                                                     │  LaunchFairV4Distributor  │
-                                                    │  Reward/Increasing/Burn:  │  process(token) buyback
-                                                    │    swap WETH→asset (V3/V4)│  → fund dividends / burn
+                                                    │  Reward / Increasing:      │  process(token) buyback
+                                                    │    swap WETH→asset (V3/V4)│  → fund / auto-compound 
                                                     │  Lottery:                 │  commitDraw → settleDraw
                                                     │    pot = accrued WETH     │  → pay drawn winner
                                                     └───────────────────────────┘
@@ -75,12 +75,11 @@ Rule: **treasury == dev**, both always paid in WETH; the mechanism keeps the rem
 
 ### 3.1 `LaunchTokenV2` — the token
 
-Five modes, fixed at construction:
+Four modes, fixed at construction (Burn was dropped):
 
 - **Base** — plain fair launch (not used on V4; the launchpad rejects it — Base stays on V1/V3).
-- **Reward** — holders earn a **dev-chosen external token**, funded by fee buybacks.
-- **Increasing** (a.k.a. Redistribute) — holders earn **this token** back, pro-rata.
-- **Burn** — fee buybacks buy back and **burn** this token.
+- **Reward** — holders earn a **dev-chosen external token**, funded by fee buybacks; the keeper pushes it to wallets.
+- **Increasing** (a.k.a. Redistribute) — **auto-compounding**: holders earn **this token** back, folded straight into `balanceOf` — no claim, no push.
 - **Lottery** — buys earn session **tickets**; a random winner takes the pot.
 
 **Dividend tracker (Reward / Increasing).** Classic *magnified-dividend-per-share*:
@@ -90,7 +89,7 @@ Five modes, fixed at construction:
 - `withdrawableDividendOf = accumulative − withdrawn`, where `accumulative = (magnifiedDividendPerShare · share + correction) / 2¹²⁸`. On every share change, `correction` is adjusted so already-accrued dividends are preserved.
 - `processAccount` pays a holder their own owed amount, **updating `withdrawnDividends` before the transfer (CEI)** — so it can't double-pay and is reentrancy-safe. `processAccounts` batches it (keeper auto-push); `claim` is the self-service fallback.
 
-Shares are updated on transfer **without touching balances**, so the V4 pool is unaffected (V3/V4 can't rebase, so rewards are claimable, not auto-compounding).
+Shares key off the **raw** balance, so the V4 pool (excluded) is unaffected. **Reward** is claimable/pushed (external token). **Increasing is auto-compounding**: `balanceOf` is overridden to fold the accrued reflection in — it grows on each buyback, no claim, no push. Correctness: the bought-back tokens held by the contract are the reflection pool and are **netted out of `balanceOf(this)`** so `sum(balanceOf) == totalSupply` (no double count); excluded accounts (incl. the pool) read their raw balance, so trading sees exact amounts (no rebase corruption); a transfer *realizes* the sender's reflection into its raw balance so it compounds into the share it keeps.
 
 **Launch guard.** During `limitEndBlock` (L1-block based), non-exempt wallets can't exceed `maxWalletAmount` (anti-snipe). Plumbing is limit-exempt.
 
@@ -115,7 +114,7 @@ Set-once launchpad wiring: `setPool`, `setBuySource`, `setLotteryOperator`. `own
 4. `_launchOnV4`: initialize the V4 pool, compute the single-sided liquidity for the full supply, exclude plumbing from dividends + the launch guard, **send the supply to the locker and lock it forever**, then wire the mechanism:
    - **Reward** → register the reward token's buyback venue (V3 or V4).
    - **Lottery** → `setBuySource(PoolManager)` + `setLotteryOperator(distributor)`, and if a prize token was chosen, register its venue too.
-   - **Increasing / Burn** → register the token's **own** pool as the buyback venue.
+   - **Increasing** → register the token's **own** pool as the buyback venue.
 5. Creation fee → treasury; refund the excess to the creator (both after state changes, inside `nonReentrant`).
 
 ### 3.4 `LaunchFairV4FeeLocker` — LP owner + fee router
@@ -128,8 +127,8 @@ Set-once launchpad wiring: `setPool`, `setBuySource`, `setLotteryOperator`. `own
 
 ### 3.5 `LaunchFairV4Distributor` — rewards + lottery
 
-**Buyback path (Reward/Increasing/Burn).** `process(token, minOut)` (permissionless, `nonReentrant`):
-`pendingWeth → 0` (CEI), then `_buyAsset(token, asset, wethIn)` routes the swap by the registered venue — **V3** (`SwapRouter02.exactInputSingle`) or **V4** (`PoolManager.unlock` → `swap` → settle/take) — then `if (out < minOut) revert`. Finally `fundBurn` (Burn) or `fundRewards` (Reward/Increasing). Reverts for Base/Lottery.
+**Buyback path (Reward/Increasing).** `process(token, minOut)` (permissionless, `nonReentrant`):
+`pendingWeth → 0` (CEI), then `_buyAsset(token, asset, wethIn)` routes the swap by the registered venue — **V3** (`SwapRouter02.exactInputSingle`) or **V4** (`PoolManager.unlock` → `swap` → settle/take) — then `if (out < minOut) revert`. Finally `fundRewards` (Reward/Increasing). Reverts for Base/Lottery.
 
 **Lottery path.** The pot is the accrued mechanism WETH. Two-phase, powerball-style:
 1. `commitDraw(token, drandRound)` (operator-only): requires the current session has tickets, then **advances the epoch (closing ticket sales), reserves the pot** as `pd.prize`, and locks the draw to a **future drand round** whose randomness can't yet be known. Buys after this count toward the next session.
