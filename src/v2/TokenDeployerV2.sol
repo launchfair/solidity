@@ -20,8 +20,9 @@ contract TokenDeployerV2 {
         uint16 maxBuyBps;
         uint32 maxBuyBlocks;
         LaunchTokenV2.Mode mode;
-        address rewardToken;
-        address rewardPool;
+        address[] rewardTokens; // Reward: 1..5 dividend assets
+        uint16[] rewardWeights; // Reward: bps per asset (sum 10000)
+        address prizeToken; // Lottery: optional prize (0 = WETH pot)
         uint256 minHoldForRewards;
     }
 
@@ -39,8 +40,9 @@ contract TokenDeployerV2 {
                 p.maxBuyBps,
                 p.maxBuyBlocks,
                 p.mode,
-                p.rewardToken,
-                p.rewardPool,
+                p.rewardTokens,
+                p.rewardWeights,
+                p.prizeToken,
                 p.minHoldForRewards,
                 msg.sender
             )

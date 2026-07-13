@@ -59,14 +59,16 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     bool public registrarLocked; // registrar is frozen after the first post-deploy set (L-03)
     address public locker;
 
-    // Where a token's reward asset is bought.
+    // Where a token's reward asset is bought. Keyed by (token, asset) so a Reward token
+    // can distribute up to 5 different reward assets, each on its own venue.
     enum Venue { V4, V3 }
     struct BuybackRoute {
         Venue venue;
         uint24 v3Fee;  // venue == V3: the V3 pool fee tier
         PoolKey v4Key; // venue == V4: the V4 pool key
     }
-    mapping(address token => BuybackRoute) internal _buyback;
+    mapping(address token => mapping(address asset => BuybackRoute)) internal _buyback;
+    mapping(address token => mapping(address asset => bool)) internal _assetRegistered;
     mapping(address token => bool) public registered;
     /// @notice Addresses allowed to call process() (the keeper). The owner is always
     /// allowed. Gating this closes the permissionless-minOut sandwich vector (M-02):
@@ -167,6 +169,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     error RandomnessNotReady();
     error RoundNotFuture();
     error BeaconAlreadyProduced();
+    error BadMinOuts();
 
     // drand quicknet timing (genesis unix time + round period), for the future-round
     // check that stops a malicious drawOperator grinding an already-produced beacon to
@@ -221,29 +224,31 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     }
 
     /// @notice Launchpad records the **V4** pool where a token's reward asset is bought.
-    /// A token's venue is registered once at launch and then frozen (L-03).
-    function registerBuyback(address token, PoolKey calldata key) external {
+    /// Each (token, asset) venue is registered once at launch and then frozen (L-03).
+    function registerBuyback(address token, address asset, PoolKey calldata key) external {
         if (msg.sender != registrar) revert OnlyRegistrar();
-        if (registered[token]) revert AlreadyRegistered();
-        _buyback[token] = BuybackRoute({venue: Venue.V4, v3Fee: 0, v4Key: key});
+        if (_assetRegistered[token][asset]) revert AlreadyRegistered();
+        _buyback[token][asset] = BuybackRoute({venue: Venue.V4, v3Fee: 0, v4Key: key});
+        _assetRegistered[token][asset] = true;
         registered[token] = true;
         emit BuybackRegistered(token, uint8(Venue.V4));
     }
 
-    /// @notice Launchpad records that a token's reward asset is bought on a **V3**
+    /// @notice Launchpad records that a token's reward `asset` is bought on a **V3**
     /// pool (WETH/asset at fee tier `fee`) via SwapRouter02. Registered once, then frozen.
-    function registerBuybackV3(address token, uint24 fee) external {
+    function registerBuybackV3(address token, address asset, uint24 fee) external {
         if (msg.sender != registrar) revert OnlyRegistrar();
-        if (registered[token]) revert AlreadyRegistered();
+        if (_assetRegistered[token][asset]) revert AlreadyRegistered();
         PoolKey memory empty;
-        _buyback[token] = BuybackRoute({venue: Venue.V3, v3Fee: fee, v4Key: empty});
+        _buyback[token][asset] = BuybackRoute({venue: Venue.V3, v3Fee: fee, v4Key: empty});
+        _assetRegistered[token][asset] = true;
         registered[token] = true;
         emit BuybackRegistered(token, uint8(Venue.V3));
     }
 
-    /// @notice The venue (0 = V4, 1 = V3) a token's reward buyback runs on.
-    function buybackVenue(address token) external view returns (uint8) {
-        return uint8(_buyback[token].venue);
+    /// @notice The venue (0 = V4, 1 = V3) a token's reward `asset` is bought on.
+    function buybackVenue(address token, address asset) external view returns (uint8) {
+        return uint8(_buyback[token][asset].venue);
     }
 
     /// @notice Called by the V4 FeeLocker after forwarding `amount` WETH here.
@@ -289,30 +294,42 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         }
     }
 
-    /// @notice Buy the token's reward asset with its pending WETH and distribute it to
-    /// holders (Reward / Redistribute). `minOut` guards slippage. Restricted to the
-    /// owner or an allowlisted keeper (M-02): a real quoted `minOut` is only meaningful
-    /// if an untrusted caller can't force the buyback through at `minOut = 0` and
-    /// sandwich it. Already-distributed rewards stay claimable trustlessly on the token.
-    function process(address token, uint256 minOut) external nonReentrant returns (uint256 out) {
+    /// @notice Buy the token's reward asset(s) with its pending WETH and distribute to
+    /// holders (Reward / Redistribute). The pending WETH is split across the token's
+    /// reward assets by the dev's fee weights; each portion buys its asset on that
+    /// asset's venue and funds that asset's tracker. `minOuts[i]` guards slippage for
+    /// asset `i` (aligned with `rewardTokensList()`). Restricted to the owner or an
+    /// allowlisted keeper (M-02) so an untrusted caller can't force a `minOut=0` buyback.
+    function process(address token, uint256[] calldata minOuts) external nonReentrant {
         if (msg.sender != owner() && !isProcessor[msg.sender]) revert NotProcessor();
         uint256 wethIn = pendingWeth[token];
         if (wethIn == 0) revert NothingPending();
         if (wethIn < payoutThreshold[token]) revert BelowThreshold();
         if (!timerElapsed(token)) revert TimerNotElapsed();
         if (!registered[token]) revert NotRegistered();
-        LaunchTokenV2.Mode m = LaunchTokenV2(token).mode();
+        LaunchTokenV2 t = LaunchTokenV2(token);
+        LaunchTokenV2.Mode m = t.mode();
         // Base has no mechanism; Lottery uses draw()/settleDraw(), not a buyback.
         if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
         lastPayoutBlock[token] = block.number; // reset the dev's block timer
 
-        out = _buyAsset(token, LaunchTokenV2(token).distributionAsset(), wethIn);
-        if (out == 0 || out < minOut) revert Slippage(); // out==0 would burn the pot into a dead swap
+        address[] memory assets = t.rewardTokensList();
+        if (minOuts.length != assets.length) revert BadMinOuts();
 
-        IERC20(LaunchTokenV2(token).distributionAsset()).forceApprove(token, out);
-        LaunchTokenV2(token).fundRewards(out);
-        emit Processed(token, wethIn, out, uint8(m));
+        uint256 remaining = wethIn;
+        for (uint256 i; i < assets.length; i++) {
+            address asset = assets[i];
+            // Split by the dev's weight; the last asset takes the remainder (dust-safe).
+            uint256 portion = i == assets.length - 1 ? remaining : (wethIn * t.rewardWeightBps(asset)) / 10_000;
+            remaining -= portion;
+            if (portion == 0) continue;
+            uint256 out = _buyAsset(token, asset, portion);
+            if (out == 0 || out < minOuts[i]) revert Slippage(); // out==0 would burn WETH on a dead swap
+            IERC20(asset).forceApprove(token, out);
+            t.fundRewards(asset, out);
+            emit Processed(token, portion, out, uint8(m));
+        }
     }
 
     // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
@@ -490,7 +507,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         }));
 
         if (pd.prize > 0) {
-            address prizeToken = t.rewardToken(); // 0 => WETH prize
+            address prizeToken = t.prizeToken(); // 0 => WETH prize
             if (prizeToken == address(0)) {
                 weth.safeTransfer(winner, pd.prize); // WETH: no receiver hook, can't wedge
                 prizePaid = pd.prize;
@@ -554,7 +571,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// Used both for reward buybacks and for converting a lottery pot to its prize
     /// token, so the target asset is passed in rather than derived.
     function _buyAsset(address token, address asset, uint256 wethIn) internal returns (uint256 out) {
-        return _buyback[token].venue == Venue.V3
+        return _buyback[token][asset].venue == Venue.V3
             ? _buyV3(token, asset, wethIn)
             : abi.decode(poolManager.unlock(abi.encode(token, asset, wethIn)), (uint256));
     }
@@ -566,7 +583,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             IV3SwapRouter.ExactInputSingleParams({
                 tokenIn: address(weth),
                 tokenOut: asset,
-                fee: _buyback[token].v3Fee,
+                fee: _buyback[token][asset].v3Fee,
                 recipient: address(this),
                 amountIn: wethIn,
                 amountOutMinimum: 0,
@@ -581,7 +598,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
         (address token, address asset, uint256 wethIn) = abi.decode(data, (address, address, uint256));
 
-        PoolKey memory key = _buyback[token].v4Key;
+        PoolKey memory key = _buyback[token][asset].v4Key;
         Currency assetCur = Currency.wrap(asset);
         Currency wethCur = Currency.wrap(address(weth));
         bool zeroForOne = Currency.unwrap(key.currency0) == address(weth); // WETH is the input

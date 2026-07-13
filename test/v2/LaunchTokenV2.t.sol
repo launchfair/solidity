@@ -32,10 +32,29 @@ contract LaunchTokenV2Test is Test {
     }
 
     function _deployMin(LaunchTokenV2.Mode mode, address reward, uint256 minHold) internal returns (LaunchTokenV2 t) {
+        // A single external reward token becomes a one-asset Reward config (weight
+        // 10000); Increasing/Base pass empty arrays (Increasing auto-registers THIS
+        // token as its sole reward asset). No prize token in these helpers.
+        address[] memory rewardTokens = new address[](0);
+        uint16[] memory rewardWeights = new uint16[](0);
+        if (reward != address(0)) {
+            rewardTokens = _arr1(reward);
+            rewardWeights = _w1(10_000);
+        }
         t = new LaunchTokenV2(
-            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, reward, address(0), minHold, address(this)
+            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, mode, rewardTokens, rewardWeights, address(0), minHold, address(this)
         );
         t.excludeFromDividends(POOL, true); // simulate excluding the pool
+    }
+
+    function _arr1(address a) internal pure returns (address[] memory arr) {
+        arr = new address[](1);
+        arr[0] = a;
+    }
+
+    function _w1(uint16 w) internal pure returns (uint16[] memory arr) {
+        arr = new uint16[](1);
+        arr[0] = w;
     }
 
     // ── Reward mode ──────────────────────────────────────────────────────────
@@ -54,18 +73,18 @@ contract LaunchTokenV2Test is Test {
         // Fund 1000 RWD of rewards.
         reward.mint(address(this), 1_000 ether);
         reward.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
+        t.fundRewards(address(reward), 1_000 ether);
 
         // 3:1 split.
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 750 ether, 100, "A gets 3/4");
-        assertApproxEqAbs(t.withdrawableDividendOf(B), 250 ether, 100, "B gets 1/4");
-        assertEq(t.totalDistributed(), 1_000 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), A), 750 ether, 100, "A gets 3/4");
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), B), 250 ether, 100, "B gets 1/4");
+        assertEq(t.totalDistributedOf(address(reward)), 1_000 ether);
 
         // A claims the reward token.
         vm.prank(A);
         t.claim();
         assertApproxEqAbs(reward.balanceOf(A), 750 ether, 100, "A received reward token");
-        assertEq(t.withdrawableDividendOf(A), 0, "nothing left after claim");
+        assertEq(t.withdrawableDividendOf(address(reward), A), 0, "nothing left after claim");
     }
 
     function test_reward_autoPushNoClaim() public {
@@ -79,14 +98,14 @@ contract LaunchTokenV2Test is Test {
 
         reward.mint(address(this), 1_000 ether);
         reward.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
+        t.fundRewards(address(reward), 1_000 ether);
 
         // Keeper pushes payouts — holders never call claim themselves.
         t.processAccounts(_two(A, B));
         assertApproxEqAbs(reward.balanceOf(A), 750 ether, 100, "A auto-received");
         assertApproxEqAbs(reward.balanceOf(B), 250 ether, 100, "B auto-received");
-        assertEq(t.withdrawableDividendOf(A), 0, "A settled");
-        assertEq(t.withdrawableDividendOf(B), 0, "B settled");
+        assertEq(t.withdrawableDividendOf(address(reward), A), 0, "A settled");
+        assertEq(t.withdrawableDividendOf(address(reward), B), 0, "B settled");
 
         // Idempotent: re-pushing with nothing owed does nothing.
         t.processAccounts(_two(A, B));
@@ -110,20 +129,20 @@ contract LaunchTokenV2Test is Test {
 
         reward.mint(address(this), 1_000 ether);
         reward.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
+        t.fundRewards(address(reward), 1_000 ether);
 
         // A moves all tokens to B AFTER accruing — A keeps its 750 accrued.
         vm.prank(A);
         t.transfer(B, 300_000 ether);
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 750 ether, 100, "already-accrued survives transfer");
-        assertApproxEqAbs(t.withdrawableDividendOf(B), 250 ether, 100, "B unchanged on prior round");
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), A), 750 ether, 100, "already-accrued survives transfer");
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), B), 250 ether, 100, "B unchanged on prior round");
 
         // Next round: now B holds everything, so B gets all of it.
         reward.mint(address(this), 400 ether);
         reward.approve(address(t), 400 ether);
-        t.fundRewards(400 ether);
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 750 ether, 100, "A gains nothing (0 balance)");
-        assertApproxEqAbs(t.withdrawableDividendOf(B), 650 ether, 100, "B: 250 + 400");
+        t.fundRewards(address(reward), 400 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), A), 750 ether, 100, "A gains nothing (0 balance)");
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), B), 650 ether, 100, "B: 250 + 400");
     }
 
     function test_reward_minimumHold() public {
@@ -138,9 +157,9 @@ contract LaunchTokenV2Test is Test {
 
         reward.mint(address(this), 1_000 ether);
         reward.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 1_000 ether, 100, "A gets all (B below min)");
-        assertEq(t.withdrawableDividendOf(B), 0, "B earns nothing below min");
+        t.fundRewards(address(reward), 1_000 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), A), 1_000 ether, 100, "A gets all (B below min)");
+        assertEq(t.withdrawableDividendOf(address(reward), B), 0, "B earns nothing below min");
 
         // B tops up above the minimum → eligible for FUTURE rewards only.
         vm.prank(POOL);
@@ -148,9 +167,9 @@ contract LaunchTokenV2Test is Test {
         assertEq(t.totalShares(), 550_000 ether, "B now counts");
         reward.mint(address(this), 550 ether);
         reward.approve(address(t), 550 ether);
-        t.fundRewards(550 ether);
-        assertApproxEqAbs(t.withdrawableDividendOf(B), 250 ether, 100, "B earns on the new round");
-        assertEq(t.withdrawableDividendOf(B) < 251 ether, true, "no retroactive earnings");
+        t.fundRewards(address(reward), 550 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), B), 250 ether, 100, "B earns on the new round");
+        assertEq(t.withdrawableDividendOf(address(reward), B) < 251 ether, true, "no retroactive earnings");
     }
 
     function test_excludedAccountDoesNotAccrue() public {
@@ -162,9 +181,9 @@ contract LaunchTokenV2Test is Test {
 
         reward.mint(address(this), 1_000 ether);
         reward.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
-        assertApproxEqAbs(t.withdrawableDividendOf(A), 1_000 ether, 100, "A gets 100%");
-        assertEq(t.withdrawableDividendOf(POOL), 0, "excluded pool accrues nothing");
+        t.fundRewards(address(reward), 1_000 ether);
+        assertApproxEqAbs(t.withdrawableDividendOf(address(reward), A), 1_000 ether, 100, "A gets 100%");
+        assertEq(t.withdrawableDividendOf(address(reward), POOL), 0, "excluded pool accrues nothing");
     }
 
     // ── Increasing mode (asset == this token) ────────────────────────────────
@@ -188,7 +207,7 @@ contract LaunchTokenV2Test is Test {
         // Fund 1000 THIS-token (a buyback). Balances grow IMMEDIATELY — no claim,
         // no keeper push.
         t.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether);
+        t.fundRewards(address(t), 1_000 ether);
 
         assertApproxEqAbs(t.balanceOf(A), aBefore + 750 ether, 100, "A auto-grew 3/4 with no claim");
         assertApproxEqAbs(t.balanceOf(B), bBefore + 250 ether, 100, "B auto-grew 1/4 with no claim");
@@ -204,7 +223,7 @@ contract LaunchTokenV2Test is Test {
 
         // A second buyback compounds on the already-grown balances.
         t.approve(address(t), 500 ether);
-        t.fundRewards(500 ether);
+        t.fundRewards(address(t), 500 ether);
         _assertSupplyInvariant(t);
     }
 
@@ -217,7 +236,7 @@ contract LaunchTokenV2Test is Test {
         uint256 poolBal = t.balanceOf(POOL);
 
         t.approve(address(t), 1_000 ether);
-        t.fundRewards(1_000 ether); // only A has a share
+        t.fundRewards(address(t), 1_000 ether); // only A has a share
 
         assertEq(t.balanceOf(POOL), poolBal, "pool balance unchanged by reflection");
         assertApproxEqAbs(t.balanceOf(A), 200_000 ether + 1_000 ether, 100, "A got the whole reflection");
@@ -226,7 +245,7 @@ contract LaunchTokenV2Test is Test {
 
     function test_lottery_ticketsFromBuys_resetOnDraw() public {
         LaunchTokenV2 t = new LaunchTokenV2(
-            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, new address[](0), new uint16[](0), address(0), 0, address(this)
         );
         t.setBuySource(POOL);
         t.setLotteryOperator(address(this)); // test acts as the lottery distributor
@@ -262,7 +281,7 @@ contract LaunchTokenV2Test is Test {
     // this session and STILL held. A buy→sell round-trip nets zero.
     function test_lottery_sellRemovesTickets() public {
         LaunchTokenV2 t = new LaunchTokenV2(
-            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, new address[](0), new uint16[](0), address(0), 0, address(this)
         );
         t.setBuySource(POOL);
         t.setLotteryOperator(address(this));
@@ -305,7 +324,7 @@ contract LaunchTokenV2Test is Test {
 
     function test_lottery_onlyOperatorAdvances() public {
         LaunchTokenV2 t = new LaunchTokenV2(
-            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, address(0), address(0), 0, address(this)
+            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, new address[](0), new uint16[](0), address(0), 0, address(this)
         );
         t.setLotteryOperator(address(0xABCD));
         vm.expectRevert(LaunchTokenV2.NotAuthorized.selector);
@@ -314,8 +333,9 @@ contract LaunchTokenV2Test is Test {
 
     function test_wrongModeReverts() public {
         LaunchTokenV2 base = _deploy(LaunchTokenV2.Mode.Base, address(0));
-        vm.expectRevert(LaunchTokenV2.WrongMode.selector);
-        base.fundRewards(1); // only Reward / Increasing accept rewards
+        // Base registers no reward assets, so funding any asset reverts NotRewardAsset.
+        vm.expectRevert(LaunchTokenV2.NotRewardAsset.selector);
+        base.fundRewards(address(0), 1); // only Reward / Increasing accept rewards
     }
 
     function test_metadataAndBranding() public {

@@ -26,8 +26,8 @@ import {LiquidityMath} from "./LiquidityMath.sol";
 import {IUniswapV3Factory} from "../../interfaces/IUniswapV3.sol";
 
 interface IDistributorV4Register {
-    function registerBuyback(address token, PoolKey calldata key) external;
-    function registerBuybackV3(address token, uint24 fee) external;
+    function registerBuyback(address token, address asset, PoolKey calldata key) external;
+    function registerBuybackV3(address token, address asset, uint24 fee) external;
     function setPayoutThreshold(address token, uint256 amount) external;
     function setPayoutInterval(address token, uint256 intervalBlocks) external;
 }
@@ -53,6 +53,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     string public officialWebsite;
     uint256 public creationFeeWei = 0.000005 ether;
     uint256 public constant MAX_CREATION_FEE_WEI = 0.001 ether;
+    uint8 public constant MAX_REWARDS = 5; // parallel reward assets (matches LaunchTokenV2)
 
     struct Launch {
         address creator;
@@ -63,6 +64,15 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
     mapping(address token => Launch) internal _launches;
 
+    /// @notice One reward asset + its fee weight + its buyback venue (Reward mode).
+    struct RewardVenue {
+        address token; // the reward asset holders earn
+        uint16 weightBps; // this asset's share of the fee (weights sum to 10000)
+        bool isV3; // venue: a Uniswap V3 pool (else V4)
+        uint24 v3Fee; // V3: the pool fee tier (e.g. 10000)
+        PoolKey v4Key; // V4: the pool to buy the asset on
+    }
+
     struct CreateParams {
         string name;
         string symbol;
@@ -70,15 +80,13 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         bytes32 salt;
         LaunchTokenV2.Mode mode; // Reward / Increasing (Redistribute) / Lottery
         uint24 fee; // 30000 / 50000 / 100000
-        // The reward asset: required for Reward mode, optional for Lottery (the
-        // prize token — 0 pays the pot in WETH). Ignored for Redistribute.
-        address rewardToken;
-        // Where that asset is bought. `rewardIsV3` picks the venue — a Uniswap V3
-        // pool (WETH/asset at `rewardV3Fee`) or a V4 pool (`rewardPoolKey`). Most
-        // established tokens on this chain are V3.
-        bool rewardIsV3;
-        uint24 rewardV3Fee; // V3: the pool fee tier
-        PoolKey rewardPoolKey; // V4: the pool to buy the asset on
+        // Reward mode: 1..5 reward assets, each with a fee weight (sum 10000) + venue.
+        RewardVenue[] rewards;
+        // Lottery mode: an optional prize token (0 = WETH pot) + its buyback venue.
+        address prizeToken;
+        bool prizeIsV3;
+        uint24 prizeV3Fee;
+        PoolKey prizePoolKey;
         uint256 minHold; // min balance to earn rewards
         uint256 payoutThreshold; // min pending WETH before a payout fires
         // Block-based timer (L1 blocks, ~12s): min blocks between payouts/draws.
@@ -98,6 +106,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     error InvalidMode();
     error InvalidRewardToken();
     error InvalidRewardPool();
+    error BadRewardConfig(); // wrong reward count / weights don't sum to 10000 / duplicate asset
     error InvalidMetadata();
     error InsufficientCreationFee();
     error CreationFeeTransferFailed();
@@ -152,31 +161,41 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         _validate(p.metadata.discord);
         _validate(p.metadata.twitter);
 
-        // Reward always distributes an external token; Lottery may optionally pay
-        // its pot in one (else the pot is paid in WETH). Validate whichever is set.
-        address rewardToken;
+        // Build the token's reward-asset config from the mode:
+        //  • Reward     — 1..MAX_REWARDS dev-chosen assets, each with a fee weight
+        //                 (weights sum to 10000) + a buyback venue. Distributed in parallel.
+        //  • Lottery    — an optional single prize token (0 => the pot stays WETH).
+        //  • Redistribute — no external asset (buys back the token's own pool).
+        address[] memory rewardTokens;
+        uint16[] memory rewardWeights;
+        address prizeToken;
+
         if (p.mode == LaunchTokenV2.Mode.Reward) {
-            if (p.rewardToken == address(0) || p.rewardToken == weth) revert InvalidRewardToken();
-            rewardToken = p.rewardToken;
-        } else if (p.mode == LaunchTokenV2.Mode.Lottery && p.rewardToken != address(0)) {
-            if (p.rewardToken == weth) revert InvalidRewardToken();
-            rewardToken = p.rewardToken;
-        }
-        // For a V3 reward/prize, the WETH/asset pool at the chosen fee must exist —
-        // otherwise the buyback would be permanently unroutable.
-        if (rewardToken != address(0) && p.rewardIsV3 && v3Factory.getPool(weth, rewardToken, p.rewardV3Fee) == address(0))
-        {
-            revert InvalidRewardPool();
-        }
-        // For a V4 reward/prize, the pool key must actually pair WETH with the reward
-        // token (audit L-02) — symmetric with the V3 check. Otherwise the distributor's
-        // swap would create an unsettleable non-WETH debt (or route to a rigged pool).
-        if (rewardToken != address(0) && !p.rewardIsV3) {
-            address rc0 = Currency.unwrap(p.rewardPoolKey.currency0);
-            address rc1 = Currency.unwrap(p.rewardPoolKey.currency1);
-            if (!((rc0 == weth && rc1 == rewardToken) || (rc0 == rewardToken && rc1 == weth))) {
-                revert InvalidRewardPool();
+            uint256 n = p.rewards.length;
+            if (n == 0 || n > MAX_REWARDS) revert BadRewardConfig();
+            rewardTokens = new address[](n);
+            rewardWeights = new uint16[](n);
+            uint256 weightSum;
+            for (uint256 i; i < n; i++) {
+                RewardVenue calldata rv = p.rewards[i];
+                address a = rv.token;
+                if (a == address(0) || a == weth) revert InvalidRewardToken();
+                // Reject duplicate assets — the token registers one dividend bucket per
+                // asset, and a repeat would double-register its venue / split weight twice.
+                for (uint256 j; j < i; j++) {
+                    if (rewardTokens[j] == a) revert BadRewardConfig();
+                }
+                if (rv.weightBps == 0) revert BadRewardConfig();
+                _validateVenue(a, rv.isV3, rv.v3Fee, rv.v4Key);
+                rewardTokens[i] = a;
+                rewardWeights[i] = rv.weightBps;
+                weightSum += rv.weightBps;
             }
+            if (weightSum != 10_000) revert BadRewardConfig();
+        } else if (p.mode == LaunchTokenV2.Mode.Lottery && p.prizeToken != address(0)) {
+            if (p.prizeToken == weth) revert InvalidRewardToken();
+            _validateVenue(p.prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
+            prizeToken = p.prizeToken;
         }
 
         token = deployer.deploy(
@@ -189,14 +208,15 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 maxBuyBps: maxBuyBps,
                 maxBuyBlocks: maxBuyBlocks,
                 mode: p.mode,
-                rewardToken: rewardToken,
-                rewardPool: address(0), // V4 uses the distributor's registered PoolKey
+                rewardTokens: rewardTokens,
+                rewardWeights: rewardWeights,
+                prizeToken: prizeToken,
                 minHoldForRewards: p.minHold
             }),
             keccak256(abi.encode(msg.sender, p.salt))
         );
 
-        _launchOnV4(token, p, rewardToken);
+        _launchOnV4(token, p, prizeToken);
 
         // Creation fee -> treasury; refund the rest.
         uint256 fee = creationFeeWei;
@@ -211,12 +231,16 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             if (!okR) revert CreationFeeTransferFailed();
         }
 
-        emit TokenLaunchedV4(token, msg.sender, p.fee, uint8(p.mode), rewardToken, p.name, p.symbol);
+        // Representative reward asset for the event/indexer: the first reward token
+        // (Reward), the prize token (Lottery), or 0 (Redistribute). The full reward
+        // set is readable on-chain via LaunchTokenV2.rewardTokensList().
+        address primaryReward = rewardTokens.length > 0 ? rewardTokens[0] : prizeToken;
+        emit TokenLaunchedV4(token, msg.sender, p.fee, uint8(p.mode), primaryReward, p.name, p.symbol);
     }
 
     /// @dev Initialize the V4 pool, lock the single-sided supply, and wire the
     /// locker + distributor. Split out to keep the stack manageable.
-    function _launchOnV4(address token, CreateParams calldata p, address rewardToken) internal {
+    function _launchOnV4(address token, CreateParams calldata p, address prizeToken) internal {
         LaunchTokenV2 t = LaunchTokenV2(token);
         bool tokenIsCurrency0 = token < weth;
         (Currency c0, Currency c1) = tokenIsCurrency0
@@ -250,13 +274,19 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // prize token, register its V3/V4 venue so the pot can be swapped to it.
             t.setBuySource(address(poolManager));
             t.setLotteryOperator(distributor);
-            if (rewardToken != address(0)) _registerRewardVenue(token, p);
+            if (prizeToken != address(0)) {
+                _registerVenue(token, prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
+            }
         } else if (p.mode == LaunchTokenV2.Mode.Reward) {
-            // Reward: buy the dev's reward token on its V3 or V4 pool.
-            _registerRewardVenue(token, p);
+            // Reward: register one buyback venue per reward asset. The distributor
+            // splits each fee batch by weight and buys every asset in parallel.
+            for (uint256 i; i < p.rewards.length; i++) {
+                RewardVenue calldata rv = p.rewards[i];
+                _registerVenue(token, rv.token, rv.isV3, rv.v3Fee, rv.v4Key);
+            }
         } else {
-            // Redistribute buys back the token's own V4 pool.
-            IDistributorV4Register(distributor).registerBuyback(token, key);
+            // Redistribute buys back the token's own V4 pool (asset == token).
+            IDistributorV4Register(distributor).registerBuyback(token, token, key);
         }
         if (p.payoutThreshold > 0) IDistributorV4Register(distributor).setPayoutThreshold(token, p.payoutThreshold);
         if (p.payoutIntervalBlocks > 0) {
@@ -266,13 +296,26 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, exists: true});
     }
 
-    /// @dev Register the distributor's buyback venue for a token's reward/prize
-    /// asset: a Uniswap V3 pool (WETH/asset at rewardV3Fee) or a V4 pool.
-    function _registerRewardVenue(address token, CreateParams calldata p) internal {
-        if (p.rewardIsV3) {
-            IDistributorV4Register(distributor).registerBuybackV3(token, p.rewardV3Fee);
+    /// @dev A reward/prize venue must actually route WETH -> asset, else the
+    /// distributor's buyback would be permanently unroutable (V3) or would create
+    /// an unsettleable non-WETH debt / route to a rigged pool (V4, audit L-02).
+    function _validateVenue(address asset, bool isV3, uint24 v3Fee, PoolKey calldata key) internal view {
+        if (isV3) {
+            if (v3Factory.getPool(weth, asset, v3Fee) == address(0)) revert InvalidRewardPool();
         } else {
-            IDistributorV4Register(distributor).registerBuyback(token, p.rewardPoolKey);
+            address c0 = Currency.unwrap(key.currency0);
+            address c1 = Currency.unwrap(key.currency1);
+            if (!((c0 == weth && c1 == asset) || (c0 == asset && c1 == weth))) revert InvalidRewardPool();
+        }
+    }
+
+    /// @dev Register the distributor's buyback venue for one reward/prize asset:
+    /// a Uniswap V3 pool (WETH/asset at v3Fee) or a V4 pool.
+    function _registerVenue(address token, address asset, bool isV3, uint24 v3Fee, PoolKey calldata key) internal {
+        if (isV3) {
+            IDistributorV4Register(distributor).registerBuybackV3(token, asset, v3Fee);
+        } else {
+            IDistributorV4Register(distributor).registerBuyback(token, asset, key);
         }
     }
 

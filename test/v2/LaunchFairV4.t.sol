@@ -111,10 +111,11 @@ contract LaunchFairV4Test is Test, Deployers {
                 salt: bytes32(0),
                 mode: LaunchTokenV2.Mode.Increasing, // Redistribute
                 fee: 30_000,
-                rewardToken: address(0),
-                rewardIsV3: false,
-                rewardV3Fee: 0,
-                rewardPoolKey: none,
+                rewards: _noRewards(),
+                prizeToken: address(0),
+                prizeIsV3: false,
+                prizeV3Fee: 0,
+                prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
                 payoutIntervalBlocks: 0
@@ -127,6 +128,27 @@ contract LaunchFairV4Test is Test, Deployers {
     function _self() internal view returns (address[] memory h) {
         h = new address[](1);
         h[0] = address(this);
+    }
+
+    // No external reward assets (Redistribute / WETH-pot Lottery).
+    function _noRewards() internal pure returns (LaunchFairV4.RewardVenue[] memory r) {
+        r = new LaunchFairV4.RewardVenue[](0);
+    }
+
+    // A single reward asset taking the full fee weight, on a V3 (or V4) venue.
+    function _oneReward(address asset, bool isV3, uint24 v3Fee)
+        internal
+        pure
+        returns (LaunchFairV4.RewardVenue[] memory r)
+    {
+        PoolKey memory none;
+        r = new LaunchFairV4.RewardVenue[](1);
+        r[0] = LaunchFairV4.RewardVenue({token: asset, weightBps: 10_000, isV3: isV3, v3Fee: v3Fee, v4Key: none});
+    }
+
+    // minOuts array of `n` zeros (no slippage floor) for process().
+    function _zeros(uint256 n) internal pure returns (uint256[] memory m) {
+        m = new uint256[](n);
     }
 
     function _buy(PoolKey memory key, address token, uint256 wethIn) internal {
@@ -169,10 +191,9 @@ contract LaunchFairV4Test is Test, Deployers {
         // Redistribute is auto-compounding: the balance grows on the buyback itself,
         // no claim and no push.
         uint256 beforeProcess = IERC20(token).balanceOf(HOLDER);
-        uint256 out = dist.process(token, 0);
-        assertGt(out, 0, "bought back for rewards");
+        dist.process(token, _zeros(1)); // Redistribute has one reward asset (the token itself)
         assertGt(IERC20(token).balanceOf(HOLDER), beforeProcess, "balance auto-grew on the buyback");
-        assertGt(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "reflection accrued");
+        assertGt(LaunchTokenV2(token).totalWithdrawableOf(HOLDER), 0, "reflection accrued");
 
         // A manual realize only folds the reflection into the raw balance — the
         // displayed balanceOf is unchanged (it already reflected the growth).
@@ -181,7 +202,7 @@ contract LaunchFairV4Test is Test, Deployers {
         who[0] = HOLDER;
         LaunchTokenV2(token).processAccounts(who);
         assertApproxEqAbs(IERC20(token).balanceOf(HOLDER), grown, 100, "realize doesn't change balanceOf");
-        assertEq(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "reflection realized");
+        assertEq(LaunchTokenV2(token).totalWithdrawableOf(HOLDER), 0, "reflection realized");
     }
 
     // A Reward token whose reward asset trades on Uniswap V3 (not an exclusive V4
@@ -201,16 +222,17 @@ contract LaunchFairV4Test is Test, Deployers {
                 salt: bytes32(uint256(2)),
                 mode: LaunchTokenV2.Mode.Reward,
                 fee: 30_000,
-                rewardToken: address(reward),
-                rewardIsV3: true,
-                rewardV3Fee: 10_000,
-                rewardPoolKey: none,
+                rewards: _oneReward(address(reward), true, 10_000),
+                prizeToken: address(0),
+                prizeIsV3: false,
+                prizeV3Fee: 0,
+                prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
                 payoutIntervalBlocks: 0
             })
         );
-        assertEq(dist.buybackVenue(token), 1, "wired to a V3 buyback");
+        assertEq(dist.buybackVenue(token, address(reward)), 1, "wired to a V3 buyback");
 
         PoolKey memory key = pad.getLaunch(token).key;
         _buy(key, token, 50_000 ether);
@@ -219,13 +241,145 @@ contract LaunchFairV4Test is Test, Deployers {
         locker.claim(token);
         assertGt(dist.pendingWeth(token), 0, "mechanism WETH pending");
 
-        uint256 out = dist.process(token, 0);
-        assertGt(out, 0, "reward bought via V3 router");
-        assertGt(LaunchTokenV2(token).withdrawableDividendOf(HOLDER), 0, "HOLDER accrued the reward");
+        dist.process(token, _zeros(1));
+        assertGt(LaunchTokenV2(token).withdrawableDividendOf(address(reward), HOLDER), 0, "HOLDER accrued the reward");
 
         vm.prank(HOLDER);
         LaunchTokenV2(token).claim();
         assertGt(reward.balanceOf(HOLDER), 0, "HOLDER received the V3-bought reward token");
+    }
+
+    // Multi-reward: two dev-chosen reward assets distributed in parallel, each with
+    // its own fee weight (60/40) + V3 venue. process() splits the fee batch by weight
+    // and buys both assets in a single call; holders accrue in each asset separately.
+    function test_endToEnd_reward_multiAsset_parallel() public {
+        MockWethT rewardA = new MockWethT();
+        MockWethT rewardB = new MockWethT();
+        v3factory.setPool(address(weth), address(rewardA), 10_000, address(0xBEE1));
+        v3factory.setPool(address(weth), address(rewardB), 10_000, address(0xBEE2));
+
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.RewardVenue[] memory rewards = new LaunchFairV4.RewardVenue[](2);
+        rewards[0] =
+            LaunchFairV4.RewardVenue({token: address(rewardA), weightBps: 6_000, isV3: true, v3Fee: 10_000, v4Key: none});
+        rewards[1] =
+            LaunchFairV4.RewardVenue({token: address(rewardB), weightBps: 4_000, isV3: true, v3Fee: 10_000, v4Key: none});
+
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Multi",
+                symbol: "MULTI",
+                metadata: meta,
+                salt: bytes32(uint256(5)),
+                mode: LaunchTokenV2.Mode.Reward,
+                fee: 30_000,
+                rewards: rewards,
+                prizeToken: address(0),
+                prizeIsV3: false,
+                prizeV3Fee: 0,
+                prizePoolKey: none,
+                minHold: 0,
+                payoutThreshold: 0,
+                payoutIntervalBlocks: 0
+            })
+        );
+
+        // Both assets registered as reward buckets, in order, with their weights + venues.
+        address[] memory list = LaunchTokenV2(token).rewardTokensList();
+        assertEq(list.length, 2, "two reward assets");
+        assertEq(list[0], address(rewardA), "asset0 = A");
+        assertEq(list[1], address(rewardB), "asset1 = B");
+        assertEq(LaunchTokenV2(token).rewardWeightBps(address(rewardA)), 6_000, "A weight 60%");
+        assertEq(LaunchTokenV2(token).rewardWeightBps(address(rewardB)), 4_000, "B weight 40%");
+        assertEq(dist.buybackVenue(token, address(rewardA)), 1, "A on V3");
+        assertEq(dist.buybackVenue(token, address(rewardB)), 1, "B on V3");
+
+        PoolKey memory key = pad.getLaunch(token).key;
+        _buy(key, token, 50_000 ether);
+        IERC20(token).transfer(HOLDER, IERC20(token).balanceOf(address(this)));
+
+        locker.claim(token);
+        assertGt(dist.pendingWeth(token), 0, "fee pending");
+
+        dist.process(token, _zeros(2)); // buys both assets in one call
+
+        uint256 wdA = LaunchTokenV2(token).withdrawableDividendOf(address(rewardA), HOLDER);
+        uint256 wdB = LaunchTokenV2(token).withdrawableDividendOf(address(rewardB), HOLDER);
+        assertGt(wdA, 0, "accrued asset A");
+        assertGt(wdB, 0, "accrued asset B");
+        // Split follows the weights: A = 60%, B = 40% -> wdA/wdB == 60/40 == 1.5.
+        assertApproxEqRel(wdA * 4_000, wdB * 6_000, 1e15, "60/40 fee split honored");
+
+        // Claiming pays out every reward asset in one call.
+        vm.prank(HOLDER);
+        LaunchTokenV2(token).claim();
+        assertGt(rewardA.balanceOf(HOLDER), 0, "HOLDER got asset A");
+        assertGt(rewardB.balanceOf(HOLDER), 0, "HOLDER got asset B");
+    }
+
+    // Reward weights must sum to exactly 10000.
+    function test_reward_rejectsBadWeights() public {
+        MockWethT a = new MockWethT();
+        MockWethT b = new MockWethT();
+        v3factory.setPool(address(weth), address(a), 10_000, address(0xBEE1));
+        v3factory.setPool(address(weth), address(b), 10_000, address(0xBEE2));
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.RewardVenue[] memory rewards = new LaunchFairV4.RewardVenue[](2);
+        rewards[0] = LaunchFairV4.RewardVenue({token: address(a), weightBps: 6_000, isV3: true, v3Fee: 10_000, v4Key: none});
+        rewards[1] = LaunchFairV4.RewardVenue({token: address(b), weightBps: 3_000, isV3: true, v3Fee: 10_000, v4Key: none}); // 9000
+        vm.expectRevert(LaunchFairV4.BadRewardConfig.selector);
+        pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Bad", symbol: "BAD", metadata: meta, salt: bytes32(uint256(6)),
+                mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+            })
+        );
+    }
+
+    // A duplicate reward asset is rejected (one dividend bucket per asset).
+    function test_reward_rejectsDuplicateAsset() public {
+        MockWethT a = new MockWethT();
+        v3factory.setPool(address(weth), address(a), 10_000, address(0xBEE1));
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.RewardVenue[] memory rewards = new LaunchFairV4.RewardVenue[](2);
+        rewards[0] = LaunchFairV4.RewardVenue({token: address(a), weightBps: 5_000, isV3: true, v3Fee: 10_000, v4Key: none});
+        rewards[1] = LaunchFairV4.RewardVenue({token: address(a), weightBps: 5_000, isV3: true, v3Fee: 10_000, v4Key: none});
+        vm.expectRevert(LaunchFairV4.BadRewardConfig.selector);
+        pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Dup", symbol: "DUP", metadata: meta, salt: bytes32(uint256(7)),
+                mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+            })
+        );
+    }
+
+    // More than MAX_REWARDS (5) assets is rejected.
+    function test_reward_rejectsTooMany() public {
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.RewardVenue[] memory rewards = new LaunchFairV4.RewardVenue[](6);
+        for (uint256 i; i < 6; i++) {
+            MockWethT a = new MockWethT();
+            v3factory.setPool(address(weth), address(a), 10_000, address(uint160(0xBE00 + i)));
+            rewards[i] =
+                LaunchFairV4.RewardVenue({token: address(a), weightBps: 2_000, isV3: true, v3Fee: 10_000, v4Key: none});
+        }
+        vm.expectRevert(LaunchFairV4.BadRewardConfig.selector);
+        pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Six", symbol: "SIX", metadata: meta, salt: bytes32(uint256(8)),
+                mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+            })
+        );
     }
 
     // A V3 reward whose pool doesn't exist is rejected at creation (no un-routable
@@ -243,10 +397,11 @@ contract LaunchFairV4Test is Test, Deployers {
                 salt: bytes32(uint256(3)),
                 mode: LaunchTokenV2.Mode.Reward,
                 fee: 30_000,
-                rewardToken: address(reward),
-                rewardIsV3: true,
-                rewardV3Fee: 10_000,
-                rewardPoolKey: none,
+                rewards: _oneReward(address(reward), true, 10_000),
+                prizeToken: address(0),
+                prizeIsV3: false,
+                prizeV3Fee: 0,
+                prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
                 payoutIntervalBlocks: 0
@@ -265,10 +420,11 @@ contract LaunchFairV4Test is Test, Deployers {
                 salt: bytes32(uint256(1)),
                 mode: LaunchTokenV2.Mode.Lottery,
                 fee: 100_000, // 10% fee -> a beefy pot
-                rewardToken: address(0), // WETH prize
-                rewardIsV3: false,
-                rewardV3Fee: 0,
-                rewardPoolKey: none,
+                rewards: _noRewards(),
+                prizeToken: address(0), // WETH pot
+                prizeIsV3: false,
+                prizeV3Fee: 0,
+                prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
                 payoutIntervalBlocks: 0
@@ -336,17 +492,18 @@ contract LaunchFairV4Test is Test, Deployers {
                 salt: bytes32(uint256(4)),
                 mode: LaunchTokenV2.Mode.Lottery,
                 fee: 100_000,
-                rewardToken: address(prize), // token prize (not WETH)
-                rewardIsV3: true,
-                rewardV3Fee: 10_000,
-                rewardPoolKey: none,
+                rewards: _noRewards(),
+                prizeToken: address(prize), // token prize (not WETH)
+                prizeIsV3: true,
+                prizeV3Fee: 10_000,
+                prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
                 payoutIntervalBlocks: 0
             })
         );
-        assertEq(dist.buybackVenue(token), 1, "prize bought on V3");
-        assertEq(LaunchTokenV2(token).rewardToken(), address(prize), "prize token recorded");
+        assertEq(dist.buybackVenue(token, address(prize)), 1, "prize bought on V3");
+        assertEq(LaunchTokenV2(token).prizeToken(), address(prize), "prize token recorded");
 
         PoolKey memory key = pad.getLaunch(token).key;
         dist.setDrawOperator(address(this));

@@ -49,14 +49,49 @@ contract V4DistributorTest is Test, Deployers {
     address constant B = address(0xB2);
     uint256 constant SUPPLY = 1_000_000_000 ether;
 
-    function _deployToken(LaunchTokenV2.Mode mode, address rewardToken, address rewardPool)
+    function _deployToken(LaunchTokenV2.Mode mode, address rewardToken, address /*rewardPool*/)
         internal
         returns (LaunchTokenV2 t)
     {
         LaunchTokenV2.Metadata memory meta;
+        // Multi-reward API: Reward passes [rewardToken] @ 100% weight; Lottery passes the
+        // prize token (0 = WETH pot); Increasing/Base pass empty arrays (the constructor
+        // auto-registers THIS token as the sole Increasing reward asset).
+        address[] memory rewardTokens = new address[](0);
+        uint16[] memory rewardWeights = new uint16[](0);
+        address prizeToken = address(0);
+        if (mode == LaunchTokenV2.Mode.Reward) {
+            rewardTokens = _arr1(rewardToken);
+            rewardWeights = _w1(10_000);
+        } else if (mode == LaunchTokenV2.Mode.Lottery) {
+            prizeToken = rewardToken; // 0 = WETH pot; otherwise a dev-chosen prize token
+        }
         t = new LaunchTokenV2(
-            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", meta, 0, 0, mode, rewardToken, rewardPool, 0, address(this)
+            "Tok", "TOK", SUPPLY, "https://hood.launchfair.app", meta, 0, 0, mode,
+            rewardTokens, rewardWeights, prizeToken, 0, address(this)
         );
+    }
+
+    // ── multi-reward API array-literal helpers ───────────────────────────────────
+    function _arr1(address a) internal pure returns (address[] memory x) {
+        x = new address[](1);
+        x[0] = a;
+    }
+
+    function _w1(uint16 w) internal pure returns (uint16[] memory x) {
+        x = new uint16[](1);
+        x[0] = w;
+    }
+
+    // A zero-filled minOuts array for process(); `n` == the token's reward-asset count.
+    function _zeros(uint256 n) internal pure returns (uint256[] memory m) {
+        m = new uint256[](n);
+    }
+
+    // A single-element minOuts array carrying `v`.
+    function _u1(uint256 v) internal pure returns (uint256[] memory x) {
+        x = new uint256[](1);
+        x[0] = v;
     }
 
     function _pool(address token) internal view returns (PoolKey memory key) {
@@ -83,7 +118,8 @@ contract V4DistributorTest is Test, Deployers {
 
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
-        dist.registerBuyback(address(token), key);
+        // Increasing distributes THIS token back to holders → the reward asset is the token itself.
+        dist.registerBuyback(address(token), address(token), key);
 
         // Exclude V4 plumbing so only real holders accrue.
         token.excludeFromDividends(address(manager), true);
@@ -109,12 +145,15 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), wethIn);
         dist.notify(address(token), wethIn);
 
-        uint256 out = dist.process(address(token), 0);
+        // process() no longer returns the bought-back amount; for Redistribute the sole
+        // reward asset is the token itself, so read it from the tracker.
+        dist.process(address(token), _zeros(1));
+        uint256 out = token.totalDistributedOf(address(token));
         assertGt(out, 0, "bought back token");
-        assertEq(token.totalDistributed(), out, "distributed == bought back");
+        assertEq(token.totalDistributedOf(address(token)), out, "distributed == bought back");
 
-        uint256 wa = token.withdrawableDividendOf(A);
-        uint256 wb = token.withdrawableDividendOf(B);
+        uint256 wa = token.withdrawableDividendOf(address(token), A);
+        uint256 wb = token.withdrawableDividendOf(address(token), B);
         assertGt(wa, 0, "A accrued");
         assertApproxEqRel(wa, wb * 3, 0.01e18, "A ~3x B");
         assertApproxEqAbs(wa + wb, out, 1000, "all distributed to holders");
@@ -139,7 +178,7 @@ contract V4DistributorTest is Test, Deployers {
 
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
-        dist.registerBuyback(address(token), rkey); // buy the REWARD token here
+        dist.registerBuyback(address(token), address(reward), rkey); // buy the REWARD token here
 
         token.excludeFromDividends(address(manager), true);
         token.excludeFromDividends(address(modifyLiquidityRouter), true);
@@ -150,11 +189,12 @@ contract V4DistributorTest is Test, Deployers {
         uint256 wethIn = 10 ether;
         weth.mint(address(dist), wethIn);
         dist.notify(address(token), wethIn);
-        uint256 out = dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
+        uint256 out = token.totalDistributedOf(address(reward)); // reward bought & funded
         assertGt(out, 0, "bought reward token");
 
         // Holders accrue the REWARD token pro-rata; claim delivers it.
-        assertApproxEqRel(token.withdrawableDividendOf(A), token.withdrawableDividendOf(B) * 3, 0.01e18, "A ~3x B");
+        assertApproxEqRel(token.withdrawableDividendOf(address(reward), A), token.withdrawableDividendOf(address(reward), B) * 3, 0.01e18, "A ~3x B");
         vm.prank(A);
         token.claim();
         assertGt(reward.balanceOf(A), 0, "A received the reward token");
@@ -169,8 +209,8 @@ contract V4DistributorTest is Test, Deployers {
 
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
-        dist.registerBuybackV3(address(token), 10_000); // buy the reward on a V3 pool
-        assertEq(dist.buybackVenue(address(token)), 1, "venue = V3");
+        dist.registerBuybackV3(address(token), address(reward), 10_000); // buy the reward on a V3 pool
+        assertEq(dist.buybackVenue(address(token), address(reward)), 1, "venue = V3");
 
         token.excludeFromDividends(address(dist), true);
         token.transfer(A, 300_000 ether);
@@ -179,11 +219,12 @@ contract V4DistributorTest is Test, Deployers {
         uint256 wethIn = 10 ether;
         weth.mint(address(dist), wethIn);
         dist.notify(address(token), wethIn);
-        uint256 out = dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
+        uint256 out = token.totalDistributedOf(address(reward)); // reward bought & funded
 
         assertEq(out, wethIn * v3router.rate(), "bought reward via the V3 router");
         assertEq(weth.balanceOf(address(dist)), 0, "all pending WETH swapped");
-        assertApproxEqRel(token.withdrawableDividendOf(A), token.withdrawableDividendOf(B) * 3, 0.01e18, "A ~3x B");
+        assertApproxEqRel(token.withdrawableDividendOf(address(reward), A), token.withdrawableDividendOf(address(reward), B) * 3, 0.01e18, "A ~3x B");
         vm.prank(A);
         token.claim();
         assertGt(reward.balanceOf(A), 0, "A received the V3-bought reward token");
@@ -194,14 +235,14 @@ contract V4DistributorTest is Test, Deployers {
         LaunchTokenV2 token = _deployToken(LaunchTokenV2.Mode.Reward, address(reward), address(0));
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setLocker(address(this));
-        dist.registerBuybackV3(address(token), 10_000);
+        dist.registerBuybackV3(address(token), address(reward), 10_000);
         token.excludeFromDividends(address(dist), true);
         token.transfer(A, 100_000 ether);
 
         weth.mint(address(dist), 5 ether);
         dist.notify(address(token), 5 ether); // out would be 10 ether
         vm.expectRevert(LaunchFairV4Distributor.Slippage.selector);
-        dist.process(address(token), 100 ether); // demand more than the swap yields
+        dist.process(address(token), _u1(100 ether)); // demand more than the swap yields
         assertEq(dist.pendingWeth(address(token)), 5 ether, "revert rolled back the pending debit");
     }
 
@@ -216,13 +257,14 @@ contract V4DistributorTest is Test, Deployers {
         dist.notify(address(token), 3 ether);
         assertFalse(dist.readyToProcess(address(token)), "below threshold");
         vm.expectRevert(LaunchFairV4Distributor.BelowThreshold.selector);
-        dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
 
         // Cross the threshold → ready, process fires.
         weth.mint(address(dist), 3 ether);
         dist.notify(address(token), 3 ether); // 6 >= 5
         assertTrue(dist.readyToProcess(address(token)), "threshold crossed");
-        assertGt(dist.process(address(token), 0), 0, "payout fired");
+        dist.process(address(token), _zeros(1));
+        assertGt(token.totalDistributedOf(address(token)), 0, "payout fired");
     }
 
     // The dev's block timer gates the buyback cadence.
@@ -237,11 +279,11 @@ contract V4DistributorTest is Test, Deployers {
 
         assertFalse(dist.readyToProcess(address(token)), "timer not elapsed yet");
         vm.expectRevert(LaunchFairV4Distributor.TimerNotElapsed.selector);
-        dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
 
         vm.roll(block.number + 100);
         assertTrue(dist.readyToProcess(address(token)), "timer elapsed");
-        dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
         assertEq(dist.lastPayoutBlock(address(token)), block.number, "timer reset to now");
 
         // The next payout must wait another full interval.
@@ -262,12 +304,13 @@ contract V4DistributorTest is Test, Deployers {
         // A random caller is rejected…
         vm.prank(A);
         vm.expectRevert(LaunchFairV4Distributor.NotProcessor.selector);
-        dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
 
         // …once allowlisted, the keeper can process.
         dist.setProcessor(A, true);
         vm.prank(A);
-        assertGt(dist.process(address(token), 0), 0, "allowlisted keeper processed");
+        dist.process(address(token), _zeros(1));
+        assertGt(token.totalDistributedOf(address(token)), 0, "allowlisted keeper processed");
     }
 
     // The registrar is set-once and a token's venue is frozen after launch (L-03),
@@ -278,7 +321,7 @@ contract V4DistributorTest is Test, Deployers {
 
         // Re-registering the same token is rejected.
         vm.expectRevert(LaunchFairV4Distributor.AlreadyRegistered.selector);
-        dist.registerBuyback(address(token), _pool(address(token)));
+        dist.registerBuyback(address(token), address(token), _pool(address(token)));
 
         // setRegistrar locks after the first call.
         dist.setRegistrar(address(0xCAFE));
@@ -528,9 +571,9 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(A, 100_000 ether);
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
-        dist.registerBuyback(address(token), _pool(address(token))); // even if registered…
+        dist.registerBuyback(address(token), address(token), _pool(address(token))); // even if registered…
         vm.expectRevert(LaunchFairV4Distributor.WrongMode.selector); // …process is not the lottery path
-        dist.process(address(token), 0);
+        dist.process(address(token), _zeros(1));
     }
 
     // Recovery: a stuck committed draw can be canceled, rolling its reserved pot
@@ -582,7 +625,7 @@ contract V4DistributorTest is Test, Deployers {
     // A lottery whose prize is a dev-chosen token (bought with the pot on V3),
     // rather than WETH: the winner is paid in that token.
     function _setupLotteryWithPrize(address prize) internal returns (LaunchTokenV2 token) {
-        token = _deployToken(LaunchTokenV2.Mode.Lottery, prize, address(0)); // prize == rewardToken
+        token = _deployToken(LaunchTokenV2.Mode.Lottery, prize, address(0)); // prize == the lottery prize token
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         vrf = new MockVRFCoordinator();
         dist.setLocker(address(this));
@@ -590,7 +633,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.setVrf(address(vrf));
         token.setBuySource(address(this));
         token.setLotteryOperator(address(dist));
-        dist.registerBuybackV3(address(token), 10_000); // prize bought on a V3 pool
+        dist.registerBuybackV3(address(token), prize, 10_000); // prize bought on a V3 pool
     }
 
     function test_lottery_tokenPrize_boughtAndPaidToWinner() public {
