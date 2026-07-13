@@ -379,6 +379,11 @@ contract V4DistributorTest is Test, Deployers {
         return uint256(keccak256(abi.encode(rnd, token, round))) % total;
     }
 
+    // The outcome roll the contract derives (0.00–99.99), for choosing miss/regular/jackpot.
+    function _roll(bytes32 rnd, address token, uint256 round) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encode(rnd, token, round, uint256(1)))) % 10_000;
+    }
+
     function test_lottery_drawPaysVerifiableWinner() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 300_000 ether); // A holds 300k → tickets [0, 300_000e18)
@@ -430,10 +435,9 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(wt, winningTicket, "winning ticket derived on-chain matches");
     }
 
-    // Rollover: on a MISS the pot is NOT paid — it stays put and rolls into the next draw,
-    // the session doesn't advance, and the draw is recorded won=false. Chance = 1 (1-in-10000)
-    // makes this beacon miss (any non-zero roll >= 1).
-    function test_lottery_jackpotMissRollsOver() public {
+    // MISS: nobody wins, the pot (and jackpot pool) stay and roll over, session doesn't
+    // advance, outcome=0. The odds put this beacon's roll inside the miss band.
+    function test_lottery_missRollsOver() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
         uint256 pot = 5 ether;
@@ -443,8 +447,8 @@ contract V4DistributorTest is Test, Deployers {
         uint256 round = 7;
         bytes32 rnd = keccak256("miss-beacon");
         uint256 roll = uint256(keccak256(abi.encode(rnd, address(token), round, uint256(1)))) % 10_000;
-        assertGt(roll, 0, "chosen beacon must roll non-zero so chance=1 misses");
-        dist.setJackpotChance(address(token), 1); // 1-in-10000 → this roll misses
+        assertLt(roll, 9998, "pick a beacon with headroom for the jackpot band");
+        dist.setLotteryOdds(address(token), uint16(roll + 1), 1, 7000); // miss band covers this roll
 
         dist.commitDraw(address(token), round);
         uint256 aBefore = weth.balanceOf(A);
@@ -452,40 +456,83 @@ contract V4DistributorTest is Test, Deployers {
 
         assertEq(weth.balanceOf(A), aBefore, "no winner paid on a miss");
         assertEq(dist.pendingWeth(address(token)), pot, "pot rolls over fully intact");
+        assertEq(dist.jackpotWeth(address(token)), 0, "jackpot pool untouched");
         assertEq(token.lotteryEpoch(), 0, "session not advanced on a miss");
-        assertEq(dist.drawCount(address(token)), 1, "the miss is recorded");
-        (,,, address w,,,,, bool won,) = dist.draws(address(token), 0);
+        (,,, address w,,,,, uint8 oc,) = dist.draws(address(token), 0);
         assertEq(w, address(0), "no winner recorded on a miss");
-        assertFalse(won, "draw recorded as a miss");
+        assertEq(oc, 0, "outcome = miss");
     }
 
-    // Rollover: on a HIT the winner takes the ENTIRE accumulated pot (built up here across
-    // several fee batches, as it would be across rolled-over draws). Chance = roll+1 forces
-    // the hit deterministically.
-    function test_lottery_jackpotHitPaysWholeRolledPot() public {
+    // REGULAR: a holder wins their share of the pot; the remainder skims into the jackpot
+    // pool; session unchanged; outcome=1. Odds: 0 miss, 10% jackpot (band 9000+), 70% share.
+    function test_lottery_regularWinSkimsToJackpot() public {
         LaunchTokenV2 token = _setupLottery();
-        token.transfer(A, 100_000 ether); // A is the only eligible holder → A wins on a hit
-        uint256 pot = 1 ether + 2 ether + 4 ether; // accrued across three batches
+        token.transfer(A, 100_000 ether); // A is the sole eligible holder → A is the winner
+        uint256 pot = 10 ether;
         weth.mint(address(dist), pot);
-        dist.notify(address(token), 1 ether);
-        dist.notify(address(token), 2 ether);
-        dist.notify(address(token), 4 ether);
-        assertEq(dist.pendingWeth(address(token)), pot, "pot accumulated across batches");
+        dist.notify(address(token), pot);
 
-        uint256 round = 9;
-        bytes32 rnd = keccak256("hit-beacon");
+        uint256 round = 11;
+        bytes32 rnd = keccak256("regular-beacon");
         uint256 roll = uint256(keccak256(abi.encode(rnd, address(token), round, uint256(1)))) % 10_000;
-        dist.setJackpotChance(address(token), uint16(roll + 1)); // roll < chance → hit
+        assertLt(roll, 9000, "pick a beacon below the jackpot band");
+        dist.setLotteryOdds(address(token), 0, 1000, 7000); // 0 miss, 10% jackpot, 70% to the winner
 
         dist.commitDraw(address(token), round);
         uint256 aBefore = weth.balanceOf(A);
         _settle(token, round, rnd, _set1(A));
 
-        assertEq(weth.balanceOf(A) - aBefore, pot, "winner takes the whole rolled-up pot");
-        assertEq(dist.pendingWeth(address(token)), 0, "pot emptied by the win");
-        assertEq(token.lotteryEpoch(), 1, "session advances on the win");
-        (,,,,,,,, bool won,) = dist.draws(address(token), 0);
-        assertTrue(won, "draw recorded as a win");
+        assertEq(weth.balanceOf(A) - aBefore, 7 ether, "winner takes 70% of the pot");
+        assertEq(dist.jackpotWeth(address(token)), 3 ether, "the other 30% skims to the jackpot pool");
+        assertEq(dist.pendingWeth(address(token)), 0, "pot consumed");
+        assertEq(token.lotteryEpoch(), 0, "session not advanced on a regular win");
+        (,,,, uint256 prize,,,, uint8 oc,) = dist.draws(address(token), 0);
+        assertEq(prize, 7 ether, "prize recorded");
+        assertEq(oc, 1, "outcome = regular");
+    }
+
+    // JACKPOT: a regular win first skims 30% into the jackpot pool, then a jackpot draw pays
+    // the winner the WHOLE pot + that accumulated pool; both reset; session advances. Fixed
+    // odds (0 miss, 50% jackpot, 70% share) with two beacons chosen either side of the band.
+    function test_lottery_jackpotPaysPotPlusPool() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether); // A is the sole holder → A wins both draws
+        address tk = address(token);
+
+        // Two beacons; compute their rolls and put the jackpot band strictly between them so
+        // the lower is a REGULAR win and the higher a JACKPOT — deterministic, no roll-guessing.
+        (bytes32 rndR, uint256 r1) = (keccak256("beaconA"), _roll(keccak256("beaconA"), tk, 21));
+        (bytes32 rndJ, uint256 r2) = (keccak256("beaconB"), _roll(keccak256("beaconB"), tk, 22));
+        uint256 round1 = 21;
+        uint256 round2 = 22;
+        if (r1 >= r2) {
+            (rndR, rndJ) = (rndJ, rndR);
+            (round1, round2) = (round2, round1);
+            (r1, r2) = (r2, r1);
+        }
+        // 0 miss, jackpot band starts at r2 (=> draw2 hits it, draw1 with r1<r2 doesn't), 70% share.
+        dist.setLotteryOdds(tk, 0, uint16(10_000 - r2), 7000);
+
+        // Draw 1 — a REGULAR win skims 30% of a 10-ETH pot → 3 ETH into the jackpot pool.
+        weth.mint(address(dist), 10 ether);
+        dist.notify(tk, 10 ether);
+        dist.commitDraw(tk, round1);
+        _settle(token, round1, rndR, _set1(A));
+        assertEq(dist.jackpotWeth(tk), 3 ether, "regular win skimmed 30% to the pool");
+
+        // Draw 2 — a JACKPOT pays the new 2-ETH pot + the 3-ETH pool = 5 ETH.
+        weth.mint(address(dist), 2 ether);
+        dist.notify(tk, 2 ether);
+        dist.commitDraw(tk, round2);
+        uint256 aBefore = weth.balanceOf(A);
+        _settle(token, round2, rndJ, _set1(A));
+
+        assertEq(weth.balanceOf(A) - aBefore, 5 ether, "winner takes pot (2) + jackpot pool (3)");
+        assertEq(dist.pendingWeth(address(token)), 0, "pot emptied");
+        assertEq(dist.jackpotWeth(address(token)), 0, "jackpot pool emptied");
+        assertEq(token.lotteryEpoch(), 1, "session advances on the jackpot");
+        (,,,,,,,, uint8 oc,) = dist.draws(address(token), 1);
+        assertEq(oc, 2, "outcome = jackpot");
     }
 
     // The holder set must be sorted-distinct — the operator can't steer the winner by

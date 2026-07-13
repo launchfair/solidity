@@ -49,7 +49,7 @@ contract TestV4Rollover is Script {
             name: "Rollover Jackpot", symbol: "ROLL", metadata: meta, salt: keccak256("rollover-test-1"),
             mode: LaunchTokenV2.Mode.Lottery, fee: FEE, rewards: new LaunchFairV4.RewardVenue[](0),
             prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: empty,
-            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 5000 // 50% per draw
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 1000, jackpotChanceBps: 500, regularWinShareBps: 7000
         });
         uint256 feeWei = pad.creationFeeWei();
 

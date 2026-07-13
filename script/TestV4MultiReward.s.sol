@@ -47,7 +47,7 @@ contract TestV4MultiReward is Script {
             prizePoolKey: empty,
             minHold: 0,
             payoutThreshold: 0,
-            payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+            payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
         });
 
         uint256 feeWei = pad.creationFeeWei();

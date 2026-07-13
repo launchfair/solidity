@@ -118,7 +118,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
         key = pad.getLaunch(token).key;
@@ -229,7 +229,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
         assertEq(dist.buybackVenue(token, address(reward)), 1, "wired to a V3 buyback");
@@ -281,7 +281,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
 
@@ -335,7 +335,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Bad", symbol: "BAD", metadata: meta, salt: bytes32(uint256(6)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
     }
@@ -355,7 +355,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Dup", symbol: "DUP", metadata: meta, salt: bytes32(uint256(7)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
     }
@@ -377,7 +377,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Six", symbol: "SIX", metadata: meta, salt: bytes32(uint256(8)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
     }
@@ -404,7 +404,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
     }
@@ -427,7 +427,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
         key = pad.getLaunch(token).key;
@@ -473,9 +473,23 @@ contract LaunchFairV4Test is Test, Deployers {
         uint256 balBefore = weth.balanceOf(address(this));
         dist.settleDraw(token, _self(), 0);
 
-        assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
+        // Default odds (miss 10% / jackpot 2% / regular 88% @ 70/30). Assert the payout matches
+        // whichever bucket THIS beacon's roll lands in — the full launch→draw flow works for all.
+        uint256 roll = uint256(keccak256(abi.encode(rnd, token, round, uint256(1)))) % 10_000;
+        uint256 paid = weth.balanceOf(address(this)) - balBefore;
+        if (roll < 1000) {
+            assertEq(paid, 0, "miss pays nobody");
+            assertEq(dist.pendingWeth(token), pot, "pot rolls over on a miss");
+            assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch, "miss doesn't advance the session");
+        } else if (roll >= 9800) {
+            assertEq(paid, pot, "jackpot pays the whole pot");
+            assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "jackpot advances the session");
+        } else {
+            assertEq(paid, (pot * 7000) / 10_000, "regular pays 70% of the pot");
+            assertEq(dist.jackpotWeth(token), pot - paid, "30% skims to the jackpot pool");
+            assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch, "regular win doesn't advance the session");
+        }
         assertEq(dist.drawCount(token), 1, "draw recorded in history");
-        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "cycle advances on the winning draw");
     }
 
     // A lottery whose prize is a dev-chosen token that trades on V3: the launchpad
@@ -502,7 +516,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+                payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
         );
         assertEq(dist.buybackVenue(token, address(prize)), 1, "prize bought on V3");
@@ -520,8 +534,16 @@ contract LaunchFairV4Test is Test, Deployers {
         vrf.deliver(42, keccak256("beacon"));
         dist.settleDraw(token, _self(), 0);
 
-        assertGt(prize.balanceOf(address(this)), 0, "winner paid in the V3 prize token");
+        // Default odds: whichever bucket the beacon lands in, a win pays the prize TOKEN.
+        uint256 roll = uint256(keccak256(abi.encode(keccak256("beacon"), token, uint256(42), uint256(1)))) % 10_000;
+        if (roll < 1000) {
+            assertEq(prize.balanceOf(address(this)), 0, "a miss pays no prize");
+        } else {
+            assertGt(prize.balanceOf(address(this)), 0, "winner paid in the V3 prize token");
+            assertEq(
+                LaunchTokenV2(token).lotteryEpoch(), roll >= 9800 ? epoch + 1 : epoch, "epoch advances only on a jackpot"
+            );
+        }
         assertEq(dist.drawCount(token), 1, "draw recorded");
-        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced");
     }
 }

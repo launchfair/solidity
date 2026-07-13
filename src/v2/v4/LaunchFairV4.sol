@@ -30,7 +30,7 @@ interface IDistributorV4Register {
     function registerBuybackV3(address token, address asset, uint24 fee) external;
     function setPayoutThreshold(address token, uint256 amount) external;
     function setPayoutInterval(address token, uint256 intervalBlocks) external;
-    function setJackpotChance(address token, uint16 chanceBps) external;
+    function setLotteryOdds(address token, uint16 missBps, uint16 jackpotBps, uint16 regularShareBps) external;
 }
 
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
@@ -96,10 +96,14 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         // Block-based timer (L1 blocks, ~12s): min blocks between payouts/draws.
         // Reward/Lottery set this; Redistribute leaves it 0 ("insta").
         uint256 payoutIntervalBlocks;
-        // Lottery only: per-draw chance (bps, 1..10000) the jackpot is won. On a miss the
-        // pot rolls over and grows; on a hit the winner takes the whole pot. Ignored by
-        // other modes. 200 = 1-in-50 default.
+        // Lottery only (ignored by other modes): the three-outcome odds. Each draw rolls
+        // 0.00–99.99; roll < missBps = MISS (pot rolls over), roll ≥ 100-jackpot = JACKPOT
+        // (winner takes pot + jackpot pool), else REGULAR (winner takes regularWinShareBps of
+        // the pot, the rest skims to the jackpot pool). 0s → launchpad defaults 1000/200/7000
+        // (10% miss, 2% jackpot, 88% regular @ 70/30).
+        uint16 missBps;
         uint16 jackpotChanceBps;
+        uint16 regularWinShareBps;
     }
 
     event TokenLaunchedV4(
@@ -282,10 +286,12 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // a weighted-random winner. The pot is WETH; if the dev picked a prize token,
             // register its V3/V4 venue so the pot can be swapped to it.
             t.setLotteryOperator(distributor);
-            // Powerball-style: a hard, per-draw chance the jackpot is won; on a miss the pot
-            // rolls over and grows. Default to 1-in-50 (200 bps) when the dev leaves it 0.
-            uint16 chanceBps = p.jackpotChanceBps == 0 ? 200 : p.jackpotChanceBps;
-            IDistributorV4Register(distributor).setJackpotChance(token, chanceBps);
+            // Powerball-style three outcomes per draw. Defaults (dev leaves a field 0):
+            // 10% miss, 2% jackpot, 88% regular paying the winner 70% (30% skims to jackpot).
+            uint16 missB = p.missBps == 0 ? 1000 : p.missBps;
+            uint16 jackpotB = p.jackpotChanceBps == 0 ? 200 : p.jackpotChanceBps;
+            uint16 shareB = p.regularWinShareBps == 0 ? 7000 : p.regularWinShareBps;
+            IDistributorV4Register(distributor).setLotteryOdds(token, missB, jackpotB, shareB);
             if (prizeToken != address(0)) {
                 _registerVenue(token, prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
             }

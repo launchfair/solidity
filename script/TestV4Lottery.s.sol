@@ -27,7 +27,7 @@ contract TestV4Lottery is Script {
             mode: LaunchTokenV2.Mode.Lottery, fee: 100_000,
             rewards: new LaunchFairV4.RewardVenue[](0),
             prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: empty,
-            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
         });
         uint256 feeWei = pad.creationFeeWei();
         vm.startBroadcast(pk);

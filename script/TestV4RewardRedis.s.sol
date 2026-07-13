@@ -59,7 +59,7 @@ contract TestV4RewardRedis is Script {
             name: "Reward Test", symbol: "RWDT", metadata: meta, salt: keccak256("reward-test-1"),
             mode: LaunchTokenV2.Mode.Reward, fee: FEE, rewards: rv,
             prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: empty,
-            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
         });
 
         // Redistribute token: no external asset (buys back its own pool → balances grow).
@@ -67,7 +67,7 @@ contract TestV4RewardRedis is Script {
             name: "Redistribute Test", symbol: "REDT", metadata: meta, salt: keccak256("redistribute-test-1"),
             mode: LaunchTokenV2.Mode.Increasing, fee: FEE, rewards: new LaunchFairV4.RewardVenue[](0),
             prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: empty,
-            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
         });
 
         vm.startBroadcast(pk);

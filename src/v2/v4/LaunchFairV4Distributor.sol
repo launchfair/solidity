@@ -84,10 +84,20 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     mapping(address token => uint256) public payoutIntervalBlocks;
     /// @notice L1 block of the token's last payout/draw (the timer's anchor).
     mapping(address token => uint256) public lastPayoutBlock;
-    /// @notice Lottery only: per-draw chance (bps, 1..10000) that the jackpot is actually
-    /// won. On a miss the pot rolls over and keeps growing. 0 = unset → treated as 10000
-    /// (always pays, no rollover) so a misconfigured token can never lock its pot.
+    /// @notice Lottery only. Each draw rolls `randomness % 10000` (i.e. 0.00–99.99) into one
+    /// of three outcomes by these dev-set bands:
+    ///   • MISS   — roll < missBps: nobody wins, the pot rolls over and keeps growing.
+    ///   • JACKPOT— roll ≥ 10000 - jackpotChanceBps: winner takes the WHOLE pot + jackpot pool.
+    ///   • REGULAR— everything in between: winner takes `regularWinShareBps` of the pot, and the
+    ///              remainder is skimmed into the jackpot pool (which only pays out on a JACKPOT).
+    /// missBps + jackpotChanceBps must be < 10000 (the gap is the regular-win band). Defaults
+    /// (set by the launchpad) are 1000 / 200 / 7000 = 10% miss, 2% jackpot, 88% regular @ 70/30.
     mapping(address token => uint16) public jackpotChanceBps;
+    mapping(address token => uint16) public missBps;
+    mapping(address token => uint16) public regularWinShareBps;
+    /// @notice The jackpot pool: skimmed from every regular win, paid out (with the pot) only
+    /// on a JACKPOT roll. Separate from `pendingWeth` (the pot funded by trade fees).
+    mapping(address token => uint256) public jackpotWeth;
 
     // ── lottery draws (Mode.Lottery) ────────────────────────────────────────────
     struct Draw {
@@ -98,8 +108,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         uint256 prize;         // WETH paid to the winner (0 on a miss)
         uint256 totalTickets;  // tickets in play for the epoch
         uint256 winningTicket; // derived on-chain: keccak(randomness,token,round) % totalTickets
-        uint256 hitRoll;       // jackpot roll: keccak(randomness,token,round,1) % 10000
-        bool won;              // true = jackpot hit (winner paid); false = missed → pot rolled over
+        uint256 hitRoll;       // outcome roll: keccak(randomness,token,round,1) % 10000 (0.00–99.99)
+        uint8 outcome;         // 0 = miss (rolled over), 1 = regular win, 2 = jackpot
         uint64 timestamp;
     }
     // A committed-but-unsettled draw: its session (epoch) and pot are frozen at
@@ -141,8 +151,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
     event PayoutThresholdSet(address indexed token, uint256 threshold);
     event PayoutIntervalSet(address indexed token, uint256 intervalBlocks);
-    event JackpotChanceSet(address indexed token, uint16 chanceBps);
-    event DrawRolledOver(address indexed token, uint256 indexed epoch, uint256 potAfter, uint256 hitRoll);
+    event LotteryOddsSet(address indexed token, uint16 missBps, uint16 jackpotBps, uint16 regularShareBps);
+    event DrawResolved(address indexed token, uint256 indexed epoch, uint8 outcome, address winner, uint256 prize, uint256 hitRoll);
     event DrawOperatorSet(address operator);
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
@@ -285,16 +295,19 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit PayoutIntervalSet(token, intervalBlocks);
     }
 
-    /// @notice Lottery only: the per-draw chance (bps, 1..10000) that the jackpot is won.
-    /// On a miss the pot rolls over and keeps growing until a draw finally hits, and the
-    /// winner takes the WHOLE pot. Set once by the launchpad at creation — a fixed value
-    /// can't be lowered on holders after a big pot has already built up.
-    function setJackpotChance(address token, uint16 chanceBps) external {
+    /// @notice Lottery only: set the three outcome bands + the regular-win split. Set once by
+    /// the launchpad at creation — fixed values can't be gamed on holders after a pot builds.
+    ///   miss_ + jackpot_ must be < 10000 (the gap is the regular-win band, > 0).
+    ///   share_ (1..10000) = the regular winner's cut of the pot; the rest skims to the jackpot.
+    function setLotteryOdds(address token, uint16 miss_, uint16 jackpot_, uint16 share_) external {
         if (msg.sender != registrar) revert NotAuthorized();
-        if (chanceBps == 0 || chanceBps > 10_000) revert BadJackpotChance();
         if (jackpotChanceBps[token] != 0) revert AlreadySet();
-        jackpotChanceBps[token] = chanceBps;
-        emit JackpotChanceSet(token, chanceBps);
+        if (jackpot_ == 0 || uint256(miss_) + jackpot_ >= 10_000) revert BadJackpotChance();
+        if (share_ == 0 || share_ > 10_000) revert BadJackpotChance();
+        missBps[token] = miss_;
+        jackpotChanceBps[token] = jackpot_;
+        regularWinShareBps[token] = share_;
+        emit LotteryOddsSet(token, miss_, jackpot_, share_);
     }
 
     /// @notice Whether the token's block-timer has elapsed since its last payout.
@@ -486,24 +499,22 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         uint256 total = t.totalEligibleAt(pd.snapshotBlock); // total held at the commit snapshot
 
         // Start (or resume) the settlement. On the first chunk, pull + cache the verified
-        // randomness, roll for the jackpot, and (on a hit) derive the winning ticket once.
+        // randomness and roll for the outcome. A MISS finalizes here (no holders needed); a
+        // REGULAR or JACKPOT win begins the paginated weighted winner search.
         Settlement storage s = settlement[token];
         if (!s.active) {
             bytes32 rnd = pd.randomness;
             if (rnd == bytes32(0)) rnd = IVRFCoordinator(vrf).randomnessOf(pd.round); // pull fallback
             if (rnd == bytes32(0)) revert RandomnessNotReady();
 
-            // Jackpot hit roll — from the SAME future beacon as the winner, so it's
-            // unknowable at commit and provably fair. A distinct preimage (…, 1) keeps it
-            // independent of the winning-ticket derivation below.
-            uint256 chance = jackpotChanceBps[token];
-            if (chance == 0) chance = 10_000; // unset (legacy) → always pays, never locks the pot
+            // Outcome roll — from the SAME future beacon as the winner, so it's unknowable at
+            // commit and provably fair. A distinct preimage (…, 1) keeps it independent of the
+            // winning-ticket derivation. 0.00–99.99 space via % 10000.
             uint256 hitRoll = uint256(keccak256(abi.encode(rnd, token, pd.round, uint256(1)))) % 10_000;
+            (uint256 missB,) = _lotteryBands(token);
 
-            if (hitRoll >= chance) {
-                // MISS → nobody wins; the pot stays in pendingWeth and rolls over. Record the
-                // miss (no winner, no prize) and reopen so the next attempt can commit. No
-                // holder enumeration needed for a miss, so this finalizes in one call.
+            if (hitRoll < missB) {
+                // MISS → nobody wins; the pot (and jackpot pool) stay and roll over. One call.
                 delete pendingDraw[token];
                 draws[token].push(Draw({
                     epoch: pd.epoch,
@@ -514,15 +525,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
                     totalTickets: total,
                     winningTicket: 0,
                     hitRoll: hitRoll,
-                    won: false,
+                    outcome: 0,
                     timestamp: uint64(block.timestamp)
                 }));
-                emit DrawSettled(token, draws[token].length - 1, pd.epoch, address(0), 0, rnd, 0);
-                emit DrawRolledOver(token, pd.epoch, pendingWeth[token], hitRoll);
+                emit DrawResolved(token, pd.epoch, 0, address(0), 0, hitRoll);
                 return 0;
             }
 
-            // HIT → begin the (paginated) weighted winner search.
+            // REGULAR or JACKPOT → begin the (paginated) weighted winner search.
             s.active = true;
             s.randomness = rnd;
             s.winningTicket = uint256(keccak256(abi.encode(rnd, token, pd.round))) % total;
@@ -554,14 +564,27 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             s.winner = winner;
             return 0;
         }
-        // cumulative == total: the set is complete → finalize (this is a jackpot HIT).
+        // cumulative == total: the set is complete → finalize (REGULAR or JACKPOT).
         if (winner == address(0)) revert IncompleteHolderSet(); // unreachable; defensive
         bytes32 randomness = s.randomness;
-        // The prize is the LIVE pot (rollover model): the winner takes everything that has
-        // accumulated across every rolled-over draw. Zeroing it resets the jackpot.
-        uint256 prize = pendingWeth[token];
+        uint256 roll = uint256(keccak256(abi.encode(randomness, token, pd.round, uint256(1)))) % 10_000;
+        (, uint256 jpB) = _lotteryBands(token);
+
+        uint256 prize;
+        uint8 outcome;
+        uint256 pot = pendingWeth[token];
         pendingWeth[token] = 0;
-        uint256 wonRoll = uint256(keccak256(abi.encode(randomness, token, pd.round, uint256(1)))) % 10_000;
+        if (roll >= 10_000 - jpB) {
+            // JACKPOT → winner takes the whole pot + the accumulated jackpot pool; both reset.
+            outcome = 2;
+            prize = pot + jackpotWeth[token];
+            jackpotWeth[token] = 0;
+        } else {
+            // REGULAR → winner takes their share of the pot; the rest skims to the jackpot pool.
+            outcome = 1;
+            prize = (pot * regularWinShareBps[token]) / 10_000;
+            jackpotWeth[token] += pot - prize;
+        }
 
         delete settlement[token];
         delete pendingDraw[token];
@@ -574,12 +597,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             prize: prize,
             totalTickets: total,
             winningTicket: winningTicket,
-            hitRoll: wonRoll,
-            won: true,
+            hitRoll: roll,
+            outcome: outcome,
             timestamp: uint64(block.timestamp)
         }));
 
-        t.advanceLotteryEpoch(); // jackpot won → open the next session
+        if (outcome == 2) t.advanceLotteryEpoch(); // jackpot won → open the next session
 
         if (prize > 0) {
             address prizeToken = t.prizeToken(); // 0 => WETH prize
@@ -599,7 +622,16 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             }
         }
 
-        emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, prize, randomness, winningTicket);
+        emit DrawResolved(token, pd.epoch, outcome, winner, prize, roll);
+    }
+
+    /// @dev Lottery outcome bands (bps on the 0.00–99.99 roll): roll < missB = MISS,
+    /// roll ≥ 10000 - jpB = JACKPOT, else REGULAR. Unset (jackpotChanceBps 0) => always
+    /// JACKPOT (miss 0), so a misconfigured token pays the whole pot and never locks it.
+    function _lotteryBands(address token) internal view returns (uint256 missB, uint256 jpB) {
+        jpB = jackpotChanceBps[token];
+        if (jpB == 0) return (0, 10_000);
+        missB = missBps[token];
     }
 
     /// @dev Self-only helper (so it can be `try`/`catch`ed from settleDraw): swap the pot

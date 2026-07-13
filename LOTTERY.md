@@ -11,12 +11,13 @@ pick or predict the winner.
 ## In one paragraph
 
 You enter just by **holding the token**. Your odds are your share of the tokens held:
-hold 1% of the circulating supply and you have a 1% chance each draw. A slice of every
-trade's fee builds the **jackpot**. When a draw fires, the contract **snapshots everyone's
-holdings** and waits for a future drand beacon it can't predict. That beacon rolls for a
-**jackpot hit**: most draws miss and the pot **rolls over and keeps growing**, but when one
-hits, the whole pot goes to a single holder chosen at random — weighted by that snapshot.
-Everything needed to re-check the result is stored on-chain.
+hold 1% of the circulating supply and you have a 1% chance to be the winner. A slice of
+every trade's fee builds the **pot**. When a draw fires, the contract **snapshots everyone's
+holdings** and waits for a future drand beacon it can't predict. That beacon rolls one of
+three outcomes: a **miss** (nobody wins, the pot rolls over), a **regular win** (a random
+holder takes a slice of the pot, the rest feeds a growing jackpot pool), or the **jackpot**
+(a random holder takes the whole pot plus the jackpot pool). The winner is always weighted
+by that snapshot, and everything needed to re-check the result is stored on-chain.
 
 ---
 
@@ -36,30 +37,39 @@ draw can read exactly what everyone held at a chosen moment.
 
 ---
 
-## The pot — a rolling jackpot
+## The pot — two pools, three outcomes
 
-- Funded by **trade fees**. Each token picks a fee tier (3% / 5% / 10%); the mechanism's
-  share of the WETH fee accrues to the token's pot (`distributor.pendingWeth[token]`).
-- The pot is a **rolling jackpot**, powerball-style — it is **not** paid out on every
-  draw. Each draw the beacon rolls for a **jackpot hit**:
-  - **Hit** → a holdings-weighted random holder wins the **entire pot**, and it resets to 0.
-  - **Miss** → nobody wins; the pot **rolls over** and keeps growing into the next draw.
-- The chance of a hit is a fixed difficulty the dev chooses once at creation
-  (`jackpotChanceBps`, in bps; default **200 = 1-in-50** per draw). Lower odds → the pot
-  rolls longer and grows bigger before someone finally lands it.
-- **No cap, no artificial partial payout.** Every draw pays the *whole* pot or nothing, so
-  a jackpot can roll across many draws and grow unbounded until one hits — and the winner
-  takes all of it.
-- The pot is **never reserved or zeroed at commit.** It stays live and keeps growing right
-  up to the settle of a *winning* draw; a draw that misses leaves it fully intact. So the
-  pot only ever drops when someone actually wins.
-- The **hit roll comes from the same future drand beacon as the winner** —
-  `keccak256(abi.encode(randomness, token, round, 1)) % 10000 < jackpotChanceBps` — so it's
-  unknowable at commit and provably fair: nobody (dev, operator, or holder) can know whether
-  a draw will hit, or force one to. A distinct preimage (the trailing `1`) keeps it
-  independent of the winning-ticket draw.
-- By default the pot pays out in **ETH**. A dev can optionally set a **prize token** —
-  then the winning pot is swapped to that token and the winner is paid in it.
+There are **two pools** per token, both in WETH held by the distributor:
+- **Pot** (`pendingWeth[token]`) — funded by **trade fees** (each token picks a 3% / 5% / 10%
+  fee tier; the mechanism's share accrues here).
+- **Jackpot pool** (`jackpotWeth[token]`) — accumulates a skim off every **regular win**, and
+  is only ever paid out on a **jackpot**.
+
+Every draw rolls one number, `keccak256(abi.encode(randomness, token, round, 1)) % 10000`
+(so **0.00–99.99**), into one of three dev-set bands:
+
+- **Miss** (roll `< missBps`) → nobody wins. Both pools are untouched; the pot **rolls over**
+  and keeps growing.
+- **Regular win** (the middle band) → a holdings-weighted random holder takes
+  `regularWinShareBps` of the pot; the **remainder skims into the jackpot pool**; the pot
+  resets and refills from fees. Frequent, keeps holders engaged.
+- **Jackpot** (roll `≥ 10000 - jackpotChanceBps`) → a holdings-weighted random holder takes
+  the **entire pot + the whole jackpot pool**; both reset to 0. Rare, and it's the big one.
+
+So the jackpot pool is fed a cut of every regular win and only pays out on the rare jackpot
+roll — it's **always climbing**. Defaults (dev-tunable at creation): **10% miss, 2% jackpot,
+88% regular @ 70/30** (the regular winner takes 70% of the pot, 30% skims to the jackpot).
+
+- **The winner (and the outcome) come from the same future drand beacon**, unknowable at
+  commit — so nobody (dev, operator, or holder) can know or force which band a draw lands in.
+  The outcome roll uses a distinct preimage (the trailing `1`) so it's independent of the
+  winning-ticket draw `keccak256(abi.encode(randomness, token, round)) % totalTickets`.
+- The pot is **never reserved or zeroed at commit.** It only leaves the pools at a *paying*
+  settle; a miss leaves both pools fully intact.
+- The `epoch` (jackpot session number) advances **only on a jackpot** — regular wins and
+  misses don't reset the session.
+- By default payouts are in **ETH**. A dev can optionally set a **prize token** — then the
+  winner's WETH payout (pot, or pot + pool on a jackpot) is swapped to that token first.
 
 ---
 
@@ -86,22 +96,25 @@ randomness can't be known — let alone gamed — in advance.
    - The on-chain randomness is `keccak256(signature)`.
 
 3. **Settle** (`settleDraw`)
-   - Reads the verified randomness and **rolls for the jackpot** first:
-     `keccak256(abi.encode(randomness, token, round, 1)) % 10000`. If that is **≥** the
-     token's `jackpotChanceBps`, the draw **misses** — no winner, the pot stays put and
-     rolls over, and the draw is recorded with `won = false` (no holder set needed, so a
-     miss settles in one cheap call).
-   - Otherwise it's a **hit**. The winning ticket is
-     `winningTicket = keccak256(abi.encode(randomness, token, round)) % totalHeldAtSnapshot`.
-   - The caller supplies the holder set (sorted by address). The contract reads each
-     holder's **snapshot** balance (`balanceOfAt(holder, snapshotBlock)`), lays them out
-     as contiguous ranges, and the holder whose range contains `winningTicket` wins.
+   - Reads the verified randomness and **rolls the outcome** first:
+     `roll = keccak256(abi.encode(randomness, token, round, 1)) % 10000`. `roll < missBps`
+     is a **miss** — no winner, both pools untouched, recorded `outcome = 0`. A miss needs
+     no holder set, so it settles in one cheap call.
+   - Otherwise a holder wins. The winning ticket is
+     `winningTicket = keccak256(abi.encode(randomness, token, round)) % totalHeldAtSnapshot`,
+     and the caller supplies the holder set (sorted by address). The contract reads each
+     holder's **snapshot** balance (`balanceOfAt(holder, snapshotBlock)`), lays them out as
+     contiguous ranges, and the holder whose range contains `winningTicket` wins.
    - The set must be **complete** — the balances must sum to the on-chain total — so no
-     holder can be omitted and no fake holder padded in. The winner is fully determined
-     by the data; the operator has **no discretion**.
-   - The winner is paid the **entire live pot** (ETH, or the swapped prize token), which is
-     then zeroed to start the next jackpot. Big lotteries can be settled across multiple
-     transactions (the holder set is fed in chunks).
+     holder can be omitted and no fake holder padded in. The winner is fully determined by
+     the data; the operator has **no discretion**.
+   - The payout depends on the band the roll fell into:
+     - **Regular** (`outcome = 1`): the winner takes `regularWinShareBps` of the pot; the
+       remainder skims into the jackpot pool; the pot resets.
+     - **Jackpot** (`roll ≥ 10000 - jackpotChanceBps`, `outcome = 2`): the winner takes the
+       entire pot **plus** the jackpot pool; both reset and the epoch advances.
+   - Payout is ETH, or the swapped prize token if the dev set one. Big lotteries can be
+     settled across multiple transactions (the holder set is fed in chunks).
 
 ---
 
@@ -125,23 +138,24 @@ history.
 
 Every settled draw stores, on-chain (`distributor.draws[token][i]`): the drand `round`,
 the `randomness`, the `winner` (zero on a miss), the `prize`, the `totalTickets` (total
-held at the snapshot), the `winningTicket`, the `hitRoll`, and `won`. Anyone can re-check
-both the jackpot roll and the winner end to end:
+held at the snapshot), the `winningTicket`, the `hitRoll`, and `outcome` (0 miss / 1
+regular / 2 jackpot). Anyone can re-check both the outcome and the winner end to end:
 
 1. **Beacon → randomness.** Fetch the drand beacon for `round` from a public gateway
    (`https://api.drand.sh/<chain>/public/<round>`), verify its BLS signature against the
    quicknet public key, and confirm `keccak256(signature)` equals the on-chain
    `randomness`.
-2. **Randomness → jackpot hit.** Recompute
-   `keccak256(abi.encode(randomness, token, round, 1)) % 10000` and confirm it equals the
-   recorded `hitRoll`; `won` is true exactly when `hitRoll < jackpotChanceBps`.
+2. **Randomness → outcome.** Recompute
+   `roll = keccak256(abi.encode(randomness, token, round, 1)) % 10000` and confirm it equals
+   the recorded `hitRoll`. The `outcome` must match its band: `0` when `roll < missBps`, `2`
+   when `roll ≥ 10000 - jackpotChanceBps`, else `1`.
 3. **Randomness → winning ticket** (only on a win). Recompute
    `keccak256(abi.encode(randomness, token, round)) % totalTickets` and confirm it equals
    the recorded `winningTicket`.
 4. **Winning ticket → winner.** Lay out every holder's snapshot balance in address order;
    the winning ticket falls in exactly one holder's range — the winner.
 
-The **token page does step 2 for you in the browser** and shows a "Verified" badge on
+The **token page does steps 2–3 for you in the browser** and shows a "Verified" badge on
 each past draw, with a link to the drand beacon for step 1.
 
 drand quicknet: chain `52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971`,
@@ -159,9 +173,10 @@ drand quicknet: chain `52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600
 | SwapRouter | `0x0e6c53664388B68F6b41851D224248F391CC8947` | native-ETH buy/sell of mode tokens |
 
 Key views on the token: `totalEligibleSupply()`, `balanceOfAt(holder, block)`,
-`totalEligibleAt(block)`, `lotteryEpoch()`. On the distributor: `pendingWeth(token)`
-(the live, rolling pot), `jackpotChanceBps(token)` (per-draw hit odds), `drawCount(token)`,
-`draws(token, i)`, `pendingDraw(token)`.
+`totalEligibleAt(block)`, `lotteryEpoch()`. On the distributor: `pendingWeth(token)` (the
+live pot), `jackpotWeth(token)` (the accumulating jackpot pool), the odds `missBps(token)` /
+`jackpotChanceBps(token)` / `regularWinShareBps(token)`, `drawCount(token)`, `draws(token, i)`,
+`pendingDraw(token)`.
 
 ---
 
