@@ -30,6 +30,7 @@ interface IDistributorV4Register {
     function registerBuybackV3(address token, address asset, uint24 fee) external;
     function setPayoutThreshold(address token, uint256 amount) external;
     function setPayoutInterval(address token, uint256 intervalBlocks) external;
+    function setJackpotChance(address token, uint16 chanceBps) external;
 }
 
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
@@ -95,6 +96,10 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         // Block-based timer (L1 blocks, ~12s): min blocks between payouts/draws.
         // Reward/Lottery set this; Redistribute leaves it 0 ("insta").
         uint256 payoutIntervalBlocks;
+        // Lottery only: per-draw chance (bps, 1..10000) the jackpot is won. On a miss the
+        // pot rolls over and grows; on a hit the winner takes the whole pot. Ignored by
+        // other modes. 200 = 1-in-50 default.
+        uint16 jackpotChanceBps;
     }
 
     event TokenLaunchedV4(
@@ -277,6 +282,10 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // a weighted-random winner. The pot is WETH; if the dev picked a prize token,
             // register its V3/V4 venue so the pot can be swapped to it.
             t.setLotteryOperator(distributor);
+            // Powerball-style: a hard, per-draw chance the jackpot is won; on a miss the pot
+            // rolls over and grows. Default to 1-in-50 (200 bps) when the dev leaves it 0.
+            uint16 chanceBps = p.jackpotChanceBps == 0 ? 200 : p.jackpotChanceBps;
+            IDistributorV4Register(distributor).setJackpotChance(token, chanceBps);
             if (prizeToken != address(0)) {
                 _registerVenue(token, prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
             }

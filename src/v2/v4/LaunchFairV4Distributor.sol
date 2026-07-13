@@ -84,16 +84,22 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     mapping(address token => uint256) public payoutIntervalBlocks;
     /// @notice L1 block of the token's last payout/draw (the timer's anchor).
     mapping(address token => uint256) public lastPayoutBlock;
+    /// @notice Lottery only: per-draw chance (bps, 1..10000) that the jackpot is actually
+    /// won. On a miss the pot rolls over and keeps growing. 0 = unset → treated as 10000
+    /// (always pays, no rollover) so a misconfigured token can never lock its pot.
+    mapping(address token => uint16) public jackpotChanceBps;
 
     // ── lottery draws (Mode.Lottery) ────────────────────────────────────────────
     struct Draw {
         uint256 epoch;         // session (token.lotteryEpoch) the winner was drawn from
         uint256 round;         // committed drand round (fixed the seed before it existed)
         bytes32 randomness;    // drand beacon value for `round` (publicly re-verifiable)
-        address winner;        // ticket holder who was drawn
-        uint256 prize;         // WETH paid to the winner
+        address winner;        // ticket holder who was drawn (address(0) on a rolled-over miss)
+        uint256 prize;         // WETH paid to the winner (0 on a miss)
         uint256 totalTickets;  // tickets in play for the epoch
         uint256 winningTicket; // derived on-chain: keccak(randomness,token,round) % totalTickets
+        uint256 hitRoll;       // jackpot roll: keccak(randomness,token,round,1) % 10000
+        bool won;              // true = jackpot hit (winner paid); false = missed → pot rolled over
         uint64 timestamp;
     }
     // A committed-but-unsettled draw: its session (epoch) and pot are frozen at
@@ -135,6 +141,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
     event PayoutThresholdSet(address indexed token, uint256 threshold);
     event PayoutIntervalSet(address indexed token, uint256 intervalBlocks);
+    event JackpotChanceSet(address indexed token, uint16 chanceBps);
+    event DrawRolledOver(address indexed token, uint256 indexed epoch, uint256 potAfter, uint256 hitRoll);
     event DrawOperatorSet(address operator);
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
@@ -154,6 +162,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     error BelowThreshold();
     error TimerNotElapsed();
     error NotAuthorized();
+    error BadJackpotChance();
+    error AlreadySet();
     error WrongMode();
     error Slippage();
     error ZeroAddress();
@@ -273,6 +283,18 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (msg.sender != registrar && msg.sender != _creator(token)) revert NotAuthorized();
         payoutIntervalBlocks[token] = intervalBlocks;
         emit PayoutIntervalSet(token, intervalBlocks);
+    }
+
+    /// @notice Lottery only: the per-draw chance (bps, 1..10000) that the jackpot is won.
+    /// On a miss the pot rolls over and keeps growing until a draw finally hits, and the
+    /// winner takes the WHOLE pot. Set once by the launchpad at creation — a fixed value
+    /// can't be lowered on holders after a big pot has already built up.
+    function setJackpotChance(address token, uint16 chanceBps) external {
+        if (msg.sender != registrar) revert NotAuthorized();
+        if (chanceBps == 0 || chanceBps > 10_000) revert BadJackpotChance();
+        if (jackpotChanceBps[token] != 0) revert AlreadySet();
+        jackpotChanceBps[token] = chanceBps;
+        emit JackpotChanceSet(token, chanceBps);
     }
 
     /// @notice Whether the token's block-timer has elapsed since its last payout.
@@ -403,10 +425,11 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (t.totalEligibleSupply() == 0) revert NoTickets();
         uint256 snapshotBlock = block.number;
 
-        lastPayoutBlock[token] = block.number;  // reset the dev's block timer
-        uint256 prize = pendingWeth[token];
-        pendingWeth[token] = 0;                 // reserve the pot for this draw…
-        t.advanceLotteryEpoch();                // …and open a fresh pot cycle.
+        lastPayoutBlock[token] = block.number;  // reset the timer that paces draw attempts
+        // The pot is NOT reserved or zeroed here: on a miss it rolls over and keeps
+        // growing; on a hit the winner takes the LIVE pot at settle. The epoch (jackpot
+        // session) advances only when a jackpot is actually won.
+        uint256 potNow = pendingWeth[token]; // indicative only (emitted below)
 
         // Ask the shared coordinator for the beacon at this future round; it will
         // push it back via fulfillRandomness (or we pull it at settle).
@@ -415,14 +438,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         pendingDraw[token] = PendingDraw({
             round: drandRound,
             epoch: epoch,
-            prize: prize,
+            prize: 0, // unused; the paid prize is the live pot at settle (rollover model)
             snapshotBlock: snapshotBlock,
             requestId: reqId,
             randomness: 0,
             active: true
         });
         drawId = draws[token].length;
-        emit DrawCommitted(token, drawId, drandRound, epoch, prize);
+        emit DrawCommitted(token, drawId, drandRound, epoch, potNow);
     }
 
     /// @notice Settle the committed draw. The drand beacon comes from the VRF
@@ -463,12 +486,43 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         uint256 total = t.totalEligibleAt(pd.snapshotBlock); // total held at the commit snapshot
 
         // Start (or resume) the settlement. On the first chunk, pull + cache the verified
-        // randomness and derive the winning ticket once.
+        // randomness, roll for the jackpot, and (on a hit) derive the winning ticket once.
         Settlement storage s = settlement[token];
         if (!s.active) {
             bytes32 rnd = pd.randomness;
             if (rnd == bytes32(0)) rnd = IVRFCoordinator(vrf).randomnessOf(pd.round); // pull fallback
             if (rnd == bytes32(0)) revert RandomnessNotReady();
+
+            // Jackpot hit roll — from the SAME future beacon as the winner, so it's
+            // unknowable at commit and provably fair. A distinct preimage (…, 1) keeps it
+            // independent of the winning-ticket derivation below.
+            uint256 chance = jackpotChanceBps[token];
+            if (chance == 0) chance = 10_000; // unset (legacy) → always pays, never locks the pot
+            uint256 hitRoll = uint256(keccak256(abi.encode(rnd, token, pd.round, uint256(1)))) % 10_000;
+
+            if (hitRoll >= chance) {
+                // MISS → nobody wins; the pot stays in pendingWeth and rolls over. Record the
+                // miss (no winner, no prize) and reopen so the next attempt can commit. No
+                // holder enumeration needed for a miss, so this finalizes in one call.
+                delete pendingDraw[token];
+                draws[token].push(Draw({
+                    epoch: pd.epoch,
+                    round: pd.round,
+                    randomness: rnd,
+                    winner: address(0),
+                    prize: 0,
+                    totalTickets: total,
+                    winningTicket: 0,
+                    hitRoll: hitRoll,
+                    won: false,
+                    timestamp: uint64(block.timestamp)
+                }));
+                emit DrawSettled(token, draws[token].length - 1, pd.epoch, address(0), 0, rnd, 0);
+                emit DrawRolledOver(token, pd.epoch, pendingWeth[token], hitRoll);
+                return 0;
+            }
+
+            // HIT → begin the (paginated) weighted winner search.
             s.active = true;
             s.randomness = rnd;
             s.winningTicket = uint256(keccak256(abi.encode(rnd, token, pd.round))) % total;
@@ -500,9 +554,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             s.winner = winner;
             return 0;
         }
-        // cumulative == total: the set is complete → finalize.
+        // cumulative == total: the set is complete → finalize (this is a jackpot HIT).
         if (winner == address(0)) revert IncompleteHolderSet(); // unreachable; defensive
         bytes32 randomness = s.randomness;
+        // The prize is the LIVE pot (rollover model): the winner takes everything that has
+        // accumulated across every rolled-over draw. Zeroing it resets the jackpot.
+        uint256 prize = pendingWeth[token];
+        pendingWeth[token] = 0;
+        uint256 wonRoll = uint256(keccak256(abi.encode(randomness, token, pd.round, uint256(1)))) % 10_000;
 
         delete settlement[token];
         delete pendingDraw[token];
@@ -512,31 +571,35 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             round: pd.round,
             randomness: randomness,
             winner: winner,
-            prize: pd.prize,
+            prize: prize,
             totalTickets: total,
             winningTicket: winningTicket,
+            hitRoll: wonRoll,
+            won: true,
             timestamp: uint64(block.timestamp)
         }));
 
-        if (pd.prize > 0) {
+        t.advanceLotteryEpoch(); // jackpot won → open the next session
+
+        if (prize > 0) {
             address prizeToken = t.prizeToken(); // 0 => WETH prize
             if (prizeToken == address(0)) {
-                weth.safeTransfer(winner, pd.prize); // WETH: no receiver hook, can't wedge
-                prizePaid = pd.prize;
+                weth.safeTransfer(winner, prize); // WETH: no receiver hook, can't wedge
+                prizePaid = prize;
             } else {
                 // Token prize: buy + send via a self-call wrapped in try/catch so a broken
                 // venue, a sandwich past minPrizeOut, or an un-receivable winner can't wedge
                 // this (now un-cancelable) draw (audit L-03) — fall back to paying the WETH pot.
-                try this.swapAndSendPrize(token, prizeToken, winner, pd.prize, minPrizeOut) returns (uint256 bought) {
+                try this.swapAndSendPrize(token, prizeToken, winner, prize, minPrizeOut) returns (uint256 bought) {
                     prizePaid = bought;
                 } catch {
-                    weth.safeTransfer(winner, pd.prize);
-                    prizePaid = pd.prize;
+                    weth.safeTransfer(winner, prize);
+                    prizePaid = prize;
                 }
             }
         }
 
-        emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, pd.prize, randomness, winningTicket);
+        emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, prize, randomness, winningTicket);
     }
 
     /// @dev Self-only helper (so it can be `try`/`catch`ed from settleDraw): swap the pot
@@ -553,10 +616,11 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     }
 
     /// @notice Emergency recovery: abandon a committed draw whose round is bad (e.g. one
-    /// so far in the future it'll never settle). Returns the reserved pot to `pendingWeth`.
-    /// **Only callable BEFORE the committed round's beacon is produced** (audit M-02):
-    /// once the beacon exists the outcome is determined, so the operator must settle to
-    /// the deterministic winner and cannot cancel to veto/resample an unfavorable result.
+    /// so far in the future it'll never settle). The pot is untouched by a draw (it only
+    /// leaves pendingWeth on a hit at settle), so cancelling just drops the pending draw and
+    /// the pot rolls on. **Only callable BEFORE the committed round's beacon is produced**
+    /// (audit M-02): once the beacon exists the outcome is determined, so the operator must
+    /// settle to the deterministic result and cannot cancel to veto an unfavorable one.
     function cancelDraw(address token) external {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         PendingDraw memory pd = pendingDraw[token];
@@ -565,8 +629,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (block.timestamp >= DRAND_GENESIS + (pd.round - 1) * DRAND_PERIOD) revert BeaconAlreadyProduced();
         delete pendingDraw[token];
         delete settlement[token]; // drop any in-progress paginated settle
-        pendingWeth[token] += pd.prize;
-        emit DrawCanceled(token, pd.epoch, pd.prize);
+        emit DrawCanceled(token, pd.epoch, pendingWeth[token]);
     }
 
     /// @notice Discard an in-progress paginated settlement so it can be restarted from

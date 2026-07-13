@@ -118,7 +118,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
         key = pad.getLaunch(token).key;
@@ -229,7 +229,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
         assertEq(dist.buybackVenue(token, address(reward)), 1, "wired to a V3 buyback");
@@ -281,7 +281,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
 
@@ -335,7 +335,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Bad", symbol: "BAD", metadata: meta, salt: bytes32(uint256(6)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
     }
@@ -355,7 +355,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Dup", symbol: "DUP", metadata: meta, salt: bytes32(uint256(7)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
     }
@@ -377,7 +377,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 name: "Six", symbol: "SIX", metadata: meta, salt: bytes32(uint256(8)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
-                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
     }
@@ -404,7 +404,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
     }
@@ -427,7 +427,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
         key = pad.getLaunch(token).key;
@@ -455,10 +455,12 @@ contract LaunchFairV4Test is Test, Deployers {
         uint256 pot = dist.pendingWeth(token);
         assertGt(pot, 0, "pot funded");
 
-        // Commit snapshots holdings at this block + reserves the pot; the cycle advances.
+        // Commit snapshots holdings at this block. The pot is NOT reserved (it rolls) and
+        // the cycle advances only when a draw actually wins.
         uint256 round = 9_999_999;
         dist.commitDraw(token, round);
-        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "pot cycle advanced at commit");
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch, "session unchanged at commit");
+        assertEq(dist.pendingWeth(token), pot, "pot live at commit (not reserved)");
         (,,, uint256 snapBlk,,,) = dist.pendingDraw(token);
 
         // …the keeper posts the beacon to the coordinator (which pushes it to the
@@ -473,6 +475,7 @@ contract LaunchFairV4Test is Test, Deployers {
 
         assertEq(weth.balanceOf(address(this)) - balBefore, pot, "winner paid the whole pot");
         assertEq(dist.drawCount(token), 1, "draw recorded in history");
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "cycle advances on the winning draw");
     }
 
     // A lottery whose prize is a dev-chosen token that trades on V3: the launchpad
@@ -499,7 +502,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 prizePoolKey: none,
                 minHold: 0,
                 payoutThreshold: 0,
-                payoutIntervalBlocks: 0
+                payoutIntervalBlocks: 0, jackpotChanceBps: 10000
             })
         );
         assertEq(dist.buybackVenue(token, address(prize)), 1, "prize bought on V3");
