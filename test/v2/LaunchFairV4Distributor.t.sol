@@ -331,7 +331,8 @@ contract V4DistributorTest is Test, Deployers {
 
     // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
     // Wire a Lottery token: distributor is its epoch operator + the draw keeper.
-    // "Buys" are transfers from buySource (this) so holders earn tickets ∝ amount.
+    // Holdings-weighted: a holder's tickets are simply their held balance, so any
+    // `token.transfer(addr, X)` enters `addr` with X tickets — no buySource needed.
     function _setupLottery() internal returns (LaunchTokenV2 token) {
         token = _deployToken(LaunchTokenV2.Mode.Lottery, address(0), address(0));
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
@@ -339,7 +340,6 @@ contract V4DistributorTest is Test, Deployers {
         dist.setLocker(address(this));      // this feeds the pot via notify
         dist.setDrawOperator(address(this)); // this is the keeper (commits/settles)
         dist.setVrf(address(vrf));           // randomness source
-        token.setBuySource(address(this));   // "buys" originate here → earn tickets
         token.setLotteryOperator(address(dist)); // distributor advances the session
     }
 
@@ -363,14 +363,15 @@ contract V4DistributorTest is Test, Deployers {
     }
 
     // Canonical ticket order is by ADDRESS: A gets [0, aTix), then B gets [aTix, ...).
-    // (Here first-appearance == address order since A < B.) The winner the CONTRACT
-    // derives — recompute it to assert against.
-    function _resolveWinner(LaunchTokenV2 token, uint256 epoch, uint256 winningTicket)
+    // (Here first-appearance == address order since A < B.) Tickets are holdings-weighted,
+    // so A's ticket span is just A's held balance (== its snapshot when nothing rolled
+    // between transfer and settle). The winner the CONTRACT derives — recompute to assert.
+    function _resolveWinner(LaunchTokenV2 token, uint256 /* epoch */, uint256 winningTicket)
         internal
         view
         returns (address winner)
     {
-        uint256 aTix = token.ticketsOf(epoch, A);
+        uint256 aTix = token.balanceOf(A);
         return winningTicket < aTix ? A : B;
     }
 
@@ -380,10 +381,10 @@ contract V4DistributorTest is Test, Deployers {
 
     function test_lottery_drawPaysVerifiableWinner() public {
         LaunchTokenV2 token = _setupLottery();
-        token.transfer(A, 300_000 ether); // A: tickets [0, 300_000e18)
-        token.transfer(B, 100_000 ether); // B: tickets [300_000e18, 400_000e18)
-        uint256 total = token.totalTickets(0);
-        assertEq(total, 400_000 ether, "ticket pool == bought amount");
+        token.transfer(A, 300_000 ether); // A holds 300k → tickets [0, 300_000e18)
+        token.transfer(B, 100_000 ether); // B holds 100k → tickets [300_000e18, 400_000e18)
+        uint256 total = token.totalEligibleSupply();
+        assertEq(total, 400_000 ether, "ticket pool == total held (holdings-weighted)");
 
         uint256 pot = 10 ether;
         weth.mint(address(dist), pot);
@@ -447,9 +448,9 @@ contract V4DistributorTest is Test, Deployers {
     // lottery is always settleable within block limits).
     function test_lottery_paginatedSettle() public {
         LaunchTokenV2 token = _setupLottery();
-        token.transfer(A, 300_000 ether); // A: [0, 300k)
-        token.transfer(B, 100_000 ether); // B: [300k, 400k)
-        uint256 total = token.totalTickets(0);
+        token.transfer(A, 300_000 ether); // A holds 300k → [0, 300k)
+        token.transfer(B, 100_000 ether); // B holds 100k → [300k, 400k)
+        uint256 total = token.totalEligibleSupply();
         uint256 pot = 8 ether;
         weth.mint(address(dist), pot);
         dist.notify(address(token), pot);
@@ -523,7 +524,7 @@ contract V4DistributorTest is Test, Deployers {
 
     // An empty session can't be committed — nothing to draw.
     function test_lottery_noTicketsReverts() public {
-        LaunchTokenV2 token = _setupLottery(); // nobody bought → no tickets
+        LaunchTokenV2 token = _setupLottery(); // nobody holds → zero eligible supply
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
         vm.expectRevert(LaunchFairV4Distributor.NoTickets.selector);
@@ -594,32 +595,99 @@ contract V4DistributorTest is Test, Deployers {
         dist.settleDraw(address(token), _set1(A), 0);
     }
 
-    // A second session only counts buys made after the previous draw was committed.
-    function test_lottery_nextSessionIsFresh() public {
+    // Holdings-weighted: a holder's tickets ARE their held balance, so they PERSIST
+    // across draws — nothing "resets" per session. After a draw settles, the same
+    // (still-holding) accounts stay fully entered in the next draw at the same odds;
+    // only the POT is per-cycle (pendingWeth restarts from newly-accrued fees).
+    function test_lottery_holdingsPersistAcrossDraws() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 300_000 ether);
         token.transfer(B, 100_000 ether);
+        assertEq(token.totalEligibleSupply(), 400_000 ether, "A + B entered by their holdings");
         weth.mint(address(dist), 4 ether);
         dist.notify(address(token), 4 ether);
 
         dist.commitDraw(address(token), 1); // closes epoch 0 → now epoch 1
         assertEq(token.lotteryEpoch(), 1, "session advanced at commit");
-        assertEq(token.totalTickets(1), 0, "fresh session starts empty");
+        assertEq(dist.pendingWeth(address(token)), 0, "pot reserved for the draw");
 
         _settle(token, 1, keccak256("r1"), _set2(A, B)); // epoch 0: A + B are the holders
+        assertEq(dist.drawCount(address(token)), 1, "first draw settled");
 
-        // Epoch 1: only A buys again. Old (epoch 0) tickets are gone.
-        token.transfer(A, 50_000 ether);
-        assertEq(token.totalTickets(1), 50_000 ether, "only new buys count");
+        // No new transfers: holdings (== tickets) PERSIST. Both A and B stay fully entered
+        // in the next draw at the same odds — nothing was reset to zero at the draw.
+        assertEq(token.balanceOf(A), 300_000 ether, "A still holds its tickets");
+        assertEq(token.balanceOf(B), 100_000 ether, "B still holds its tickets");
+        assertEq(token.totalEligibleSupply(), 400_000 ether, "same total eligible into the next draw");
 
-        weth.mint(address(dist), 2 ether);
-        dist.notify(address(token), 2 ether);
+        // The POT is the only thing that restarts: it re-accrues from newly-notified fees
+        // (the 4 ETH pot was already paid out to the winner).
+        uint256 pot2 = 2 ether;
+        weth.mint(address(dist), pot2);
+        dist.notify(address(token), pot2);
+        assertEq(dist.pendingWeth(address(token)), pot2, "next pot restarts from new fees only");
+
         dist.commitDraw(address(token), 2); // closes epoch 1 → now epoch 2
-        uint256 balBefore = weth.balanceOf(A);
-        // A owns the whole epoch-1 pool → A wins regardless of randomness.
-        _settle(token, 2, keccak256("r2"), _set1(A));
-        assertEq(weth.balanceOf(A) - balBefore, 2 ether, "epoch-1 winner paid");
+        assertEq(token.lotteryEpoch(), 2, "second session advanced");
+
+        // The second draw's odds pool == the CURRENT total eligible (holders unchanged),
+        // frozen at this commit's snapshot block.
+        (, , , uint256 snapBlk, , , ) = dist.pendingDraw(address(token));
+        assertEq(token.totalEligibleAt(snapBlk), 400_000 ether, "second draw uses the persisted holdings");
+
+        bytes32 rnd = keccak256("r2");
+        address expected = _resolveWinner(token, 1, _ticketFor(address(token), rnd, 2, 400_000 ether));
+        uint256 balBefore = weth.balanceOf(expected);
+        _settle(token, 2, rnd, _set2(A, B)); // both are still holders in the second draw
+        assertEq(weth.balanceOf(expected) - balBefore, pot2, "second draw pays the fresh pot to the derived winner");
         assertEq(dist.drawCount(address(token)), 2, "two draws in history");
+    }
+
+    // Front-run-proof: the draw snapshots holdings at the COMMIT block, so selling AFTER
+    // commit (even before the beacon is public) can't dodge or steer the draw. A dumps its
+    // whole balance post-commit, yet the draw still counts A at its pre-sell (snapshot)
+    // balance and settles off the original total.
+    function test_lottery_snapshotFrozenAtCommit() public {
+        LaunchTokenV2 token = _setupLottery();
+        // Use literal block numbers (via_ir re-reads `block.number` across vm.roll, so
+        // `vm.roll(block.number + N)` twice can reuse a stale value — use literals).
+        vm.roll(100);
+        token.transfer(A, 300_000 ether);
+        token.transfer(B, 100_000 ether);
+        uint256 originalTotal = token.totalEligibleSupply();
+        assertEq(originalTotal, 400_000 ether, "A + B entered by their holdings");
+
+        uint256 pot = 5 ether;
+        weth.mint(address(dist), pot);
+        dist.notify(address(token), pot);
+
+        // Advance to a distinct block, then commit — records snapshotBlock = commit block.
+        vm.roll(200);
+        uint256 round = 3;
+        dist.commitDraw(address(token), round);
+        (, , , uint256 snapBlk, , , ) = dist.pendingDraw(address(token));
+        assertEq(snapBlk, 200, "snapshot frozen at the commit block");
+
+        // Roll forward again and have A DUMP its entire balance after the commit.
+        // (Read A's balance BEFORE vm.prank — an inner view call would consume the prank.)
+        vm.roll(300);
+        uint256 aBal = token.balanceOf(A);
+        vm.prank(A);
+        token.transfer(B, aBal); // A sells everything (to B) post-commit
+        assertEq(token.balanceOf(A), 0, "A now holds nothing (current balance)");
+
+        // …but the draw is frozen at the snapshot: A still counts for its pre-sell balance
+        // and the total is unchanged. Selling after commit cannot dodge/steer the draw.
+        assertEq(token.balanceOfAt(A, snapBlk), 300_000 ether, "A's SNAPSHOT balance, not its now-zero current one");
+        assertEq(token.balanceOfAt(B, snapBlk), 100_000 ether, "B's snapshot balance unaffected by the incoming transfer");
+        assertEq(token.totalEligibleAt(snapBlk), originalTotal, "odds denominator frozen at commit");
+
+        // Settle against the SNAPSHOT holder set {A, B}: succeeds using the original total,
+        // and A (despite selling) remains a valid, snapshot-weighted participant.
+        _settle(token, round, keccak256("frozen"), _set2(A, B));
+        assertEq(dist.drawCount(address(token)), 1, "draw settled off the frozen snapshot");
+        (,,,,, uint256 recordedTotal,,) = dist.draws(address(token), 0);
+        assertEq(recordedTotal, originalTotal, "draw recorded the pre-sell total");
     }
 
     // A lottery whose prize is a dev-chosen token (bought with the pot on V3),
@@ -631,7 +699,6 @@ contract V4DistributorTest is Test, Deployers {
         dist.setLocker(address(this));
         dist.setDrawOperator(address(this));
         dist.setVrf(address(vrf));
-        token.setBuySource(address(this));
         token.setLotteryOperator(address(dist));
         dist.registerBuybackV3(address(token), prize, 10_000); // prize bought on a V3 pool
     }
@@ -699,7 +766,6 @@ contract V4DistributorTest is Test, Deployers {
         dist = new LaunchFairV4Distributor(address(this), manager, IV3SwapRouter(address(v3router)), IERC20(address(weth)), address(this));
         dist.setDrawOperator(address(this));
         token.setLotteryOperator(address(dist));
-        token.setBuySource(address(this));
         token.transfer(A, 100_000 ether);
         vm.expectRevert(LaunchFairV4Distributor.VrfNotSet.selector);
         dist.commitDraw(address(token), 1);

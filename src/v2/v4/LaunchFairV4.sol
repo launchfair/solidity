@@ -268,11 +268,10 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);
 
         if (p.mode == LaunchTokenV2.Mode.Lottery) {
-            // Lottery: a buy is the pool handing tokens to the buyer, so tickets
-            // accrue on transfers from the PoolManager; the distributor runs the
-            // draw and advances each session. The pot is WETH; if the dev picked a
-            // prize token, register its V3/V4 venue so the pot can be swapped to it.
-            t.setBuySource(address(poolManager));
+            // Lottery: holdings-weighted. The token checkpoints every holder's balance,
+            // and the distributor snapshots holdings at each draw's commit block to pick
+            // a weighted-random winner. The pot is WETH; if the dev picked a prize token,
+            // register its V3/V4 venue so the pot can be swapped to it.
             t.setLotteryOperator(distributor);
             if (prizeToken != address(0)) {
                 _registerVenue(token, prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);

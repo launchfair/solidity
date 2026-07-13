@@ -440,31 +440,31 @@ contract LaunchFairV4Test is Test, Deployers {
         (address token, PoolKey memory key) = _createLottery();
         dist.setDrawOperator(address(this)); // this session acts as the keeper
 
-        // Launchpad wired the lottery: buys tracked from the pool, distributor draws.
-        assertEq(LaunchTokenV2(token).buySource(), address(manager), "buys tracked from pool");
+        // Launchpad wired the lottery: distributor is the draw operator.
         assertEq(LaunchTokenV2(token).lotteryOperator(), address(dist), "distributor is operator");
 
-        // A buy hands tokens straight from the pool to the buyer -> tickets accrue.
+        // Holdings are tickets: buying gives this buyer a balance -> proportional tickets.
         _buy(key, token, 50_000 ether);
         uint256 epoch = LaunchTokenV2(token).lotteryEpoch();
-        uint256 myTickets = LaunchTokenV2(token).ticketsOf(epoch, address(this));
-        assertGt(myTickets, 0, "buy earned tickets");
-        assertEq(LaunchTokenV2(token).totalTickets(epoch), myTickets, "sole ticket holder");
+        uint256 myTickets = LaunchTokenV2(token).balanceOf(address(this));
+        assertGt(myTickets, 0, "holdings earn tickets");
+        assertEq(LaunchTokenV2(token).totalEligibleSupply(), myTickets, "sole eligible holder");
 
         // Claim the buy-side fee -> mechanism WETH becomes the pot.
         locker.claim(token);
         uint256 pot = dist.pendingWeth(token);
         assertGt(pot, 0, "pot funded");
 
-        // Commit closes ticket sales (advances the session, reserves the pot)…
+        // Commit snapshots holdings at this block + reserves the pot; the cycle advances.
         uint256 round = 9_999_999;
         dist.commitDraw(token, round);
-        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "session advanced at commit");
+        assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch + 1, "pot cycle advanced at commit");
+        (,,, uint256 snapBlk,,,) = dist.pendingDraw(token);
 
         // …the keeper posts the beacon to the coordinator (which pushes it to the
         // distributor), then settles — the randomness comes from the coordinator.
         bytes32 rnd = keccak256("drand-beacon");
-        uint256 wt = uint256(keccak256(abi.encode(rnd, token, round))) % LaunchTokenV2(token).totalTickets(epoch);
+        uint256 wt = uint256(keccak256(abi.encode(rnd, token, round))) % LaunchTokenV2(token).totalEligibleAt(snapBlk);
         assertLt(wt, myTickets, "winning ticket falls in our range");
         vrf.deliver(round, rnd);
 

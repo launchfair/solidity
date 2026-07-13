@@ -8,7 +8,7 @@ pragma solidity ^0.8.24;
 //   Base       — plain fair launch (identical to V1).
 //   Reward     — holders earn a dev-chosen external token, funded by LP fees.
 //   Increasing — holders earn THIS token back (pro-rata), funded by LP fees.
-//   Lottery    — buys earn tickets; a random holder wins the accrued pot.
+//   Lottery    — holders are entered by their balance; a random holder wins the pot.
 // A keeper batches the fee buybacks and funds the on-chain dividend tracker below.
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -17,11 +17,13 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 /// @notice LaunchFair V2 token: base fair-launch mechanics plus an optional,
 /// V4-safe dividend tracker (Reward/Increasing) or a lottery.
 contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Checkpoints for Checkpoints.Trace208;
 
     /// @notice Human-readable version tag so explorers/terminals attribute the
     /// token (and its trades) to us.
@@ -33,7 +35,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         Base, // 0 — plain fair launch
         Reward, // 1 — distribute an external reward token to holders
         Increasing, // 2 — auto-compounding: distribute THIS token to holders (balance grows)
-        Lottery // 3 — buys earn tickets (lost on sell); a random holder takes the pot
+        Lottery // 3 — holdings-weighted: odds = your balance ÷ total held; a random holder takes the pot
     }
 
     struct Metadata {
@@ -123,22 +125,23 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     event DividendClaimed(address indexed account, address indexed asset, uint256 amount);
     event RewardTokensSet(address[] assets, uint16[] weightsBps);
 
-    // ── lottery (Mode.Lottery) ───────────────────────────────────────────────
-    /// @notice The pool tokens are bought from — a transfer FROM here to a real
-    /// wallet is a "buy" that earns lottery tickets. Set once by the launchpad.
-    address public buySource;
-    /// @notice The lottery distributor allowed to close a session after a draw.
+    // ── lottery (Mode.Lottery) — holdings-weighted, powerball ($BALL) style ─────
+    /// @notice The lottery distributor allowed to advance the draw cycle.
     address public lotteryOperator;
-    /// @notice Current lottery session. Tickets reset each draw via a fresh epoch.
+    /// @notice Draw-cycle counter (labels each draw). Tickets are NOT per-cycle —
+    /// they're your HELD balance; only the POT resets each draw.
     uint256 public lotteryEpoch;
-    /// @notice tickets[epoch][holder] — tokens the holder BOUGHT this session and
-    /// STILL HOLDS. Buys add tickets; any move out (sell/transfer/burn) removes
-    /// them, so selling drops your odds to zero and a buy→sell round-trip nets none.
-    mapping(uint256 => mapping(address => uint256)) public ticketsOf;
-    /// @notice Total tickets in a session (the odds denominator).
-    mapping(uint256 => uint256) public totalTickets;
 
-    event TicketsChanged(uint256 indexed epoch, address indexed holder, uint256 newTickets);
+    /// @notice Block-indexed history of each holder's ELIGIBLE (held, non-excluded)
+    /// balance. A draw snapshots holdings at its commit block, so your odds = your held
+    /// balance ÷ total held, frozen BEFORE the random beacon is public (front-run-proof).
+    mapping(address => Checkpoints.Trace208) private _eligibleOf;
+    /// @notice Block-indexed history of the total eligible (held) balance — the odds denominator.
+    Checkpoints.Trace208 private _totalEligible;
+
+    /// @notice Emitted when a holder's eligible (held) balance changes; the log's block
+    /// number is the checkpoint key. `heldBalance` is the holder's new eligible balance.
+    event TicketsChanged(uint256 indexed epoch, address indexed holder, uint256 heldBalance);
     event LotterySessionAdvanced(uint256 indexed closedEpoch, uint256 newEpoch);
 
     constructor(
@@ -244,13 +247,6 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         if (pool == address(0)) pool = pool_;
     }
 
-    /// @notice Launchpad-only (once): the pool address a buy comes FROM, so the
-    /// token can credit lottery tickets on buys.
-    function setBuySource(address src) external {
-        if (msg.sender != launchpad) revert OnlyLaunchpad();
-        if (buySource == address(0)) buySource = src;
-    }
-
     /// @notice Launchpad-only (once): the lottery distributor allowed to close a
     /// session after settling a draw.
     function setLotteryOperator(address op) external {
@@ -274,6 +270,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         if (excludedFromDividends[account] == excluded) return;
         excludedFromDividends[account] = excluded;
         _syncShare(account);
+        if (mode == Mode.Lottery) _writeEligible(account); // eligibility flip changes the odds pool
         emit ExcludedFromDividends(account, excluded);
     }
 
@@ -298,36 +295,41 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
             if (to != address(0)) _syncShare(to);
         }
 
-        // Lottery tickets track tokens BOUGHT this session and STILL HELD:
-        //   • a buy (tokens leaving the pool to a wallet) ADDS tickets;
-        //   • any move OUT of a wallet — sell (to the pool), transfer, or burn —
-        //     REMOVES tickets (down to zero).
-        // So selling drops your odds to zero, a buy→sell round-trip nets nothing,
-        // and moving tokens to another wallet can't launder tickets (the receiver
-        // only earns tickets by buying from the pool). Tickets are per-session and
-        // reset when the draw advances the epoch.
-        if (mode == Mode.Lottery && value > 0) {
-            uint256 e = lotteryEpoch;
-            // `buySource != 0` so the constructor mint (from == 0 == unset buySource) can
-            // never mint tickets before the pool is wired.
-            if (from == buySource && buySource != address(0)) {
-                if (to != address(0) && !excludedFromDividends[to]) {
-                    uint256 nt = ticketsOf[e][to] + value;
-                    ticketsOf[e][to] = nt;
-                    totalTickets[e] += value;
-                    emit TicketsChanged(e, to, nt);
-                }
-            } else if (from != address(0)) {
-                uint256 held = ticketsOf[e][from];
-                if (held > 0) {
-                    uint256 cut = value < held ? value : held;
-                    uint256 nt = held - cut;
-                    ticketsOf[e][from] = nt;
-                    totalTickets[e] -= cut;
-                    emit TicketsChanged(e, from, nt);
-                }
-            }
+        // Lottery is HOLDINGS-weighted: your tickets are your held balance. Checkpoint
+        // each party's eligible (held, non-excluded) balance per block so a draw can
+        // snapshot everyone's holdings at its commit block — your odds = your held
+        // balance ÷ total held. Only the POT is per-cycle; holdings are always "in".
+        if (mode == Mode.Lottery) {
+            if (from != address(0)) _writeEligible(from);
+            if (to != address(0)) _writeEligible(to);
         }
+    }
+
+    /// @dev Record `account`'s new eligible (held, non-excluded) balance and update the
+    /// global total, both block-stamped, powering holdings-weighted lottery snapshots.
+    function _writeEligible(address account) internal {
+        uint208 oldE = _eligibleOf[account].latest();
+        uint208 newE = excludedFromDividends[account] ? 0 : uint208(super.balanceOf(account));
+        if (newE == oldE) return;
+        _eligibleOf[account].push(uint48(block.number), newE);
+        uint208 oldT = _totalEligible.latest();
+        _totalEligible.push(uint48(block.number), oldT - oldE + newE);
+        emit TicketsChanged(lotteryEpoch, account, newE);
+    }
+
+    /// @notice A holder's eligible (held) balance as of `blockNumber` — the draw snapshot.
+    function balanceOfAt(address account, uint256 blockNumber) external view returns (uint256) {
+        return _eligibleOf[account].upperLookup(uint48(blockNumber));
+    }
+
+    /// @notice Total eligible (held) balance as of `blockNumber` — the odds denominator at a draw.
+    function totalEligibleAt(uint256 blockNumber) external view returns (uint256) {
+        return _totalEligible.upperLookup(uint48(blockNumber));
+    }
+
+    /// @notice Current total eligible (held) balance — the live odds denominator.
+    function totalEligibleSupply() external view returns (uint256) {
+        return _totalEligible.latest();
     }
 
     // ── dividend accounting (multi-asset) ─────────────────────────────────────

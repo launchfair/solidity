@@ -243,83 +243,109 @@ contract LaunchTokenV2Test is Test {
         _assertSupplyInvariant(t);
     }
 
-    function test_lottery_ticketsFromBuys_resetOnDraw() public {
-        LaunchTokenV2 t = new LaunchTokenV2(
+    // ── Lottery mode (holdings-weighted, powerball/$BALL style) ─────────────────
+    // Tickets are your ELIGIBLE HELD balance — any non-excluded holder is entered,
+    // weighted by balance. The test contract is the launchpad (excluded, holds no
+    // tickets); the pool is excluded too. Tickets go to fresh holders (A, B) via
+    // transfer. Checkpoints are keyed by block.number, so vm.roll separates them.
+    function _deployLottery() internal returns (LaunchTokenV2 t) {
+        t = new LaunchTokenV2(
             "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, new address[](0), new uint16[](0), address(0), 0, address(this)
         );
-        t.setBuySource(POOL);
         t.setLotteryOperator(address(this)); // test acts as the lottery distributor
-        t.excludeFromDividends(POOL, true);
-        t.transfer(POOL, SUPPLY); // seed the "pool"
-
-        // Buys = transfers FROM the pool → earn tickets proportional to size.
-        vm.prank(POOL);
-        t.transfer(A, 300 ether);
-        vm.prank(POOL);
-        t.transfer(B, 100 ether);
-        uint256 e = t.lotteryEpoch();
-        assertEq(t.ticketsOf(e, A), 300 ether, "A tickets == buy size");
-        assertEq(t.ticketsOf(e, B), 100 ether, "B tickets");
-        assertEq(t.totalTickets(e), 400 ether, "session total");
-
-        // Draw advances the epoch → tickets reset; old session preserved.
-        uint256 closed = t.advanceLotteryEpoch();
-        assertEq(closed, e, "closed the old session");
-        uint256 e2 = t.lotteryEpoch();
-        assertEq(e2, e + 1, "new session started");
-        assertEq(t.totalTickets(e2), 0, "fresh session, zero tickets");
-        assertEq(t.ticketsOf(e, A), 300 ether, "old session tickets preserved");
-
-        // New buys count only toward the new session.
-        vm.prank(POOL);
-        t.transfer(A, 200 ether);
-        assertEq(t.ticketsOf(e2, A), 200 ether, "new session buy");
-        assertEq(t.ticketsOf(e, A), 300 ether, "old session unchanged");
+        t.excludeFromDividends(POOL, true); // the pool holds no tickets
     }
 
-    // Selling (or transferring out) removes tickets: your odds track tokens bought
-    // this session and STILL held. A buy→sell round-trip nets zero.
-    function test_lottery_sellRemovesTickets() public {
-        LaunchTokenV2 t = new LaunchTokenV2(
-            "Lotto", "LOT", SUPPLY, "https://hood.launchfair.app", _meta(), 0, 0, LaunchTokenV2.Mode.Lottery, new address[](0), new uint16[](0), address(0), 0, address(this)
-        );
-        t.setBuySource(POOL);
-        t.setLotteryOperator(address(this));
-        t.excludeFromDividends(POOL, true);
-        t.transfer(POOL, SUPPLY);
-        uint256 e = t.lotteryEpoch();
+    // Tickets == eligible held balance: holding enters you, weighted by balance, and
+    // a plain-transfer RECEIVER now GAINS tickets (the old "receiver earns nothing"
+    // is false). Past-block reads are frozen at that block's checkpoint.
+    function test_lottery_ticketsAreHoldings() public {
+        LaunchTokenV2 t = _deployLottery();
 
-        vm.prank(POOL);
-        t.transfer(A, 300 ether); // A buys 300
-        vm.prank(POOL);
-        t.transfer(B, 100 ether); // B buys 100
-        assertEq(t.totalTickets(e), 400 ether, "start");
+        uint256 X = 300 ether;
+        uint256 Y = 100 ether;
+        // Use explicit block numbers (via_ir re-reads `block.number` across vm.roll, so
+        // never capture it into a var before a roll — use literals for checkpoint keys).
+        vm.roll(100);
+        // Simply HOLDING tokens enters A and B — no buySource needed.
+        t.transfer(A, X);
+        t.transfer(B, Y);
 
-        // A sells 100 back to the pool → tickets drop by 100.
-        vm.prank(A);
-        t.transfer(POOL, 100 ether);
-        assertEq(t.ticketsOf(e, A), 200 ether, "sell removed tickets");
-        assertEq(t.totalTickets(e), 300 ether, "pool total shrank");
+        assertEq(t.balanceOf(A), X, "A holds X");
+        assertEq(t.balanceOf(B), Y, "B holds Y");
+        assertEq(t.balanceOfAt(A, 100), X, "A's tickets == held balance");
+        // Test contract (launchpad) and POOL are excluded → 0 eligible; A and B are
+        // the only entrants, so the odds denominator is exactly their held total.
+        assertEq(t.totalEligibleSupply(), X + Y, "total eligible = A + B holdings");
 
-        // A transfers 50 to B → A loses those tickets; B (a receiver) gains none.
-        vm.prank(A);
-        t.transfer(B, 50 ether);
-        assertEq(t.ticketsOf(e, A), 150 ether, "transfer out removed tickets");
-        assertEq(t.ticketsOf(e, B), 100 ether, "receiver earns no tickets");
-        assertEq(t.totalTickets(e), 250 ether, "total tracks net held");
+        // Roll to a DISTINCT block so the next change lands on a new checkpoint.
+        vm.roll(200);
 
-        // Wash trade: B buys 200 more then dumps it all → nets zero tickets.
-        vm.prank(POOL);
-        t.transfer(B, 200 ether); // B tickets 300
+        // B sends half its holdings to A: the receiver A gains those tickets.
         vm.prank(B);
-        t.transfer(POOL, 300 ether); // dump 300
-        assertEq(t.ticketsOf(e, B), 0, "wash trade nets zero");
+        t.transfer(A, Y / 2);
 
-        // A dumps the rest → fully out, zero odds.
+        assertEq(t.balanceOfAt(A, 200), X + Y / 2, "receiver A GAINED tickets");
+        assertEq(t.balanceOfAt(B, 200), Y / 2, "sender B's tickets dropped");
+        // Internal transfer between two eligible holders conserves the held total.
+        assertEq(t.totalEligibleSupply(), X + Y, "eligible total unchanged by internal transfer");
+
+        // Checkpoint freeze: A's eligible AT block 100 is still its old value.
+        assertEq(t.balanceOfAt(A, 100), X, "past checkpoint frozen at A's earlier balance");
+    }
+
+    // Selling reduces tickets: moving tokens to an EXCLUDED holder (the pool) or
+    // burning them removes those tickets from A and from the odds denominator.
+    function test_lottery_sellingReducesTickets() public {
+        LaunchTokenV2 t = _deployLottery();
+
+        uint256 X = 300 ether;
+        vm.roll(100);
+        t.transfer(A, X);
+        assertEq(t.balanceOfAt(A, 100), X, "A's tickets == held");
+        assertEq(t.totalEligibleSupply(), X, "A is the only entrant");
+
+        // Selling to the pool == transferring to an EXCLUDED address → tickets leave.
+        uint256 sold = 100 ether;
+        vm.roll(200);
         vm.prank(A);
-        t.transfer(POOL, 150 ether);
-        assertEq(t.ticketsOf(e, A), 0, "full seller has no tickets");
-        assertEq(t.totalTickets(e), 0, "nobody eligible after everyone sold");
+        t.transfer(POOL, sold);
+        assertEq(t.balanceOf(A), X - sold, "A's balance dropped by the sale");
+        assertEq(t.balanceOfAt(A, 200), X - sold, "A's tickets dropped by the sale");
+        assertEq(t.totalEligibleSupply(), X - sold, "excluded pool holds no tickets, total drops");
+
+        // Burning (ERC20Burnable) also removes tickets from A and the total.
+        uint256 burned = 50 ether;
+        vm.roll(300);
+        vm.prank(A);
+        t.burn(burned);
+        assertEq(t.balanceOfAt(A, 300), X - sold - burned, "burn dropped A's tickets");
+        assertEq(t.totalEligibleSupply(), X - sold - burned, "burn removed those tickets from the total");
+
+        // The pre-sale checkpoint (block 100) stays frozen at A's full holdings.
+        assertEq(t.balanceOfAt(A, 100), X, "pre-sale tickets frozen at full holdings");
+    }
+
+    // A draw only advances the cycle counter (and resets the POT); it does NOT reset
+    // tickets — holdings persist across draws.
+    function test_lottery_holdingsPersistAcrossDraws() public {
+        LaunchTokenV2 t = _deployLottery();
+
+        uint256 X = 300 ether;
+        t.transfer(A, X);
+        uint256 e = t.lotteryEpoch();
+        assertEq(t.balanceOfAt(A, block.number), X, "A's tickets == held before the draw");
+        assertEq(t.totalEligibleSupply(), X, "total eligible before the draw");
+
+        // Advance the draw cycle as the operator (the test contract).
+        uint256 closed = t.advanceLotteryEpoch();
+        assertEq(closed, e, "closed the current cycle");
+        assertEq(t.lotteryEpoch(), e + 1, "cycle counter incremented");
+
+        // Holdings persist: A STILL has tickets == balance after the draw.
+        assertEq(t.balanceOf(A), X, "A still holds X");
+        assertEq(t.balanceOfAt(A, block.number), X, "A's tickets unchanged by the draw");
+        assertEq(t.totalEligibleSupply(), X, "total eligible unchanged by the draw");
     }
 
     function test_lottery_onlyOperatorAdvances() public {

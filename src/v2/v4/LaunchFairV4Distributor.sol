@@ -102,6 +102,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         uint256 round;
         uint256 epoch;
         uint256 prize;
+        uint256 snapshotBlock; // block whose holdings the winner is drawn from (frozen at commit)
         uint256 requestId; // the coordinator request this draw waits on
         bytes32 randomness; // pushed by the coordinator (or pulled at settle)
         bool active;
@@ -332,14 +333,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         }
     }
 
-    // ── lottery (Mode.Lottery) ──────────────────────────────────────────────────
-    // The token accrues WETH exactly like a reward token, but instead of a buyback
-    // the pot is paid whole to one ticket holder. Tickets are earned per-buy inside
-    // the token (LaunchTokenV2.ticketsOf[epoch]). A draw is committed to a *future*
-    // drand round so its randomness can't be known — let alone ground — in advance,
-    // then settled once that round's beacon is published. Everything needed to
-    // re-verify the winner (randomness, round, epoch, totalTickets, winningTicket)
-    // is emitted + stored on-chain, powerball-style.
+    // ── lottery (Mode.Lottery) — powerball ($BALL) style, holdings-weighted ─────────
+    // The token accrues WETH exactly like a reward token, but instead of a buyback the
+    // pot is paid whole to one holder, weighted by holdings. A draw snapshots every
+    // holder's balance at its commit block (LaunchTokenV2.balanceOfAt / totalEligibleAt)
+    // and is committed to a *future* drand round, so the winner is drawn from holdings
+    // frozen BEFORE the randomness exists — nobody can buy to steer a known result. It's
+    // settled once that round's beacon is published. Everything needed to re-verify the
+    // winner (randomness, round, snapshot block, total, winningTicket) is on-chain.
 
     function setDrawOperator(address op) external onlyOwner {
         if (op == address(0)) revert ZeroAddress();
@@ -396,19 +397,30 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (drandRound <= _currentDrandRound()) revert RoundNotFuture();
 
         uint256 epoch = t.lotteryEpoch();
-        if (t.totalTickets(epoch) == 0) revert NoTickets();
+        // Holdings-weighted: the odds pool is every holder's current balance. Snapshot
+        // THIS block — the winner is drawn from holdings frozen here, before the future
+        // round's beacon exists, so nobody can buy to steer a known result.
+        if (t.totalEligibleSupply() == 0) revert NoTickets();
+        uint256 snapshotBlock = block.number;
 
         lastPayoutBlock[token] = block.number;  // reset the dev's block timer
         uint256 prize = pendingWeth[token];
         pendingWeth[token] = 0;                 // reserve the pot for this draw…
-        t.advanceLotteryEpoch();                // …and close ticket sales for `epoch`.
+        t.advanceLotteryEpoch();                // …and open a fresh pot cycle.
 
         // Ask the shared coordinator for the beacon at this future round; it will
         // push it back via fulfillRandomness (or we pull it at settle).
         uint256 reqId = IVRFCoordinator(vrf).requestRandomness(drandRound);
         requestToken[reqId] = token;
-        pendingDraw[token] =
-            PendingDraw({round: drandRound, epoch: epoch, prize: prize, requestId: reqId, randomness: 0, active: true});
+        pendingDraw[token] = PendingDraw({
+            round: drandRound,
+            epoch: epoch,
+            prize: prize,
+            snapshotBlock: snapshotBlock,
+            requestId: reqId,
+            randomness: 0,
+            active: true
+        });
         drawId = draws[token].length;
         emit DrawCommitted(token, drawId, drandRound, epoch, prize);
     }
@@ -448,7 +460,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (!pd.active) revert NoDraw();
 
         LaunchTokenV2 t = LaunchTokenV2(token);
-        uint256 total = t.totalTickets(pd.epoch); // frozen at commit (epoch already advanced)
+        uint256 total = t.totalEligibleAt(pd.snapshotBlock); // total held at the commit snapshot
 
         // Start (or resume) the settlement. On the first chunk, pull + cache the verified
         // randomness and derive the winning ticket once.
@@ -474,7 +486,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             address h = holders[i];
             if (h <= lastHolder) revert BadHolderSet();
             lastHolder = h;
-            uint256 tk = t.ticketsOf(pd.epoch, h);
+            uint256 tk = t.balanceOfAt(h, pd.snapshotBlock); // the holder's held balance at the snapshot
             if (tk == 0) revert BadHolderSet();
             if (winner == address(0) && winningTicket < cumulative + tk) winner = h;
             cumulative += tk;
