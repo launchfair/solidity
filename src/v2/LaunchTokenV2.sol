@@ -15,11 +15,12 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /// @notice LaunchFair V2 token: base fair-launch mechanics plus an optional,
 /// V4-safe dividend tracker (Reward/Increasing) or a lottery.
-contract LaunchTokenV2 is ERC20Burnable {
+contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// @notice Human-readable version tag so explorers/terminals attribute the
@@ -256,7 +257,9 @@ contract LaunchTokenV2 is ERC20Burnable {
         // reset when the draw advances the epoch.
         if (mode == Mode.Lottery && value > 0) {
             uint256 e = lotteryEpoch;
-            if (from == buySource) {
+            // `buySource != 0` so the constructor mint (from == 0 == unset buySource) can
+            // never mint tickets before the pool is wired.
+            if (from == buySource && buySource != address(0)) {
                 if (to != address(0) && !excludedFromDividends[to]) {
                     uint256 nt = ticketsOf[e][to] + value;
                     ticketsOf[e][to] = nt;
@@ -307,17 +310,27 @@ contract LaunchTokenV2 is ERC20Burnable {
     /// distribution asset from the caller and credits it pro-rata to holders.
     /// Permissionless — anyone (typically our keeper after a fee buyback) may
     /// fund; funding only ever *adds* claimable value to holders.
-    function fundRewards(uint256 amount) external {
+    function fundRewards(uint256 amount) external nonReentrant {
         if (mode != Mode.Reward && mode != Mode.Increasing) revert WrongMode();
-        if (totalShares == 0) revert NoShares();
         if (amount == 0) return;
-        IERC20(distributionAsset()).safeTransferFrom(msg.sender, address(this), amount);
+        // Credit the amount ACTUALLY received, not the nominal amount, so a fee-on-transfer
+        // or rebasing reward token can't over-credit holders and strand the last claimers.
+        IERC20 asset = IERC20(distributionAsset());
+        uint256 balBefore = asset.balanceOf(address(this));
+        asset.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = asset.balanceOf(address(this)) - balBefore;
+        if (received == 0) return;
+        // Re-read shares AFTER the transfer: for Increasing a non-excluded funder's own
+        // share drops, and a sole shareholder funding their whole balance would otherwise
+        // divide by zero.
+        uint256 shares = totalShares;
+        if (shares == 0) revert NoShares();
         // Increasing: the pulled THIS-token is the reflection pool (netted out of
         // balanceOf(this)); holders' balances grow immediately, no push needed.
-        if (mode == Mode.Increasing) _reflectionHeld += amount;
-        magnifiedDividendPerShare += (amount * MAGNITUDE) / totalShares;
-        totalDistributed += amount;
-        emit DividendsDistributed(amount);
+        if (mode == Mode.Increasing) _reflectionHeld += received;
+        magnifiedDividendPerShare += (received * MAGNITUDE) / shares;
+        totalDistributed += received;
+        emit DividendsDistributed(received);
     }
 
     function accumulativeDividendOf(address account) public view returns (uint256) {
@@ -378,10 +391,12 @@ contract LaunchTokenV2 is ERC20Burnable {
 
     /// @notice Push payouts to a batch of holders — called by the keeper (with
     /// the holder list from the indexer) so rewards land in wallets AUTOMATICALLY,
-    /// no claim required. Skips zero-owed accounts cheaply.
+    /// no claim required. Skips zero-owed accounts cheaply. Each account is wrapped in
+    /// try/catch so one recipient whose reward-token transfer reverts (e.g. a blacklist)
+    /// can't block the whole batch; that account can still `claim()` later.
     function processAccounts(address[] calldata accounts) external {
         for (uint256 i = 0; i < accounts.length; i++) {
-            processAccount(accounts[i]);
+            try this.processAccount(accounts[i]) {} catch {}
         }
     }
 

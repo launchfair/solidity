@@ -55,7 +55,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     IPoolManager public immutable poolManager;
     IV3SwapRouter public immutable v3Router; // SwapRouter02, for reward tokens on V3
     IERC20 public immutable weth;
-    address public registrar; // the launchpad; records buyback pools (owner-settable for wiring)
+    address public registrar; // the launchpad; records buyback pools (set-once after deploy)
+    bool public registrarLocked; // registrar is frozen after the first post-deploy set (L-03)
     address public locker;
 
     // Where a token's reward asset is bought.
@@ -67,6 +68,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     }
     mapping(address token => BuybackRoute) internal _buyback;
     mapping(address token => bool) public registered;
+    /// @notice Addresses allowed to call process() (the keeper). The owner is always
+    /// allowed. Gating this closes the permissionless-minOut sandwich vector (M-02):
+    /// only a trusted caller passing a real quoted minOut can trigger a buyback.
+    mapping(address caller => bool) public isProcessor;
     mapping(address token => uint256) public pendingWeth;
     /// @notice Dev-set minimum pending WETH before a payout fires (anti-dust; the
     /// keeper only processes once it's crossed). 0 = fire on any pending.
@@ -99,14 +104,29 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         bytes32 randomness; // pushed by the coordinator (or pulled at settle)
         bool active;
     }
+    // Progress of a (possibly multi-transaction) settlement. `settleDraw` can be fed
+    // the sorted holder set in chunks so an arbitrarily large lottery can always be
+    // settled within block limits; this accumulates the running total + winner across
+    // chunks and finalizes once every ticket is accounted for.
+    struct Settlement {
+        bool active;            // a settlement is in progress
+        address lastHolder;     // last holder counted — the next chunk must exceed it
+        address winner;         // set once the winning ticket falls in a holder's range
+        uint256 cumulative;     // tickets counted so far
+        uint256 winningTicket;  // cached at start (from the verified randomness)
+        bytes32 randomness;     // cached at start (for the Draw record at finalize)
+    }
 
     address public drawOperator; // off-chain keeper that commits/settles draws
     address public vrf; // the shared LaunchFairVRFCoordinator (randomness source)
     mapping(address token => Draw[]) public draws;         // full winner history
     mapping(address token => PendingDraw) public pendingDraw;
+    mapping(address token => Settlement) public settlement; // in-progress paginated settle
     mapping(uint256 requestId => address token) public requestToken; // VRF callback routing
 
     event LockerSet(address locker);
+    event RegistrarSet(address registrar);
+    event ProcessorSet(address indexed processor, bool allowed);
     event BuybackRegistered(address indexed token, uint8 venue);
     event Notified(address indexed token, uint256 amount, uint256 pending);
     event Processed(address indexed token, uint256 wethIn, uint256 assetOut, uint8 mode);
@@ -123,6 +143,9 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     error OnlyRegistrar();
     error OnlyPoolManager();
     error LockerAlreadySet();
+    error RegistrarLocked();
+    error AlreadyRegistered();
+    error NotProcessor();
     error NotRegistered();
     error NothingPending();
     error BelowThreshold();
@@ -136,10 +159,28 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     error DrawActive();
     error NoDraw();
     error NoTickets();
-    error BadProof();
+    error BadHolderSet();
+    error IncompleteHolderSet();
     error OnlyVrf();
     error VrfNotSet();
+    error VrfAlreadySet();
     error RandomnessNotReady();
+    error RoundNotFuture();
+    error BeaconAlreadyProduced();
+
+    // drand quicknet timing (genesis unix time + round period), for the future-round
+    // check that stops a malicious drawOperator grinding an already-produced beacon to
+    // choose the winner (audit C-01). Matches the quicknet chain DrandBLS verifies.
+    uint256 private constant DRAND_GENESIS = 1_692_803_367;
+    uint256 private constant DRAND_PERIOD = 3;
+    bool public vrfLocked; // vrf is set-once (audit M-01): owner can't swap the randomness source
+
+    /// @dev The drand round currently being produced (per this chain's clock). A round
+    /// strictly greater than this cannot have its beacon known yet.
+    function _currentDrandRound() internal view returns (uint256) {
+        if (block.timestamp <= DRAND_GENESIS) return 0;
+        return (block.timestamp - DRAND_GENESIS) / DRAND_PERIOD + 1;
+    }
 
     constructor(address owner_, IPoolManager pm_, IV3SwapRouter v3Router_, IERC20 weth_, address registrar_)
         Ownable(owner_)
@@ -161,24 +202,39 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit LockerSet(locker_);
     }
 
-    /// @notice Point the distributor at the launchpad (deployed after this).
+    /// @notice Point the distributor at the launchpad (deployed after this). Set-once:
+    /// the very first post-deploy call wires the real launchpad and then freezes it,
+    /// so the owner can't later re-point the registrar to hijack buyback venues (L-03).
     function setRegistrar(address registrar_) external onlyOwner {
+        if (registrarLocked) revert RegistrarLocked();
         if (registrar_ == address(0)) revert ZeroAddress();
         registrar = registrar_;
+        registrarLocked = true;
+        emit RegistrarSet(registrar_);
+    }
+
+    /// @notice Owner-manage the keeper allowlist that may call process() (M-02).
+    function setProcessor(address processor, bool allowed) external onlyOwner {
+        if (processor == address(0)) revert ZeroAddress();
+        isProcessor[processor] = allowed;
+        emit ProcessorSet(processor, allowed);
     }
 
     /// @notice Launchpad records the **V4** pool where a token's reward asset is bought.
+    /// A token's venue is registered once at launch and then frozen (L-03).
     function registerBuyback(address token, PoolKey calldata key) external {
         if (msg.sender != registrar) revert OnlyRegistrar();
+        if (registered[token]) revert AlreadyRegistered();
         _buyback[token] = BuybackRoute({venue: Venue.V4, v3Fee: 0, v4Key: key});
         registered[token] = true;
         emit BuybackRegistered(token, uint8(Venue.V4));
     }
 
     /// @notice Launchpad records that a token's reward asset is bought on a **V3**
-    /// pool (WETH/asset at fee tier `fee`) via SwapRouter02.
+    /// pool (WETH/asset at fee tier `fee`) via SwapRouter02. Registered once, then frozen.
     function registerBuybackV3(address token, uint24 fee) external {
         if (msg.sender != registrar) revert OnlyRegistrar();
+        if (registered[token]) revert AlreadyRegistered();
         PoolKey memory empty;
         _buyback[token] = BuybackRoute({venue: Venue.V3, v3Fee: fee, v4Key: empty});
         registered[token] = true;
@@ -233,9 +289,13 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         }
     }
 
-    /// @notice Permissionless: buy the token's reward asset with its pending WETH
-    /// and distribute it to holders (Reward / Redistribute). `minOut` guards slippage.
+    /// @notice Buy the token's reward asset with its pending WETH and distribute it to
+    /// holders (Reward / Redistribute). `minOut` guards slippage. Restricted to the
+    /// owner or an allowlisted keeper (M-02): a real quoted `minOut` is only meaningful
+    /// if an untrusted caller can't force the buyback through at `minOut = 0` and
+    /// sandwich it. Already-distributed rewards stay claimable trustlessly on the token.
     function process(address token, uint256 minOut) external nonReentrant returns (uint256 out) {
+        if (msg.sender != owner() && !isProcessor[msg.sender]) revert NotProcessor();
         uint256 wethIn = pendingWeth[token];
         if (wethIn == 0) revert NothingPending();
         if (wethIn < payoutThreshold[token]) revert BelowThreshold();
@@ -248,7 +308,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         lastPayoutBlock[token] = block.number; // reset the dev's block timer
 
         out = _buyAsset(token, LaunchTokenV2(token).distributionAsset(), wethIn);
-        if (out < minOut) revert Slippage();
+        if (out == 0 || out < minOut) revert Slippage(); // out==0 would burn the pot into a dead swap
 
         IERC20(LaunchTokenV2(token).distributionAsset()).forceApprove(token, out);
         LaunchTokenV2(token).fundRewards(out);
@@ -270,11 +330,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit DrawOperatorSet(op);
     }
 
-    /// @notice Point the distributor at the shared VRF coordinator (randomness
-    /// source for lottery draws). Owner-settable so a new coordinator can be wired.
+    /// @notice Point the distributor at the shared VRF coordinator (randomness source).
+    /// **Set-once** (audit M-01): once wired, the owner cannot swap the randomness source
+    /// for one it controls, so it can't rig lottery outcomes.
     function setVrf(address vrf_) external onlyOwner {
+        if (vrfLocked) revert VrfAlreadySet();
         if (vrf_ == address(0)) revert ZeroAddress();
         vrf = vrf_;
+        vrfLocked = true;
         emit VrfSet(vrf_);
     }
 
@@ -297,11 +360,13 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         return draws[token].length;
     }
 
-    /// @notice Close the current session and commit its draw to drand `drandRound`
-    /// (which must not yet have been produced, so the seed can't be known/ground in
-    /// advance). Ticket sales for this draw end here: the epoch is advanced so later
-    /// buys count toward the next session, and the current pot is reserved as the
-    /// prize. Reverts on an empty session so no draw locks with nothing to win.
+    /// @notice Close the current session and commit its draw to a **future** drand
+    /// `drandRound`. The future-round requirement is enforced ON-CHAIN (audit C-01): a
+    /// round whose beacon is already produced could be ground by the operator to choose
+    /// the winner, so `drandRound` must exceed the round currently being produced (bound
+    /// to `block.timestamp` via drand's genesis+period). Ticket sales for this draw end
+    /// here: the epoch is advanced so later buys count toward the next session, and the
+    /// current pot is reserved as the prize. Reverts on an empty session.
     function commitDraw(address token, uint256 drandRound) external returns (uint256 drawId) {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         LaunchTokenV2 t = LaunchTokenV2(token);
@@ -309,6 +374,9 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (vrf == address(0)) revert VrfNotSet();
         if (pendingDraw[token].active) revert DrawActive();
         if (!timerElapsed(token)) revert TimerNotElapsed();
+        // The committed round's beacon must not exist yet — otherwise the operator could
+        // pick a past round whose (public) beacon makes its chosen holder win.
+        if (drandRound <= _currentDrandRound()) revert RoundNotFuture();
 
         uint256 epoch = t.lotteryEpoch();
         if (t.totalTickets(epoch) == 0) revert NoTickets();
@@ -329,41 +397,85 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     }
 
     /// @notice Settle the committed draw. The drand beacon comes from the VRF
-    /// coordinator — pushed to us at post, or pulled here if that push reverted —
-    /// so the keeper can't substitute its own value. The winning ticket is derived
-    /// on-chain from it (tamper-evident); the caller supplies `winner` + its
-    /// `cumulativeStart` (the winner's ticket offset in the canonical TicketsChanged
-    /// order) and we prove on-chain the drawn ticket lands in `[cumulativeStart,
-    /// cumulativeStart + winnerTickets)`. The session and pot were frozen at commit,
-    /// so this pays out the reserved prize and records it.
+    /// coordinator — which only stores a value whose BLS signature it verified — so the
+    /// seed is provably the real beacon and the winning ticket is derived on-chain from
+    /// it. The winner is then derived on-chain too, with **no operator discretion**:
+    /// the caller supplies the epoch's ticket-holders as `holders`, sorted strictly
+    /// ascending by address. Strict-ascending order makes them distinct and defines a
+    /// canonical partition of `[0, totalTickets)`; requiring the holders' stored ticket
+    /// counts to sum to exactly `totalTickets` forces the set to be COMPLETE (any
+    /// omission undershoots, any padding with a non-holder is rejected). The drawn ticket
+    /// therefore lands in exactly one holder's range — the winner.
     ///
-    /// The prize is the reserved WETH pot, paid either as WETH (default) or as the
-    /// dev-chosen prize token bought with it on the token's registered V3/V4 venue
-    /// (`minPrizeOut` guards that swap; ignored for a WETH prize).
+    /// **Paginated:** the sorted set can be fed across multiple calls, so a lottery with
+    /// any number of holders can always be settled within block limits. Each call must
+    /// continue strictly after the previous call's last holder; progress accumulates in
+    /// `settlement[token]` and the draw finalizes on the call whose cumulative reaches
+    /// `totalTickets`. A partial call returns 0 and records no draw yet. (`resetSettlement`
+    /// restarts a botched sequence; `cancelDraw` abandons the whole draw.)
+    ///
+    /// The prize is the reserved WETH pot, paid on finalization either as WETH (default)
+    /// or as the dev-chosen prize token bought with it on the token's registered V3/V4
+    /// venue (`minPrizeOut` guards that swap; ignored for a WETH prize / partial calls).
+    ///
+    /// Returns the amount paid to the winner on the finalizing call (0 for a partial
+    /// call), so the keeper can `eth_call` the final chunk with `minPrizeOut = 0` to
+    /// quote the swap, then re-send with a real slippage bound.
     function settleDraw(
         address token,
-        address winner,
-        uint256 cumulativeStart,
+        address[] calldata holders,
         uint256 minPrizeOut
-    ) external nonReentrant {
+    ) external nonReentrant returns (uint256 prizePaid) {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         PendingDraw memory pd = pendingDraw[token];
         if (!pd.active) revert NoDraw();
 
-        bytes32 randomness = pd.randomness;
-        if (randomness == bytes32(0)) randomness = IVRFCoordinator(vrf).randomnessOf(pd.round); // pull fallback
-        if (randomness == bytes32(0)) revert RandomnessNotReady();
-
         LaunchTokenV2 t = LaunchTokenV2(token);
         uint256 total = t.totalTickets(pd.epoch); // frozen at commit (epoch already advanced)
 
-        uint256 winningTicket = uint256(keccak256(abi.encode(randomness, token, pd.round))) % total;
-        uint256 winnerTickets = t.ticketsOf(pd.epoch, winner);
-        // The winner's contiguous ticket range must contain the drawn ticket.
-        if (winnerTickets == 0 || winningTicket < cumulativeStart || winningTicket >= cumulativeStart + winnerTickets) {
-            revert BadProof();
+        // Start (or resume) the settlement. On the first chunk, pull + cache the verified
+        // randomness and derive the winning ticket once.
+        Settlement storage s = settlement[token];
+        if (!s.active) {
+            bytes32 rnd = pd.randomness;
+            if (rnd == bytes32(0)) rnd = IVRFCoordinator(vrf).randomnessOf(pd.round); // pull fallback
+            if (rnd == bytes32(0)) revert RandomnessNotReady();
+            s.active = true;
+            s.randomness = rnd;
+            s.winningTicket = uint256(keccak256(abi.encode(rnd, token, pd.round))) % total;
         }
 
+        // Walk this chunk of the sorted, complete holder set. `h > lastHolder` (strict,
+        // and contiguous across chunks) => sorted + distinct; `tk != 0` => only real
+        // holders; overshooting `total` => a bad set. The winner is whoever's cumulative
+        // range owns the winning ticket — uniquely determined, the caller can't steer it.
+        uint256 cumulative = s.cumulative;
+        address lastHolder = s.lastHolder;
+        address winner = s.winner;
+        uint256 winningTicket = s.winningTicket;
+        for (uint256 i = 0; i < holders.length; i++) {
+            address h = holders[i];
+            if (h <= lastHolder) revert BadHolderSet();
+            lastHolder = h;
+            uint256 tk = t.ticketsOf(pd.epoch, h);
+            if (tk == 0) revert BadHolderSet();
+            if (winner == address(0) && winningTicket < cumulative + tk) winner = h;
+            cumulative += tk;
+            if (cumulative > total) revert BadHolderSet(); // padded past the real total
+        }
+
+        if (cumulative < total) {
+            // More holders to come — persist progress and wait for the next chunk.
+            s.cumulative = cumulative;
+            s.lastHolder = lastHolder;
+            s.winner = winner;
+            return 0;
+        }
+        // cumulative == total: the set is complete → finalize.
+        if (winner == address(0)) revert IncompleteHolderSet(); // unreachable; defensive
+        bytes32 randomness = s.randomness;
+
+        delete settlement[token];
         delete pendingDraw[token];
 
         draws[token].push(Draw({
@@ -380,28 +492,61 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (pd.prize > 0) {
             address prizeToken = t.rewardToken(); // 0 => WETH prize
             if (prizeToken == address(0)) {
-                weth.safeTransfer(winner, pd.prize);
+                weth.safeTransfer(winner, pd.prize); // WETH: no receiver hook, can't wedge
+                prizePaid = pd.prize;
             } else {
-                uint256 bought = _buyAsset(token, prizeToken, pd.prize);
-                if (bought < minPrizeOut) revert Slippage();
-                IERC20(prizeToken).safeTransfer(winner, bought);
+                // Token prize: buy + send via a self-call wrapped in try/catch so a broken
+                // venue, a sandwich past minPrizeOut, or an un-receivable winner can't wedge
+                // this (now un-cancelable) draw (audit L-03) — fall back to paying the WETH pot.
+                try this.swapAndSendPrize(token, prizeToken, winner, pd.prize, minPrizeOut) returns (uint256 bought) {
+                    prizePaid = bought;
+                } catch {
+                    weth.safeTransfer(winner, pd.prize);
+                    prizePaid = pd.prize;
+                }
             }
         }
 
         emit DrawSettled(token, draws[token].length - 1, pd.epoch, winner, pd.prize, randomness, winningTicket);
     }
 
-    /// @notice Emergency recovery: abandon a committed draw whose beacon can't be
-    /// settled (e.g. a bad committed round). Returns the reserved pot to `pendingWeth`
-    /// so it rolls into the next draw. The already-closed session is not reopened —
-    /// its tickets stay reset — so use only when a draw is genuinely stuck.
+    /// @dev Self-only helper (so it can be `try`/`catch`ed from settleDraw): swap the pot
+    /// to the prize token and send it to the winner. Reverts on slippage / bad venue /
+    /// un-receivable winner, which settleDraw catches and pays out in WETH instead.
+    function swapAndSendPrize(address token, address prizeToken, address winner, uint256 potWeth, uint256 minPrizeOut)
+        external
+        returns (uint256 bought)
+    {
+        if (msg.sender != address(this)) revert NotAuthorized();
+        bought = _buyAsset(token, prizeToken, potWeth);
+        if (bought < minPrizeOut) revert Slippage();
+        IERC20(prizeToken).safeTransfer(winner, bought);
+    }
+
+    /// @notice Emergency recovery: abandon a committed draw whose round is bad (e.g. one
+    /// so far in the future it'll never settle). Returns the reserved pot to `pendingWeth`.
+    /// **Only callable BEFORE the committed round's beacon is produced** (audit M-02):
+    /// once the beacon exists the outcome is determined, so the operator must settle to
+    /// the deterministic winner and cannot cancel to veto/resample an unfavorable result.
     function cancelDraw(address token) external {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         PendingDraw memory pd = pendingDraw[token];
         if (!pd.active) revert NoDraw();
+        // beacon production time = genesis + (round-1)*period; reject once it has passed.
+        if (block.timestamp >= DRAND_GENESIS + (pd.round - 1) * DRAND_PERIOD) revert BeaconAlreadyProduced();
         delete pendingDraw[token];
+        delete settlement[token]; // drop any in-progress paginated settle
         pendingWeth[token] += pd.prize;
         emit DrawCanceled(token, pd.epoch, pd.prize);
+    }
+
+    /// @notice Discard an in-progress paginated settlement so it can be restarted from
+    /// the first chunk — recovery if a chunk was submitted out of order (e.g. a holder
+    /// was skipped, leaving the running total unable to reach `totalTickets`). The draw
+    /// itself stays committed; only the partial progress is cleared.
+    function resetSettlement(address token) external {
+        if (msg.sender != drawOperator) revert OnlyDrawOperator();
+        delete settlement[token];
     }
 
     /// @dev Buy `asset` with `wethIn` on the token's registered buyback venue (V3

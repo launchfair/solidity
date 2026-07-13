@@ -83,6 +83,10 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
 
     mapping(address token => LaunchInfo) internal _launches;
 
+    /// @dev The pool authorized to invoke `uniswapV3SwapCallback` — set only for the
+    /// duration of an in-progress dev-buy swap, `address(0)` otherwise (audit M-03).
+    address private _devBuyPool;
+
     event TokenLaunched(
         address indexed token,
         address indexed creator,
@@ -305,19 +309,26 @@ contract V3Launchpad is Ownable, ReentrancyGuard {
     function _devBuy(address token, address pool, bool tokenIsToken0, uint256 wethIn, uint256 minTokensOut) internal {
         IWETH(weth).deposit{value: wethIn}();
         bool zeroForOne = !tokenIsToken0; // WETH is the input asset
+        _devBuyPool = pool; // authorize the callback for exactly this swap (audit M-03)
         (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
             msg.sender, zeroForOne, int256(wethIn), zeroForOne ? MIN_SQRT : MAX_SQRT, abi.encode(token)
         );
+        _devBuyPool = address(0);
         uint256 tokensOut = uint256(-(tokenIsToken0 ? amount0 : amount1));
         if (tokensOut < minTokensOut) revert DevBuyTooLittle();
+        // Refund WETH the pool didn't consume — a large dev buy can partial-fill the
+        // single-sided range, leaving unspent WETH stuck otherwise (audit L-05).
+        uint256 leftover = IERC20(weth).balanceOf(address(this));
+        if (leftover > 0) IERC20(weth).safeTransfer(msg.sender, leftover);
         emit DevBought(token, msg.sender, wethIn, tokensOut);
     }
 
-    /// @notice Uniswap V3 swap callback — pays the WETH owed for a dev buy. Only
-    /// the token's canonical pool can invoke it (prevents spoofed calls).
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        address token = abi.decode(data, (address));
-        if (msg.sender != factory.getPool(token, weth, feeTier)) revert OnlyPool();
+    /// @notice Uniswap V3 swap callback — pays the WETH owed for the in-progress dev buy.
+    /// Authorized against `_devBuyPool` (set only for the duration of our own swap), NOT
+    /// against a `data`-derived pool: trusting `data` let anyone with a (token,weth) pool
+    /// spoof this and drain any WETH the launchpad held (audit M-03).
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        if (msg.sender != _devBuyPool) revert OnlyPool();
         if (amount0Delta > 0) IERC20(weth).safeTransfer(msg.sender, uint256(amount0Delta));
         if (amount1Delta > 0) IERC20(weth).safeTransfer(msg.sender, uint256(amount1Delta));
     }

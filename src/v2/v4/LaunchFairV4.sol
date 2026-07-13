@@ -168,6 +168,16 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         {
             revert InvalidRewardPool();
         }
+        // For a V4 reward/prize, the pool key must actually pair WETH with the reward
+        // token (audit L-02) — symmetric with the V3 check. Otherwise the distributor's
+        // swap would create an unsettleable non-WETH debt (or route to a rigged pool).
+        if (rewardToken != address(0) && !p.rewardIsV3) {
+            address rc0 = Currency.unwrap(p.rewardPoolKey.currency0);
+            address rc1 = Currency.unwrap(p.rewardPoolKey.currency1);
+            if (!((rc0 == weth && rc1 == rewardToken) || (rc0 == rewardToken && rc1 == weth))) {
+                revert InvalidRewardPool();
+            }
+        }
 
         token = deployer.deploy(
             TokenDeployerV2.Params({

@@ -2,108 +2,72 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {LaunchFairVRFCoordinator, IRandomnessConsumer} from "../../src/v2/v4/LaunchFairVRFCoordinator.sol";
+import {LaunchFairVRFCoordinator} from "../../src/v2/v4/LaunchFairVRFCoordinator.sol";
 
-/// @notice A consumer that records its last push. `boom` makes it revert, to test
-/// that one bad consumer can't block the fan-out.
-contract MockConsumer is IRandomnessConsumer {
-    uint256 public lastRequestId;
-    bytes32 public lastRandomness;
-    uint256 public calls;
-    bool public boom;
-
-    function setBoom(bool b) external {
-        boom = b;
-    }
-
-    function request(LaunchFairVRFCoordinator vrf, uint256 round) external returns (uint256) {
-        return vrf.requestRandomness(round); // msg.sender = this consumer
-    }
-
-    function fulfillRandomness(uint256 requestId, bytes32 randomness) external {
-        require(!boom, "boom");
-        lastRequestId = requestId;
-        lastRandomness = randomness;
-        calls++;
-    }
-}
-
+/// @notice Coordinator behavior driven by a REAL drand quicknet beacon, since
+/// `postRandomness` verifies the BLS signature on-chain (EIP-2537). The local test EVM
+/// has no BLS12-381 precompiles, so these skip there; they run — and verification is
+/// exercised for real — on a chain that has EIP-2537 (Robinhood Chain does; see
+/// DrandBLS.t.sol and the live-RPC validation in LAUNCHFAIR.md §7).
+///
+/// The coordinator is **pull-based** (audit H-01): posting is O(1) and stores no
+/// per-round request list, so it can't be gas-griefed; consumers read `randomnessOf`.
 contract VRFCoordinatorTest is Test {
     LaunchFairVRFCoordinator vrf;
 
+    // Real quicknet beacon, round 30364827. Signature as an EIP-2537 uncompressed G1
+    // point (128 bytes). The coordinator stores keccak256(signature) as the randomness.
+    uint256 constant ROUND = 30_364_827;
+    bytes constant SIG =
+        hex"000000000000000000000000000000000f25e09fd32971105ebf2f62b39acaf45f50b21851571dc64116500bfa2fe1e3fd206f6a951a2ab54aa3386cde3ad99b"
+        hex"000000000000000000000000000000000f8643dd4077b49b43bb7f6de0b1bd0f957e9284f4ddffe91581f6ccce09f2557ea810264158b56938c3069bc7a36f6d";
+
     function setUp() public {
-        vrf = new LaunchFairVRFCoordinator(address(this), address(this)); // owner + poster = this
+        vrf = new LaunchFairVRFCoordinator();
     }
 
-    function test_requestAndPost_pushesToConsumer() public {
-        MockConsumer c = new MockConsumer();
-        uint256 id = c.request(vrf, 100);
-        assertEq(id, 1, "first request id");
-
-        vrf.postRandomness(100, keccak256("r"));
-        assertEq(vrf.randomnessOf(100), keccak256("r"), "stored for pull");
-        assertEq(c.calls(), 1, "pushed once");
-        assertEq(c.lastRequestId(), id, "request id delivered");
-        assertEq(c.lastRandomness(), keccak256("r"), "randomness delivered");
+    function _blsAvailable() internal view returns (bool) {
+        (bool ok, bytes memory out) = address(0x0f).staticcall(new bytes(384));
+        return ok && out.length == 32;
     }
 
-    function test_fansOutToEveryConsumerOnTheRound() public {
-        MockConsumer a = new MockConsumer();
-        MockConsumer b = new MockConsumer();
-        a.request(vrf, 200);
-        b.request(vrf, 200);
-        vrf.postRandomness(200, keccak256("x"));
-        assertEq(a.calls(), 1, "a fulfilled");
-        assertEq(b.calls(), 1, "b fulfilled");
+    modifier requiresBls() {
+        if (!_blsAvailable()) {
+            vm.skip(true);
+            return;
+        }
+        _;
     }
 
-    function test_onlyPosterCanPost() public {
-        MockConsumer c = new MockConsumer();
-        c.request(vrf, 1);
-        vm.prank(address(0xBEEF));
-        vm.expectRevert(LaunchFairVRFCoordinator.OnlyPoster.selector);
-        vrf.postRandomness(1, keccak256("r"));
+    // requestRandomness is O(1): returns an incrementing id and emits, stores no list.
+    function test_requestRandomnessReturnsIds() public {
+        assertEq(vrf.requestRandomness(ROUND), 1, "first id");
+        assertEq(vrf.requestRandomness(ROUND), 2, "second id");
+        assertEq(vrf.nextRequestId(), 3, "counter advanced");
     }
 
-    function test_doublePostReverts() public {
-        vrf.postRandomness(1, keccak256("r"));
-        vm.expectRevert(LaunchFairVRFCoordinator.AlreadyPosted.selector);
-        vrf.postRandomness(1, keccak256("r2"));
+    function test_postStoresVerifiedRandomness() public requiresBls {
+        vrf.postRandomness(ROUND, SIG);
+        assertEq(vrf.randomnessOf(ROUND), keccak256(SIG), "stored = keccak256(sig)");
     }
 
-    function test_zeroRandomnessReverts() public {
+    // Verification replaces poster trust: ANYONE can bring the real beacon on-chain.
+    function test_postIsPermissionless() public requiresBls {
+        vm.prank(address(0xBEEF)); // no privileged role exists
+        vrf.postRandomness(ROUND, SIG);
+        assertEq(vrf.randomnessOf(ROUND), keccak256(SIG));
+    }
+
+    // A well-formed signature that isn't the real beacon for `round` is rejected.
+    function test_wrongSignatureReverts() public requiresBls {
+        // The real sig for ROUND, posted for the WRONG round: valid G1 point, wrong beacon.
         vm.expectRevert(LaunchFairVRFCoordinator.BadRandomness.selector);
-        vrf.postRandomness(1, bytes32(0));
+        vrf.postRandomness(ROUND + 1, SIG);
     }
 
-    // A consumer that requests AFTER the round was posted is fulfilled inline.
-    function test_lateRequestFulfilledInline() public {
-        vrf.postRandomness(300, keccak256("y")); // posted with no consumers yet
-        MockConsumer c = new MockConsumer();
-        c.request(vrf, 300);
-        assertEq(c.calls(), 1, "late request fulfilled on request");
-        assertEq(c.lastRandomness(), keccak256("y"));
-    }
-
-    // A reverting consumer is isolated: the others still get pushed, and the value
-    // remains readable via randomnessOf (the pull recovery path).
-    function test_revertingConsumerIsolated() public {
-        MockConsumer bad = new MockConsumer();
-        MockConsumer good = new MockConsumer();
-        bad.request(vrf, 400);
-        good.request(vrf, 400);
-        bad.setBoom(true);
-
-        vrf.postRandomness(400, keccak256("z"));
-        assertEq(good.calls(), 1, "good consumer still fulfilled");
-        assertEq(bad.calls(), 0, "bad consumer reverted, caught");
-        assertEq(vrf.randomnessOf(400), keccak256("z"), "value stored for the bad one to pull");
-    }
-
-    function test_setPoster() public {
-        vrf.setPoster(address(0xCAFE));
-        assertEq(vrf.poster(), address(0xCAFE), "poster rotated");
-        vm.expectRevert(LaunchFairVRFCoordinator.OnlyPoster.selector);
-        vrf.postRandomness(1, keccak256("r")); // old poster (this) can't post anymore
+    function test_doublePostReverts() public requiresBls {
+        vrf.postRandomness(ROUND, SIG);
+        vm.expectRevert(LaunchFairVRFCoordinator.AlreadyPosted.selector);
+        vrf.postRandomness(ROUND, SIG);
     }
 }
