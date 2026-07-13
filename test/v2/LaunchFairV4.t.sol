@@ -87,7 +87,7 @@ contract LaunchFairV4Test is Test, Deployers {
         );
         pad = new LaunchFairV4(
             address(this), manager, IUniswapV3Factory(address(v3factory)), locker, address(dist), tokenDeployer,
-            address(weth), SUPPLY, 1e18, int24(200), int24(200), int24(60_000), 0, 0, "https://hood.launchfair.app"
+            address(weth), SUPPLY, 1491146318, int24(200), int24(-203200), int24(-143400), 0, 0, "https://hood.launchfair.app"
         );
 
         vrf = new MockVRFCoordinator();
@@ -175,7 +175,7 @@ contract LaunchFairV4Test is Test, Deployers {
         assertEq(pad.creatorOf(token), address(this), "creator recorded");
 
         // A buyer becomes a holder (buys token, receives it here) + generates WETH fee.
-        _buy(key, token, 50_000 ether);
+        _buy(key, token, 0.1 ether);
         // Move the freshly-bought tokens to HOLDER so there's a real dividend holder.
         uint256 bought = IERC20(token).balanceOf(address(this));
         assertGt(bought, 0, "bought token");
@@ -235,7 +235,7 @@ contract LaunchFairV4Test is Test, Deployers {
         assertEq(dist.buybackVenue(token, address(reward)), 1, "wired to a V3 buyback");
 
         PoolKey memory key = pad.getLaunch(token).key;
-        _buy(key, token, 50_000 ether);
+        _buy(key, token, 0.1 ether);
         IERC20(token).transfer(HOLDER, IERC20(token).balanceOf(address(this)));
 
         locker.claim(token);
@@ -296,7 +296,7 @@ contract LaunchFairV4Test is Test, Deployers {
         assertEq(dist.buybackVenue(token, address(rewardB)), 1, "B on V3");
 
         PoolKey memory key = pad.getLaunch(token).key;
-        _buy(key, token, 50_000 ether);
+        _buy(key, token, 0.1 ether);
         IERC20(token).transfer(HOLDER, IERC20(token).balanceOf(address(this)));
 
         locker.claim(token);
@@ -444,7 +444,7 @@ contract LaunchFairV4Test is Test, Deployers {
         assertEq(LaunchTokenV2(token).lotteryOperator(), address(dist), "distributor is operator");
 
         // Holdings are tickets: buying gives this buyer a balance -> proportional tickets.
-        _buy(key, token, 50_000 ether);
+        _buy(key, token, 0.1 ether);
         uint256 epoch = LaunchTokenV2(token).lotteryEpoch();
         uint256 myTickets = LaunchTokenV2(token).balanceOf(address(this));
         assertGt(myTickets, 0, "holdings earn tickets");
@@ -507,7 +507,7 @@ contract LaunchFairV4Test is Test, Deployers {
 
         PoolKey memory key = pad.getLaunch(token).key;
         dist.setDrawOperator(address(this));
-        _buy(key, token, 50_000 ether); // this session earns all tickets
+        _buy(key, token, 0.1 ether); // this session earns all tickets
         uint256 epoch = LaunchTokenV2(token).lotteryEpoch();
 
         locker.claim(token);

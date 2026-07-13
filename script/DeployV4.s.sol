@@ -37,11 +37,14 @@ import {IUniswapV3Factory, IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol
 /// is chain-agnostic; the tick math is not.
 contract DeployV4 is Script {
     // ── pool shape (VERIFY before a real broadcast) ──────────────────────────────
+    // Matches the V3 launchpad's economics: ~1.49e-9 WETH/token launch price → ~1.5 WETH
+    // launch mcap. The EFFECTIVE launch price is set by the liquidity range bottom
+    // (TICK_LOWER0), not INITIAL_PRICE — INITIAL_PRICE just starts the pool at/below it.
     uint128 constant TOTAL_SUPPLY = 1_000_000_000 ether;
-    uint256 constant INITIAL_PRICE = 1e18; // WETH wei per whole token at launch
+    uint256 constant INITIAL_PRICE = 1491146318; // WETH wei per whole token at launch (~1.49e-9)
     int24 constant TICK_SPACING = 200;
-    int24 constant TICK_LOWER0 = 200; // single-sided range start (token == currency0)
-    int24 constant TICK_UPPER0 = 60_000; // single-sided range end
+    int24 constant TICK_LOWER0 = -203200; // single-sided range start (token == currency0): price ~1.49e-9
+    int24 constant TICK_UPPER0 = -143400; // single-sided range end (~395x above launch)
     uint16 constant MAX_BUY_BPS = 200; // 2% wallet cap during the launch window…
     uint32 constant MAX_BUY_BLOCKS = 100; // …for the first 100 L1 blocks (0 = off); owner-tunable post-deploy
 
