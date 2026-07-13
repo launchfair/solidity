@@ -47,8 +47,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     int24 public immutable tickSpacing;
     int24 public immutable tickLower0; // single-sided range when token == currency0
     int24 public immutable tickUpper0;
-    uint16 public immutable maxBuyBps;
-    uint32 public immutable maxBuyBlocks;
+    // Anti-snipe launch guard applied to each new token: a `maxBuyBps` wallet cap for
+    // the first `maxBuyBlocks` L1 blocks. Owner-settable so the window can be tuned
+    // without redeploying (affects tokens created after the change).
+    uint16 public maxBuyBps;
+    uint32 public maxBuyBlocks;
 
     string public officialWebsite;
     uint256 public creationFeeWei = 0.000005 ether;
@@ -100,6 +103,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     event CreationFeePaid(address indexed creator, address indexed token, uint256 fee);
     event OfficialWebsiteSet(string website);
     event CreationFeeSet(uint256 weiAmount);
+    event AntiSnipeSet(uint16 maxBuyBps, uint32 maxBuyBlocks);
 
     error ZeroAddress();
     error InvalidFee();
@@ -337,6 +341,15 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         if (weiAmount > MAX_CREATION_FEE_WEI) revert InsufficientCreationFee();
         creationFeeWei = weiAmount;
         emit CreationFeeSet(weiAmount);
+    }
+
+    /// @notice Tune the anti-snipe launch guard for FUTURE tokens: a `bps` wallet cap
+    /// for the first `blocks` L1 blocks after launch (either 0 disables that part).
+    function setAntiSnipe(uint16 bps, uint32 blocks) external onlyOwner {
+        if (bps > 10_000) revert InvalidFee();
+        maxBuyBps = bps;
+        maxBuyBlocks = blocks;
+        emit AntiSnipeSet(bps, blocks);
     }
 
     // ── internals ──────────────────────────────────────────────────────────────

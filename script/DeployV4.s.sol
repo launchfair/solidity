@@ -43,7 +43,7 @@ contract DeployV4 is Script {
     int24 constant TICK_LOWER0 = 200; // single-sided range start (token == currency0)
     int24 constant TICK_UPPER0 = 60_000; // single-sided range end
     uint16 constant MAX_BUY_BPS = 200; // 2% wallet cap during the launch window…
-    uint32 constant MAX_BUY_BLOCKS = 360; // …for the first 360 blocks (0 = off)
+    uint32 constant MAX_BUY_BLOCKS = 100; // …for the first 100 L1 blocks (0 = off); owner-tunable post-deploy
 
     // Known Robinhood Chain mainnet addresses (override via env for other envs).
     address constant DEFAULT_POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
