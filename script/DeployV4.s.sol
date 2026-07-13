@@ -54,6 +54,9 @@ contract DeployV4 is Script {
     address constant DEFAULT_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
     address constant DEFAULT_V3_ROUTER = 0xCaf681a66D020601342297493863E78C959E5cb2;
     address constant DEFAULT_TREASURY = 0x82C8f63D0E578bA3d800BA5d48F8e9dD2a009Af3;
+    // The standalone LaunchFairV4SwapRouter (stateless, reused across redeploys) — used by
+    // createAndBuy for the atomic dev buy.
+    address constant DEFAULT_V4_SWAP_ROUTER = 0x0e6c53664388B68F6b41851D224248F391CC8947;
 
     function run() external {
         uint256 pk = vm.envUint("PRIVATE_KEY");
@@ -116,6 +119,7 @@ contract DeployV4 is Script {
         dist.setVrf(address(vrf));
         dist.setDrawOperator(keeper); // keeper commits/settles lottery draws
         dist.setProcessor(keeper, true); // keeper may fire buybacks with a quoted minOut (M-02)
+        pad.setSwapRouter(vm.envOr("V4_SWAP_ROUTER", DEFAULT_V4_SWAP_ROUTER)); // atomic dev buy
 
         vm.stopBroadcast();
 

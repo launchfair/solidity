@@ -16,6 +16,7 @@ import {TokenDeployerV2} from "../../src/v2/TokenDeployerV2.sol";
 import {LaunchFairV4} from "../../src/v2/v4/LaunchFairV4.sol";
 import {LaunchFairV4FeeLocker} from "../../src/v2/v4/LaunchFairV4FeeLocker.sol";
 import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.sol";
+import {LaunchFairV4SwapRouter, IWETH} from "../../src/v2/v4/LaunchFairV4SwapRouter.sol";
 import {MockVRFCoordinator} from "./MockVRF.sol";
 import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
 
@@ -23,6 +24,18 @@ contract MockWethT is ERC20 {
     constructor() ERC20("WETH", "WETH") {}
     function mint(address to, uint256 a) external {
         _mint(to, a);
+    }
+    // WETH9-style wrap/unwrap so the swap router can round-trip native ETH in createAndBuy tests.
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+    function withdraw(uint256 a) external {
+        _burn(msg.sender, a);
+        (bool ok,) = msg.sender.call{value: a}("");
+        require(ok, "weth withdraw");
+    }
+    receive() external payable {
+        _mint(msg.sender, msg.value);
     }
 }
 
@@ -49,10 +62,10 @@ contract MockV3FactoryT {
 /// (a mintable MockWethT) to the recipient.
 contract MockV3RouterT {
     function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external returns (uint256 out) {
-        MockWethT(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        MockWethT(payable(p.tokenIn)).transferFrom(msg.sender, address(this), p.amountIn);
         out = p.amountIn * 2;
         require(out >= p.amountOutMinimum, "slip");
-        MockWethT(p.tokenOut).mint(p.recipient, out);
+        MockWethT(payable(p.tokenOut)).mint(p.recipient, out);
     }
 }
 
@@ -67,6 +80,7 @@ contract LaunchFairV4Test is Test, Deployers {
     LaunchFairV4FeeLocker locker;
     LaunchFairV4Distributor dist;
     MockVRFCoordinator vrf;
+    LaunchFairV4SwapRouter v4Router;
     LaunchFairV4 pad;
 
     address constant TREASURY = address(0x7EA);
@@ -91,13 +105,15 @@ contract LaunchFairV4Test is Test, Deployers {
         );
 
         vrf = new MockVRFCoordinator();
+        v4Router = new LaunchFairV4SwapRouter(manager, IWETH(address(weth)));
         locker.setLaunchpad(address(pad));
         locker.setDistributor(address(dist));
         dist.setLocker(address(locker));
         dist.setRegistrar(address(pad));
         dist.setVrf(address(vrf));
+        pad.setSwapRouter(address(v4Router)); // wire the router for createAndBuy
 
-        vm.deal(address(this), 1 ether);
+        vm.deal(address(this), 10 ether);
     }
 
     function _createRedistribute() internal returns (address token, PoolKey memory key) {
@@ -545,5 +561,53 @@ contract LaunchFairV4Test is Test, Deployers {
             );
         }
         assertEq(dist.drawCount(token), 1, "draw recorded");
+    }
+
+    // createAndBuy: the creator gets a bag in the SAME tx as the launch — atomic, no front-run gap.
+    function test_createAndBuy_devGetsTokensAtomically() public {
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        uint256 fee = pad.creationFeeWei();
+        uint256 buyAmount = 0.05 ether;
+        uint256 treBefore = TREASURY.balance;
+
+        address token = pad.createAndBuy{value: fee + buyAmount}(
+            LaunchFairV4.CreateParams({
+                name: "Red", symbol: "RED", metadata: meta, salt: bytes32(uint256(77)),
+                mode: LaunchTokenV2.Mode.Increasing, fee: 30_000, rewards: _noRewards(),
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+            }),
+            0 // minTokensOut
+        );
+
+        assertTrue(pad.getLaunch(token).exists, "launched");
+        assertEq(pad.creatorOf(token), address(this), "creator recorded");
+        assertGt(LaunchTokenV2(token).balanceOf(address(this)), 0, "dev bought a bag in the same tx");
+        assertEq(TREASURY.balance - treBefore, fee, "creation fee paid to treasury");
+    }
+
+    // createAndBuy with a zero buy behaves like createToken: token created, no dev bag.
+    function test_createAndBuy_zeroBuy_justCreates() public {
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        address token = pad.createAndBuy{value: pad.creationFeeWei()}(
+            LaunchFairV4.CreateParams({
+                name: "Red", symbol: "RED", metadata: meta, salt: bytes32(uint256(78)),
+                mode: LaunchTokenV2.Mode.Increasing, fee: 30_000, rewards: _noRewards(),
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+                minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+            }),
+            0
+        );
+        assertTrue(pad.getLaunch(token).exists, "launched");
+        assertEq(LaunchTokenV2(token).balanceOf(address(this)), 0, "no dev bag on a zero buy");
+    }
+
+    // The swap router is set once, owner-only.
+    function test_setSwapRouter_setOnce() public {
+        // Already set in setUp → a second set reverts.
+        vm.expectRevert(LaunchFairV4.AlreadySet.selector);
+        pad.setSwapRouter(address(0xBEEF));
     }
 }

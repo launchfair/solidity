@@ -33,6 +33,14 @@ interface IDistributorV4Register {
     function setLotteryOdds(address token, uint16 missBps, uint16 jackpotBps, uint16 regularShareBps) external;
 }
 
+/// LaunchFairV4SwapRouter.buy — used by createAndBuy for an atomic, front-run-proof dev buy.
+interface ILaunchFairV4SwapRouter {
+    function buy(PoolKey calldata key, uint256 minOut, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256 out);
+}
+
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -58,6 +66,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     uint256 public creationFeeWei = 0.000005 ether;
     uint256 public constant MAX_CREATION_FEE_WEI = 0.001 ether;
     uint8 public constant MAX_REWARDS = 5; // parallel reward assets (matches LaunchTokenV2)
+    /// @notice The V4 swap router used by createAndBuy for the atomic dev buy. Set once by
+    /// the owner at deploy (kept off the constructor to avoid a 16-arg signature).
+    address public swapRouter;
 
     struct Launch {
         address creator;
@@ -113,6 +124,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     event OfficialWebsiteSet(string website);
     event CreationFeeSet(uint256 weiAmount);
     event AntiSnipeSet(uint16 maxBuyBps, uint32 maxBuyBlocks);
+    event SwapRouterSet(address router);
 
     error ZeroAddress();
     error InvalidFee();
@@ -124,6 +136,8 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     error InsufficientCreationFee();
     error CreationFeeTransferFailed();
     error UnknownToken();
+    error SwapRouterNotSet();
+    error AlreadySet();
 
     constructor(
         address owner_,
@@ -164,6 +178,61 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
     function createToken(CreateParams calldata p) external payable nonReentrant returns (address token) {
         if (msg.value < creationFeeWei) revert InsufficientCreationFee();
+        token = _create(p);
+        _payCreationFee(token);
+        uint256 refund = msg.value - creationFeeWei; // no dev buy → refund any excess
+        if (refund > 0) {
+            (bool okR,) = msg.sender.call{value: refund}("");
+            if (!okR) revert CreationFeeTransferFailed();
+        }
+    }
+
+    /// @notice Create a mode token AND buy some in the SAME transaction — an atomic, front-run-proof
+    /// dev buy. `msg.value` = creationFeeWei + the buy amount; the bought tokens go straight to the
+    /// creator, respecting the launch-window wallet cap. If the buy would breach the cap (or otherwise
+    /// fails), the token is still created and the buy amount is refunded. `minTokensOut` guards the swap.
+    function createAndBuy(CreateParams calldata p, uint256 minTokensOut)
+        external
+        payable
+        nonReentrant
+        returns (address token)
+    {
+        if (msg.value < creationFeeWei) revert InsufficientCreationFee();
+        if (swapRouter == address(0)) revert SwapRouterNotSet();
+        token = _create(p);
+        _payCreationFee(token);
+        uint256 buyAmount = msg.value - creationFeeWei;
+        if (buyAmount > 0) {
+            try ILaunchFairV4SwapRouter(swapRouter).buy{value: buyAmount}(
+                _launches[token].key, minTokensOut, msg.sender, block.timestamp
+            ) {
+                // A partial fill refunds unspent ETH to us (the caller) — forward any leftover on.
+                uint256 leftover = address(this).balance;
+                if (leftover > 0) {
+                    (bool okL,) = msg.sender.call{value: leftover}("");
+                    if (!okL) revert CreationFeeTransferFailed();
+                }
+            } catch {
+                // Buy failed (e.g. exceeds the launch cap) — the token is live; refund the buy.
+                (bool okB,) = msg.sender.call{value: buyAmount}("");
+                if (!okB) revert CreationFeeTransferFailed();
+            }
+        }
+    }
+
+    /// @dev Pay the creation fee to the treasury.
+    function _payCreationFee(address token) internal {
+        uint256 fee = creationFeeWei;
+        if (fee > 0) {
+            (bool ok,) = locker.treasury().call{value: fee}("");
+            if (!ok) revert CreationFeeTransferFailed();
+            emit CreationFeePaid(msg.sender, token, fee);
+        }
+    }
+
+    /// @dev Core creation: validate, deploy, launch on V4, emit. No `msg.value` handling — the
+    /// public wrappers (createToken / createAndBuy) pay the fee and refund or dev-buy the rest.
+    function _create(CreateParams calldata p) internal returns (address token) {
         if (!(p.fee == 30_000 || p.fee == 50_000 || p.fee == 100_000)) revert InvalidFee();
         if (p.mode == LaunchTokenV2.Mode.Base) revert InvalidMode(); // Base stays on V1/V3
         _validate(p.name);
@@ -230,19 +299,6 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         );
 
         _launchOnV4(token, p, prizeToken);
-
-        // Creation fee -> treasury; refund the rest.
-        uint256 fee = creationFeeWei;
-        if (fee > 0) {
-            (bool ok,) = locker.treasury().call{value: fee}("");
-            if (!ok) revert CreationFeeTransferFailed();
-            emit CreationFeePaid(msg.sender, token, fee);
-        }
-        uint256 refund = msg.value - fee;
-        if (refund > 0) {
-            (bool okR,) = msg.sender.call{value: refund}("");
-            if (!okR) revert CreationFeeTransferFailed();
-        }
 
         // Representative reward asset for the event/indexer: the first reward token
         // (Reward), the prize token (Lottery), or 0 (Redistribute). The full reward
@@ -356,6 +412,14 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         if (weiAmount > MAX_CREATION_FEE_WEI) revert InsufficientCreationFee();
         creationFeeWei = weiAmount;
         emit CreationFeeSet(weiAmount);
+    }
+
+    /// @notice Set the V4 swap router used by createAndBuy (set once, at deploy).
+    function setSwapRouter(address r) external onlyOwner {
+        if (r == address(0)) revert ZeroAddress();
+        if (swapRouter != address(0)) revert AlreadySet();
+        swapRouter = r;
+        emit SwapRouterSet(r);
     }
 
     /// @notice Tune the anti-snipe launch guard for FUTURE tokens: a `bps` wallet cap
