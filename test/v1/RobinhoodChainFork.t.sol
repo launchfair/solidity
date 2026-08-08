@@ -5,10 +5,10 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {V3Launchpad} from "../src/V3Launchpad.sol";
-import {FeeLocker} from "../src/FeeLocker.sol";
-import {LaunchToken} from "../src/LaunchToken.sol";
-import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
+import {V3Launchpad} from "../../src/v1/V3Launchpad.sol";
+import {FeeLocker} from "../../src/v1/FeeLocker.sol";
+import {LaunchToken} from "../../src/v1/LaunchToken.sol";
+import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager} from "../../src/interfaces/IUniswapV3.sol";
 
 interface IPoolTrade {
     function token0() external view returns (address);
@@ -207,11 +207,13 @@ contract RobinhoodChainForkTest is Test {
         assertGt(wethBack, 0);
         assertTrue(pad.getLaunch(token).graduated);
 
-        // Claim real collected fees: WETH split 50/50, token side burned.
+        // Claim real collected fees: WETH split 25 treasury / 25 dev / 50 flagship;
+        // with no flagshipSink set the 50% folds into treasury, so treasury = 3x dev.
         uint256 supplyBefore = IERC20(token).totalSupply();
-        (uint256 toTreasury, uint256 toDev, uint256 burned) = locker.claim(token);
-        assertGt(toTreasury, 0, "treasury WETH share");
-        assertApproxEqAbs(toDev, toTreasury, 1, "50/50 split");
+        (uint256 toTreasury, uint256 toDev, uint256 toFlagship, uint256 burned) = locker.claim(token);
+        assertGt(toDev, 0, "dev WETH share");
+        assertEq(toFlagship, 0, "flagship folds into treasury until sink set");
+        assertApproxEqAbs(toTreasury, toDev * 3, 3, "25 dev / 75 treasury (flagship folded)");
         assertGt(burned, 0, "token-side fees burned");
         assertEq(IERC20(token).totalSupply(), supplyBefore - burned);
         assertEq(wethBal(creator), toDev, "dev got only WETH");

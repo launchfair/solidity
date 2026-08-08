@@ -24,10 +24,12 @@ import {TokenDeployerV2} from "../TokenDeployerV2.sol";
 import {LaunchFairV4FeeLocker} from "./LaunchFairV4FeeLocker.sol";
 import {LiquidityMath} from "./LiquidityMath.sol";
 import {IUniswapV3Factory} from "../../interfaces/IUniswapV3.sol";
+import {IPerpsVenue} from "./IPerpsVenue.sol";
 
 interface IDistributorV4Register {
     function registerBuyback(address token, address asset, PoolKey calldata key) external;
     function registerBuybackV3(address token, address asset, uint24 fee) external;
+    function registerPerps(address token, address venue) external;
     function setPayoutThreshold(address token, uint256 amount) external;
     function setPayoutInterval(address token, uint256 intervalBlocks) external;
     function setLotteryOdds(address token, uint16 missBps, uint16 jackpotBps, uint16 regularShareBps) external;
@@ -64,6 +66,17 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
     string public officialWebsite;
     uint256 public creationFeeWei = 0.000005 ether;
+    /// @notice Optional WETH fee hook. When set (a properly-mined hook address), NEW pools launch
+    /// with this hook and a 0 LP fee — the hook charges the fee in WETH on both buys and sells (no
+    /// sell pressure). Unset (0) => today's model (no hook, pool LP fee, locker-collected).
+    address public feeHook;
+    event FeeHookSet(address feeHook);
+    /// @notice The stock-perp venue for Mode.Perps tokens (resolves each leg's position token at
+    /// launch). Must match the distributor's `perpsVenue`. Owner-settable; 0 => Perps launches revert.
+    address public perpsVenue;
+    event PerpsVenueSet(address perpsVenue);
+    /// @notice Mode-enforced ceiling on a Perps leg's leverage (bps). 50000 = 5x.
+    uint16 public constant MAX_LEVERAGE_BPS = 50_000;
     uint256 public constant MAX_CREATION_FEE_WEI = 0.001 ether;
     uint8 public constant MAX_REWARDS = 5; // parallel reward assets (matches LaunchTokenV2)
     /// @notice The V4 swap router used by createAndBuy for the atomic dev buy. Set once by
@@ -88,6 +101,15 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         PoolKey v4Key; // V4: the pool to buy the asset on
     }
 
+    /// @notice One leveraged stock-perp leg (Mode.Perps). Resolves to a venue position token that
+    /// holders receive as a reward; the dev picks market/side/leverage + this leg's fee weight.
+    struct PerpLeg {
+        bytes32 market; // venue stock market id (e.g. keccak256("AAPL"))
+        bool isLong; // long or short
+        uint16 leverageBps; // e.g. 30000 = 3x, capped by MAX_LEVERAGE_BPS
+        uint16 weightBps; // this leg's share of the fee (Σ over legs == 10000)
+    }
+
     struct CreateParams {
         string name;
         string symbol;
@@ -97,6 +119,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         uint24 fee; // 30000 / 50000 / 100000
         // Reward mode: 1..5 reward assets, each with a fee weight (sum 10000) + venue.
         RewardVenue[] rewards;
+        // Perps mode: 1..5 leveraged stock legs (Σ weight == 10000). Each resolves to a venue
+        // position token that holders receive + can hold/sell/redeem.
+        PerpLeg[] perps;
         // Lottery mode: an optional prize token (0 = WETH pot) + its buyback venue.
         address prizeToken;
         bool prizeIsV3;
@@ -234,7 +259,10 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     /// public wrappers (createToken / createAndBuy) pay the fee and refund or dev-buy the rest.
     function _create(CreateParams calldata p) internal returns (address token) {
         if (!(p.fee == 30_000 || p.fee == 50_000 || p.fee == 100_000)) revert InvalidFee();
-        if (p.mode == LaunchTokenV2.Mode.Base) revert InvalidMode(); // Base stays on V1/V3
+        // Base/plain tokens are allowed on V4 ONLY with the WETH fee hook set — the hook routes a
+        // plain token's "mechanism" fee slice to the flagship (it has no reward/lottery of its own).
+        // Without the hook their mechanism slice would strand in the distributor, so require it.
+        if (p.mode == LaunchTokenV2.Mode.Base && feeHook == address(0)) revert InvalidMode();
         _validate(p.name);
         _validate(p.symbol);
         _validate(p.metadata.logoURI);
@@ -272,6 +300,29 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 rewardTokens[i] = a;
                 rewardWeights[i] = rv.weightBps;
                 weightSum += rv.weightBps;
+            }
+            if (weightSum != 10_000) revert BadRewardConfig();
+        } else if (p.mode == LaunchTokenV2.Mode.Perps) {
+            // Perps: 1..5 leveraged stock legs. Each resolves to the venue's fungible position token,
+            // which is registered as a reward asset and distributed exactly like a Reward token.
+            if (perpsVenue == address(0)) revert InvalidMode();
+            uint256 n = p.perps.length;
+            if (n == 0 || n > MAX_REWARDS) revert BadRewardConfig();
+            rewardTokens = new address[](n);
+            rewardWeights = new uint16[](n);
+            uint256 weightSum;
+            for (uint256 i; i < n; i++) {
+                PerpLeg calldata leg = p.perps[i];
+                if (leg.weightBps == 0 || leg.leverageBps == 0 || leg.leverageBps > MAX_LEVERAGE_BPS) {
+                    revert BadRewardConfig();
+                }
+                address posTok = IPerpsVenue(perpsVenue).positionTokenFor(leg.market, leg.isLong, leg.leverageBps);
+                for (uint256 j; j < i; j++) {
+                    if (rewardTokens[j] == posTok) revert BadRewardConfig(); // duplicate leg
+                }
+                rewardTokens[i] = posTok;
+                rewardWeights[i] = leg.weightBps;
+                weightSum += leg.weightBps;
             }
             if (weightSum != 10_000) revert BadRewardConfig();
         } else if (p.mode == LaunchTokenV2.Mode.Lottery && p.prizeToken != address(0)) {
@@ -315,8 +366,16 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         (Currency c0, Currency c1) = tokenIsCurrency0
             ? (Currency.wrap(token), Currency.wrap(weth))
             : (Currency.wrap(weth), Currency.wrap(token));
-        PoolKey memory key =
-            PoolKey({currency0: c0, currency1: c1, fee: p.fee, tickSpacing: tickSpacing, hooks: IHooks(address(0))});
+        // When a WETH fee hook is configured, launch with it + a 0 LP fee (the hook IS the fee,
+        // charged in WETH both ways). Otherwise the classic LP-fee model (no hook).
+        address hook = feeHook;
+        PoolKey memory key = PoolKey({
+            currency0: c0,
+            currency1: c1,
+            fee: hook != address(0) ? uint24(0) : p.fee,
+            tickSpacing: tickSpacing,
+            hooks: IHooks(hook)
+        });
 
         poolManager.initialize(key, _sqrtPriceX96For(initialPriceWethPerToken, tokenIsCurrency0));
 
@@ -358,6 +417,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 RewardVenue calldata rv = p.rewards[i];
                 _registerVenue(token, rv.token, rv.isV3, rv.v3Fee, rv.v4Key);
             }
+        } else if (p.mode == LaunchTokenV2.Mode.Perps) {
+            // Perps: no Uniswap buyback venue — the distributor mints the position tokens via the
+            // perp venue in process(). Pin THIS launchpad's venue for the token so its payout-time
+            // and launch-time venues can never diverge.
+            IDistributorV4Register(distributor).registerPerps(token, perpsVenue);
         } else {
             // Redistribute buys back the token's own V4 pool (asset == token).
             IDistributorV4Register(distributor).registerBuyback(token, token, key);
@@ -420,6 +484,23 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         if (swapRouter != address(0)) revert AlreadySet();
         swapRouter = r;
         emit SwapRouterSet(r);
+    }
+
+    /// @notice Set the WETH fee hook for FUTURE tokens (a properly-mined hook address). Once set,
+    /// new pools launch with this hook and a 0 LP fee. Set to 0 to revert to the LP-fee model.
+    function setFeeHook(address hook) external onlyOwner {
+        feeHook = hook;
+        emit FeeHookSet(hook);
+    }
+
+    /// @notice Set the stock-perp venue for Mode.Perps launches. The venue is pinned per token at
+    /// launch (`registerPerps`), so changing this only affects FUTURE launches. Guarded so the
+    /// venue's margin token must be this stack's WETH (else process()/open would pull a token the
+    /// distributor never holds).
+    function setPerpsVenue(address venue) external onlyOwner {
+        if (venue != address(0) && IPerpsVenue(venue).marginToken() != weth) revert InvalidMode();
+        perpsVenue = venue;
+        emit PerpsVenueSet(venue);
     }
 
     /// @notice Tune the anti-snipe launch guard for FUTURE tokens: a `bps` wallet cap

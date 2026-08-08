@@ -35,7 +35,8 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         Base, // 0 — plain fair launch
         Reward, // 1 — distribute an external reward token to holders
         Increasing, // 2 — auto-compounding: distribute THIS token to holders (balance grows)
-        Lottery // 3 — holdings-weighted: odds = your balance ÷ total held; a random holder takes the pot
+        Lottery, // 3 — holdings-weighted: odds = your balance ÷ total held; a random holder takes the pot
+        Perps // 4 — distribute a leveraged stock-perp POSITION TOKEN (minted via a venue) to holders
     }
 
     struct Metadata {
@@ -176,7 +177,9 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         if (mode_ == Mode.Increasing) {
             // Auto-compound: the single asset is THIS token, 100% of the fee.
             _addRewardAsset(address(this), 10_000);
-        } else if (mode_ == Mode.Reward) {
+        } else if (mode_ == Mode.Reward || mode_ == Mode.Perps) {
+            // Perps: the reward assets ARE the venue's leveraged-position tokens (one per leg),
+            // set + funded exactly like a Reward token; the distributor mints them via the venue.
             uint256 n = rewardTokens_.length;
             if (n == 0 || n > MAX_REWARDS || rewardWeights_.length != n) revert BadRewardConfig();
             uint256 sum;
@@ -290,7 +293,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         super._update(from, to, value);
 
         // Keep dividend shares in sync (only matters for reward-bearing modes).
-        if (mode == Mode.Reward || mode == Mode.Increasing) {
+        if (mode == Mode.Reward || mode == Mode.Increasing || mode == Mode.Perps) {
             if (from != address(0)) _syncShare(from);
             if (to != address(0)) _syncShare(to);
         }

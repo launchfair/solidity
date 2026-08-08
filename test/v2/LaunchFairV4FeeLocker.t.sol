@@ -114,7 +114,7 @@ contract V4FeeLockerTest is Test, Deployers {
         _sell(500 ether); // sell pulls WETH back, token fee accrues
 
         uint256 supplyBefore = token.totalSupply();
-        (uint256 burned, uint256 t, uint256 d, uint256 mech) = locker.claim(address(token));
+        (uint256 burned, uint256 t, uint256 d, uint256 mech,) = locker.claim(address(token));
 
         // Buy-side WETH split (3% tier): treasury == dev, mechanism ~4x each side.
         assertGt(t, 0, "treasury got WETH");
@@ -127,5 +127,28 @@ contract V4FeeLockerTest is Test, Deployers {
         // Sell-side token fee burned.
         assertGt(burned, 0, "sell-side token fee burned");
         assertEq(token.totalSupply(), supplyBefore - burned, "supply reduced by the burn");
+    }
+
+    /// The flat flagship-buyback cut is carved from the DEV slice only (0.1% of the trade),
+    /// leaving treasury + mechanism untouched. Off by default (no sink) — on once a sink is set.
+    function test_claim_flagshipCutCarvedFromDevSlice() public {
+        address FLAGSHIP = address(0xF1A); // the buyback keeper wallet / sink
+        locker.setFlagshipSink(FLAGSHIP); // flagshipTradeBps defaults to 10 = 0.1% of the trade
+
+        _buy(50_000 ether);
+        _sell(500 ether);
+
+        (, uint256 t, uint256 d, uint256 mech, uint256 flag) = locker.claim(address(token));
+
+        assertGt(flag, 0, "flagship got a cut");
+        assertEq(weth.balanceOf(FLAGSHIP), flag, "flagship paid to the sink");
+        // Carved from dev ONLY: treasury == the pre-carve dev (= reduced dev + flagship cut).
+        assertEq(t, d + flag, "flagship carved from the dev slice; treasury untouched");
+        assertEq(weth.balanceOf(TREASURY), t, "treasury paid its full slice");
+        assertEq(weth.balanceOf(DEV), d, "dev paid the reduced slice");
+        // Mechanism (reward/lottery buyback) is never reduced.
+        assertEq(dist.pendingWeth(address(token)), mech, "mechanism untouched, routed to distributor");
+        // 0.1% of the trade @ the 3% tier == ~20% of the (16.67%) dev slice.
+        assertApproxEqRel(flag, t / 5, 0.02e18, "flat 0.1% of trade = ~20% of the dev slice at 3% tier");
     }
 }

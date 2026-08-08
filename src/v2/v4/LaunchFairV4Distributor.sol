@@ -18,6 +18,8 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 import {IV3SwapRouter} from "../../interfaces/IUniswapV3.sol";
 import {IRandomnessConsumer} from "./LaunchFairVRFCoordinator.sol";
+import {IPerpsVenue} from "./IPerpsVenue.sol";
+import {PerpPositionToken} from "./PerpPositionToken.sol";
 
 interface ICreatorRegistryV4 {
     function creatorOf(address token) external view returns (address);
@@ -58,6 +60,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     address public registrar; // the launchpad; records buyback pools (set-once after deploy)
     bool public registrarLocked; // registrar is frozen after the first post-deploy set (L-03)
     address public locker;
+    address public feeHook; // the WethFeeHook (an alternate fee source that may notify() the pot)
+    // Mode.Perps: the venue is PINNED per token at launch (via registerPerps) — so a later global
+    // change can never brick an existing token, and the launch-time and payout-time venues can't diverge.
+    mapping(address token => address) public perpsVenueOf;
 
     // Where a token's reward asset is bought. Keyed by (token, asset) so a Reward token
     // can distribute up to 5 different reward assets, each on its own venue.
@@ -129,8 +135,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     // chunks and finalizes once every ticket is accounted for.
     struct Settlement {
         bool active;            // a settlement is in progress
+        bool ticketReached;     // the winning ticket's holder range has been passed
         address lastHolder;     // last holder counted — the next chunk must exceed it
-        address winner;         // set once the winning ticket falls in a holder's range
+        address winner;         // first NON-COOLING holder at/after the winning ticket
+        address firstEligible;  // first non-cooling holder seen (wrap-around fallback)
         uint256 cumulative;     // tickets counted so far
         uint256 winningTicket;  // cached at start (from the verified randomness)
         bytes32 randomness;     // cached at start (for the Draw record at finalize)
@@ -139,11 +147,24 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     address public drawOperator; // off-chain keeper that commits/settles draws
     address public vrf; // the shared LaunchFairVRFCoordinator (randomness source)
     mapping(address token => Draw[]) public draws;         // full winner history
+
+    /// @notice Repeat-winner cooldown: a wallet that wins a token's lottery can't win THAT token
+    /// again for `winCooldownSecs`. If a draw's winning ticket lands on a still-cooling holder,
+    /// the draw is RE-DRAWN past them (the next eligible holder at/after the ticket wins, wrapping
+    /// to the first eligible holder), so the pot still pays out and only voids to a miss if EVERY
+    /// holder is cooling. Selection stays deterministic from the beacon, so it can't be steered.
+    /// NOTE: the cooldown is keyed by winner ADDRESS, so it's a soft deterrent — a winner can move
+    /// their balance to a fresh wallet to reset it; do not rely on it as a hard guarantee. Owner-
+    /// tunable; 0 disables it. Default 1 hour.
+    uint256 public winCooldownSecs = 1 hours;
+    mapping(address token => mapping(address wallet => uint64)) public lastWinAt;
     mapping(address token => PendingDraw) public pendingDraw;
     mapping(address token => Settlement) public settlement; // in-progress paginated settle
     mapping(uint256 requestId => address token) public requestToken; // VRF callback routing
 
     event LockerSet(address locker);
+    event FeeHookSet(address feeHook);
+    event PerpsVenueSet(address indexed token, address venue);
     event RegistrarSet(address registrar);
     event ProcessorSet(address indexed processor, bool allowed);
     event BuybackRegistered(address indexed token, uint8 venue);
@@ -157,6 +178,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event DrawCommitted(address indexed token, uint256 indexed drawId, uint256 round, uint256 epoch, uint256 prizeSnapshot);
     event DrawSettled(address indexed token, uint256 indexed drawId, uint256 epoch, address indexed winner, uint256 prize, bytes32 randomness, uint256 winningTicket);
     event DrawCanceled(address indexed token, uint256 epoch, uint256 prizeReturned);
+    event WinCooldownSet(uint256 secs);
     event VrfSet(address vrf);
     event RandomnessReady(address indexed token, uint256 indexed requestId, bytes32 randomness);
 
@@ -226,6 +248,15 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit LockerSet(locker_);
     }
 
+    /// @notice Authorize the WethFeeHook as an additional fee source that may `notify()` the pot
+    /// (alongside the locker) — so a mode token launched through the hook funds its own mechanism.
+    /// Owner-settable (re-settable, since the hook can be re-mined/redeployed); 0 disables it.
+    function setFeeHook(address feeHook_) external onlyOwner {
+        feeHook = feeHook_;
+        emit FeeHookSet(feeHook_);
+    }
+
+
     /// @notice Point the distributor at the launchpad (deployed after this). Set-once:
     /// the very first post-deploy call wires the real launchpad and then freezes it,
     /// so the owner can't later re-point the registrar to hijack buyback venues (L-03).
@@ -267,6 +298,16 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         emit BuybackRegistered(token, uint8(Venue.V3));
     }
 
+    /// @notice Launchpad marks a Mode.Perps token as processable. It has no Uniswap buyback venue —
+    /// its reward assets are the venue's leveraged-position tokens, minted in `process()` via
+    /// `perpsVenue.open`, reading each leg's (market, side, leverage) off the position token itself.
+    function registerPerps(address token, address venue) external {
+        if (msg.sender != registrar) revert OnlyRegistrar();
+        registered[token] = true;
+        perpsVenueOf[token] = venue; // pin the venue for this token's whole life
+        emit PerpsVenueSet(token, venue);
+    }
+
     /// @notice The venue (0 = V4, 1 = V3) a token's reward `asset` is bought on.
     function buybackVenue(address token, address asset) external view returns (uint8) {
         return uint8(_buyback[token][asset].venue);
@@ -274,7 +315,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
 
     /// @notice Called by the V4 FeeLocker after forwarding `amount` WETH here.
     function notify(address token, uint256 amount) external {
-        if (msg.sender != locker) revert OnlyLocker();
+        if (msg.sender != locker && (feeHook == address(0) || msg.sender != feeHook)) revert OnlyLocker();
         pendingWeth[token] += amount;
         emit Notified(token, amount, pendingWeth[token]);
     }
@@ -348,23 +389,63 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         // Base has no mechanism; Lottery uses draw()/settleDraw(), not a buyback.
         if (m == LaunchTokenV2.Mode.Base || m == LaunchTokenV2.Mode.Lottery) revert WrongMode();
         pendingWeth[token] = 0;
-        lastPayoutBlock[token] = block.number; // reset the dev's block timer
+        uint256 prevPayoutBlock = lastPayoutBlock[token];
+        lastPayoutBlock[token] = block.number; // reset the dev's timer (restored below if nothing deploys)
 
         address[] memory assets = t.rewardTokensList();
         if (minOuts.length != assets.length) revert BadMinOuts();
 
+        bool perps = (m == LaunchTokenV2.Mode.Perps);
+        address venue = perps ? perpsVenueOf[token] : address(0); // pinned at launch, per token
         uint256 remaining = wethIn;
+        uint256 held; // Perps: WETH for closed/failing legs, re-credited to pendingWeth for next cycle
+        uint256 deployed; // WETH actually deployed this cycle
         for (uint256 i; i < assets.length; i++) {
             address asset = assets[i];
             // Split by the dev's weight; the last asset takes the remainder (dust-safe).
             uint256 portion = i == assets.length - 1 ? remaining : (wethIn * t.rewardWeightBps(asset)) / 10_000;
             remaining -= portion;
             if (portion == 0) continue;
-            uint256 out = _buyAsset(token, asset, portion);
-            if (out == 0 || out < minOuts[i]) revert Slippage(); // out==0 would burn WETH on a dead swap
+            uint256 out;
+            if (perps) {
+                // HOLD this leg's WETH (deploy a later cycle) when its market is closed, its open
+                // FAILS (liquidated pool), or it mints too few shares. A single bad leg must NEVER
+                // revert the whole batch and brick the token's rewards (mirrors the lottery try/catch).
+                if (!IPerpsVenue(venue).marketOpen(PerpPositionToken(asset).market())) {
+                    held += portion;
+                    continue;
+                }
+                out = _openPerp(venue, asset, portion); // deposit margin → mint the position token
+                if (out == 0 || out < minOuts[i]) {
+                    held += portion;
+                    continue;
+                }
+            } else {
+                out = _buyAsset(token, asset, portion); // swap WETH → reward asset on its venue
+                if (out == 0 || out < minOuts[i]) revert Slippage(); // out==0 would burn WETH on a dead swap
+            }
             IERC20(asset).forceApprove(token, out);
             t.fundRewards(asset, out);
+            deployed += portion;
             emit Processed(token, portion, out, uint8(m));
+        }
+        if (held > 0) pendingWeth[token] = held; // closed/failing legs — hold for next cycle
+        if (deployed == 0) lastPayoutBlock[token] = prevPayoutBlock; // nothing deployed → don't burn the timer
+    }
+
+    /// @dev Deposit `wethIn` as margin into the (market, side, leverage) pool encoded by the position
+    /// token `asset`, minting the leveraged-position token to this distributor (then funded to
+    /// holders). Config is read off the token — the distributor never chooses direction/leverage. A
+    /// venue revert (e.g. a liquidated pool, or a sub-NAV dust deposit) is CAUGHT and returned as 0
+    /// shares, so the caller HOLDS that leg instead of reverting the whole payout.
+    function _openPerp(address venue, address asset, uint256 wethIn) internal returns (uint256 shares) {
+        PerpPositionToken pt = PerpPositionToken(asset);
+        weth.forceApprove(venue, wethIn);
+        try IPerpsVenue(venue).open(pt.market(), pt.isLong(), pt.leverageBps(), wethIn) returns (address, uint256 s) {
+            shares = s;
+        } catch {
+            weth.forceApprove(venue, 0); // clear the unused approval on a caught failure
+            shares = 0;
         }
     }
 
@@ -381,6 +462,14 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (op == address(0)) revert ZeroAddress();
         drawOperator = op;
         emit DrawOperatorSet(op);
+    }
+
+    /// @notice Set the repeat-winner cooldown (seconds). A winner can't win the same token's
+    /// lottery again until it elapses; a re-selected cooling winner voids the draw to a miss.
+    /// 0 disables the cooldown.
+    function setWinCooldown(uint256 secs) external onlyOwner {
+        winCooldownSecs = secs;
+        emit WinCooldownSet(secs);
     }
 
     /// @notice Point the distributor at the shared VRF coordinator (randomness source).
@@ -538,37 +627,31 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             s.winningTicket = uint256(keccak256(abi.encode(rnd, token, pd.round))) % total;
         }
 
-        // Walk this chunk of the sorted, complete holder set. `h > lastHolder` (strict,
-        // and contiguous across chunks) => sorted + distinct; `tk != 0` => only real
-        // holders; overshooting `total` => a bad set. The winner is whoever's cumulative
-        // range owns the winning ticket — uniquely determined, the caller can't steer it.
-        uint256 cumulative = s.cumulative;
-        address lastHolder = s.lastHolder;
-        address winner = s.winner;
-        uint256 winningTicket = s.winningTicket;
-        for (uint256 i = 0; i < holders.length; i++) {
-            address h = holders[i];
-            if (h <= lastHolder) revert BadHolderSet();
-            lastHolder = h;
-            uint256 tk = t.balanceOfAt(h, pd.snapshotBlock); // the holder's held balance at the snapshot
-            if (tk == 0) revert BadHolderSet();
-            if (winner == address(0) && winningTicket < cumulative + tk) winner = h;
-            cumulative += tk;
-            if (cumulative > total) revert BadHolderSet(); // padded past the real total
-        }
+        // Walk this chunk of the sorted, complete holder set (see _walkHolders); returns true once
+        // every ticket is accounted for. A partial chunk persists progress and waits for the next.
+        if (!_walkHolders(token, s, pd.snapshotBlock, holders, total)) return 0;
 
-        if (cumulative < total) {
-            // More holders to come — persist progress and wait for the next chunk.
-            s.cumulative = cumulative;
-            s.lastHolder = lastHolder;
-            s.winner = winner;
-            return 0;
-        }
-        // cumulative == total: the set is complete → finalize (REGULAR or JACKPOT).
-        if (winner == address(0)) revert IncompleteHolderSet(); // unreachable; defensive
+        // Complete → finalize. The winner is the first non-cooling holder at/after the ticket; if
+        // the ticket fell on cooling holders through the end of the set, wrap to the first eligible
+        // holder. If EVERY holder is on cooldown, `winner` stays 0 → void to a miss (pot rolls over).
+        address winner = s.winner;
+        if (winner == address(0)) winner = s.firstEligible;
+        uint256 winningTicket = s.winningTicket;
         bytes32 randomness = s.randomness;
         uint256 roll = uint256(keccak256(abi.encode(randomness, token, pd.round, uint256(1)))) % 10_000;
         (, uint256 jpB) = _lotteryBands(token);
+
+        if (winner == address(0)) {
+            delete settlement[token];
+            delete pendingDraw[token];
+            draws[token].push(Draw({
+                epoch: pd.epoch, round: pd.round, randomness: randomness,
+                winner: address(0), prize: 0, totalTickets: total, winningTicket: winningTicket,
+                hitRoll: roll, outcome: 0, timestamp: uint64(block.timestamp)
+            }));
+            emit DrawResolved(token, pd.epoch, 0, address(0), 0, roll);
+            return 0;
+        }
 
         uint256 prize;
         uint8 outcome;
@@ -585,6 +668,8 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
             prize = (pot * regularWinShareBps[token]) / 10_000;
             jackpotWeth[token] += pot - prize;
         }
+
+        lastWinAt[token][winner] = uint64(block.timestamp); // start this winner's cooldown
 
         delete settlement[token];
         delete pendingDraw[token];
@@ -632,6 +717,57 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         jpB = jackpotChanceBps[token];
         if (jpB == 0) return (0, 10_000);
         missB = missBps[token];
+    }
+
+    /// @dev True while `who` is inside its repeat-winner cooldown for `token` (won within the last
+    /// `winCooldownSecs`). A first-ever winner (`lastWinAt == 0`) is never cooling.
+    function _isCooling(address token, address who) internal view returns (bool) {
+        uint64 wonAt = lastWinAt[token][who];
+        return winCooldownSecs != 0 && wonAt != 0 && block.timestamp < uint256(wonAt) + winCooldownSecs;
+    }
+
+    /// @dev Walk a chunk of the sorted, complete holder set, accumulating into `s`. `h > lastHolder`
+    /// (strict, contiguous across chunks) => sorted + distinct; `tk != 0` => only real holders;
+    /// overshooting `total` => a bad set. Winner derivation is the first NON-COOLING holder at/after
+    /// the winning ticket (cooldown re-draw), tracking the first eligible holder as a wrap-around
+    /// fallback. Uniquely determined by the beacon + the holder set — the caller can't steer it.
+    /// Returns true once the cumulative reaches `total` (the set is complete). Split out of
+    /// `settleDraw` to keep its stack shallow.
+    function _walkHolders(
+        address token,
+        Settlement storage s,
+        uint256 snapshotBlock,
+        address[] calldata holders,
+        uint256 total
+    ) internal returns (bool complete) {
+        LaunchTokenV2 t = LaunchTokenV2(token);
+        uint256 cumulative = s.cumulative;
+        address lastHolder = s.lastHolder;
+        address winner = s.winner;
+        bool ticketReached = s.ticketReached;
+        address firstEligible = s.firstEligible;
+        uint256 winningTicket = s.winningTicket;
+        for (uint256 i = 0; i < holders.length; i++) {
+            address h = holders[i];
+            if (h <= lastHolder) revert BadHolderSet();
+            lastHolder = h;
+            uint256 tk = t.balanceOfAt(h, snapshotBlock); // the holder's held balance at the snapshot
+            if (tk == 0) revert BadHolderSet();
+            bool cooling = _isCooling(token, h);
+            if (!cooling && firstEligible == address(0)) firstEligible = h;
+            if (winner == address(0)) {
+                if (!ticketReached && winningTicket < cumulative + tk) ticketReached = true;
+                if (ticketReached && !cooling) winner = h;
+            }
+            cumulative += tk;
+            if (cumulative > total) revert BadHolderSet(); // padded past the real total
+        }
+        s.cumulative = cumulative;
+        s.lastHolder = lastHolder;
+        s.winner = winner;
+        s.ticketReached = ticketReached;
+        s.firstEligible = firstEligible;
+        return cumulative == total;
     }
 
     /// @dev Self-only helper (so it can be `try`/`catch`ed from settleDraw): swap the pot

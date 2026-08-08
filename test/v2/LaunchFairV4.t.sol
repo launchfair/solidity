@@ -19,6 +19,10 @@ import {LaunchFairV4Distributor} from "../../src/v2/v4/LaunchFairV4Distributor.s
 import {LaunchFairV4SwapRouter, IWETH} from "../../src/v2/v4/LaunchFairV4SwapRouter.sol";
 import {MockVRFCoordinator} from "./MockVRF.sol";
 import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {WethFeeHook} from "../../src/v2/v4/WethFeeHook.sol";
+import {ReferenceStockPerpVenue} from "../../src/v2/v4/ReferenceStockPerpVenue.sol";
+import {PerpPositionToken} from "../../src/v2/v4/PerpPositionToken.sol";
 
 contract MockWethT is ERC20 {
     constructor() ERC20("WETH", "WETH") {}
@@ -84,6 +88,7 @@ contract LaunchFairV4Test is Test, Deployers {
     LaunchFairV4 pad;
 
     address constant TREASURY = address(0x7EA);
+    address constant FLAGSHIP = address(0xF1A);
     address constant HOLDER = address(0xB0B);
     uint128 constant SUPPLY = 1_000_000_000 ether;
 
@@ -128,6 +133,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Increasing, // Redistribute
                 fee: 30_000,
                 rewards: _noRewards(),
+                perps: _noPerps(),
                 prizeToken: address(0),
                 prizeIsV3: false,
                 prizeV3Fee: 0,
@@ -149,6 +155,10 @@ contract LaunchFairV4Test is Test, Deployers {
     // No external reward assets (Redistribute / WETH-pot Lottery).
     function _noRewards() internal pure returns (LaunchFairV4.RewardVenue[] memory r) {
         r = new LaunchFairV4.RewardVenue[](0);
+    }
+
+    function _noPerps() internal pure returns (LaunchFairV4.PerpLeg[] memory p) {
+        p = new LaunchFairV4.PerpLeg[](0);
     }
 
     // A single reward asset taking the full fee weight, on a V3 (or V4) venue.
@@ -181,6 +191,67 @@ contract LaunchFairV4Test is Test, Deployers {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+    }
+
+    /// End-to-end: a PLAIN (Base) token on V4 with the WETH fee hook — fee is WETH on both the
+    /// buy and the sell (no token taken → no sell pressure), and distribute() splits it, folding
+    /// the plain token's mechanism slice into the flagship.
+    function test_endToEnd_baseTokenOnV4_wethHookBothWays() public {
+        // Deploy the hook at a permission-encoded address + wire it.
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
+        address hookAddr = address(flags | (uint160(0x7777) << 144));
+        deployCodeTo("WethFeeHook.sol:WethFeeHook", abi.encode(address(this), manager, address(weth), uint16(100)), hookAddr);
+        WethFeeHook hook = WethFeeHook(hookAddr);
+        hook.setDestinations(TREASURY, address(dist), FLAGSHIP, address(pad));
+        pad.setFeeHook(hookAddr);
+
+        // Launch a BASE/plain token on V4 (allowed now that the hook is set).
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Plain", symbol: "PLN", metadata: meta, salt: bytes32(uint256(7)),
+                mode: LaunchTokenV2.Mode.Base, fee: 30_000, rewards: _noRewards(), perps: _noPerps(), prizeToken: address(0),
+                prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
+                payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+            })
+        );
+        PoolKey memory pk = pad.getLaunch(token).key;
+        assertEq(address(pk.hooks), hookAddr, "pool uses the hook");
+        assertEq(pk.fee, 0, "pool LP fee is 0 (the hook is the fee)");
+
+        // Buy → hook skims WETH from the input.
+        _buy(pk, token, 0.1 ether);
+        uint256 afterBuy = hook.accrued(token);
+        assertGt(afterBuy, 0, "hook took a WETH fee on the buy");
+
+        // Sell the bought tokens → hook skims WETH from the OUTPUT, takes ZERO token.
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        uint256 hookTokBefore = IERC20(token).balanceOf(hookAddr);
+        IERC20(token).approve(address(swapRouter), bal);
+        bool zeroForOne = Currency.unwrap(pk.currency0) == address(token);
+        swapRouter.swap(
+            pk,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(bal),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertGt(hook.accrued(token), afterBuy, "hook took a WETH fee on the sell too");
+        assertEq(IERC20(token).balanceOf(hookAddr), hookTokBefore, "hook took NO token -> no sell pressure");
+
+        // Distribute → plain token: mechanism folds into the flagship (no reward/lottery).
+        hook.distribute(token);
+        assertEq(hook.accrued(token), 0, "accrual cleared");
+        assertGt(weth.balanceOf(FLAGSHIP), 0, "flagship funded (flagship + mechanism for a plain token)");
+        assertGt(weth.balanceOf(TREASURY), 0, "treasury funded");
+        assertEq(dist.pendingWeth(token), 0, "plain token never funds the reward/lottery distributor");
     }
 
     function test_endToEnd_launch_trade_claim_process_reward() public {
@@ -239,6 +310,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Reward,
                 fee: 30_000,
                 rewards: _oneReward(address(reward), true, 10_000),
+                perps: _noPerps(),
                 prizeToken: address(0),
                 prizeIsV3: false,
                 prizeV3Fee: 0,
@@ -263,6 +335,114 @@ contract LaunchFairV4Test is Test, Deployers {
         vm.prank(HOLDER);
         LaunchTokenV2(token).claim();
         assertGt(reward.balanceOf(HOLDER), 0, "HOLDER received the V3-bought reward token");
+    }
+
+    // Perps mode end-to-end: fees are deposited as MARGIN into a leveraged stock position via the
+    // venue, and holders receive the fungible POSITION TOKEN as a reward — hands-off, exactly like a
+    // reward token. A holder ends up with the leveraged position in their wallet and redeems it for
+    // WETH at NAV (which grows with the leveraged move). Principal-safe: only fees were ever margin.
+    function test_endToEnd_perps_holderGetsLeveragedPositionToken_andRedeems() public {
+        bytes32 AAPL = keccak256("AAPL");
+        ReferenceStockPerpVenue venue = new ReferenceStockPerpVenue(address(this), address(weth));
+        venue.listMarket(AAPL, "AAPL", 200 ether, true);
+        weth.mint(address(this), 100 ether);
+        weth.approve(address(venue), type(uint256).max);
+        venue.fundLiquidity(50 ether); // house liquidity backs leveraged profit on redeem
+        venue.setOpener(address(dist), true); // the distributor is the authorized margin depositor
+        pad.setPerpsVenue(address(venue)); // distributor's venue is pinned per-token at registerPerps
+
+        // Launch a Perps token: one leg, AAPL 3x long, full weight — dev's pick, frozen at launch.
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.PerpLeg[] memory legs = new LaunchFairV4.PerpLeg[](1);
+        legs[0] = LaunchFairV4.PerpLeg({market: AAPL, isLong: true, leverageBps: 30_000, weightBps: 10_000});
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "AAPL3x", symbol: "AAPL3X", metadata: meta, salt: bytes32(uint256(42)),
+                mode: LaunchTokenV2.Mode.Perps, fee: 30_000, rewards: _noRewards(), perps: legs,
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
+                payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+            })
+        );
+        address posTok = venue.positionTokenFor(AAPL, true, 30_000);
+        assertEq(LaunchTokenV2(token).rewardTokensList()[0], posTok, "position token is the reward asset");
+
+        PoolKey memory key = pad.getLaunch(token).key;
+        _buy(key, token, 0.1 ether);
+        IERC20(token).transfer(HOLDER, IERC20(token).balanceOf(address(this)));
+
+        locker.claim(token);
+        assertGt(dist.pendingWeth(token), 0, "mechanism WETH pending");
+
+        // process(): deposit the WETH as margin → mint the position token → fund the tracker.
+        dist.process(token, _zeros(1));
+        assertGt(LaunchTokenV2(token).withdrawableDividendOf(posTok, HOLDER), 0, "HOLDER accrued the position token");
+
+        // HOLDER claims → the leveraged position token lands in their wallet, to do whatever with.
+        vm.prank(HOLDER);
+        LaunchTokenV2(token).claim();
+        uint256 shares = IERC20(posTok).balanceOf(HOLDER);
+        assertGt(shares, 0, "HOLDER holds the leveraged-position token");
+
+        // AAPL rallies 10% → 3x = +30% NAV. HOLDER redeems it for WETH profit.
+        uint256 navEntry = venue.shareValue(posTok, shares);
+        venue.setMarkPrice(AAPL, 220 ether);
+        uint256 navAfter = venue.shareValue(posTok, shares);
+        assertGt(navAfter, navEntry, "the leveraged position gained on the move");
+
+        uint256 wethBefore = weth.balanceOf(HOLDER);
+        vm.prank(HOLDER);
+        uint256 out = venue.redeem(posTok, shares, 0);
+        assertEq(out, navAfter, "redeemed at NAV");
+        assertEq(weth.balanceOf(HOLDER) - wethBefore, out, "HOLDER got WETH for the leveraged position");
+        assertGt(out, 0, "position had value");
+    }
+
+    // AUDIT HIGH: a liquidated leg (market still open, but its pool value hit 0) must NOT revert the
+    // whole process() and brick the token's rewards — it holds that leg and deploys the others.
+    function test_perps_liquidatedLegDoesNotBrickTheToken() public {
+        bytes32 AAPL = keccak256("AAPL");
+        bytes32 TSLA = keccak256("TSLA");
+        ReferenceStockPerpVenue venue = new ReferenceStockPerpVenue(address(this), address(weth));
+        venue.listMarket(AAPL, "AAPL", 200 ether, true);
+        venue.listMarket(TSLA, "TSLA", 100 ether, true);
+        weth.mint(address(this), 100 ether);
+        weth.approve(address(venue), type(uint256).max);
+        venue.fundLiquidity(50 ether);
+        venue.setOpener(address(dist), true);
+        pad.setPerpsVenue(address(venue));
+
+        // 2-leg basket: AAPL 3x long 50%, TSLA 2x short 50%.
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.PerpLeg[] memory legs = new LaunchFairV4.PerpLeg[](2);
+        legs[0] = LaunchFairV4.PerpLeg({market: AAPL, isLong: true, leverageBps: 30_000, weightBps: 5_000});
+        legs[1] = LaunchFairV4.PerpLeg({market: TSLA, isLong: false, leverageBps: 20_000, weightBps: 5_000});
+        address token = pad.createToken{value: 0.000005 ether}(
+            LaunchFairV4.CreateParams({
+                name: "Basket", symbol: "BKT", metadata: meta, salt: bytes32(uint256(77)),
+                mode: LaunchTokenV2.Mode.Perps, fee: 30_000, rewards: _noRewards(), perps: legs,
+                prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
+                payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+            })
+        );
+        PoolKey memory key = pad.getLaunch(token).key;
+
+        // Cycle 1: both legs get margin.
+        _buy(key, token, 0.1 ether);
+        locker.claim(token);
+        dist.process(token, _zeros(2));
+
+        // AAPL 3x-long pool is liquidated by a −35% move — but its MARKET stays open (price > 0).
+        venue.setMarkPrice(AAPL, 130 ether);
+        assertTrue(venue.marketOpen(AAPL), "market open; only the pool is liquidated");
+
+        // Cycle 2: new fees. Without the try/catch fix this reverts forever; with it, process holds
+        // the AAPL leg and deploys the TSLA leg.
+        _buy(key, token, 0.1 ether);
+        locker.claim(token);
+        dist.process(token, _zeros(2)); // must not revert
+        assertGt(dist.pendingWeth(token), 0, "liquidated AAPL leg's WETH held for next cycle, not bricked");
     }
 
     // Multi-reward: two dev-chosen reward assets distributed in parallel, each with
@@ -291,6 +471,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Reward,
                 fee: 30_000,
                 rewards: rewards,
+                perps: _noPerps(),
                 prizeToken: address(0),
                 prizeIsV3: false,
                 prizeV3Fee: 0,
@@ -350,6 +531,7 @@ contract LaunchFairV4Test is Test, Deployers {
             LaunchFairV4.CreateParams({
                 name: "Bad", symbol: "BAD", metadata: meta, salt: bytes32(uint256(6)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                perps: _noPerps(),
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
                 minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
@@ -370,6 +552,7 @@ contract LaunchFairV4Test is Test, Deployers {
             LaunchFairV4.CreateParams({
                 name: "Dup", symbol: "DUP", metadata: meta, salt: bytes32(uint256(7)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                perps: _noPerps(),
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
                 minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
@@ -392,6 +575,7 @@ contract LaunchFairV4Test is Test, Deployers {
             LaunchFairV4.CreateParams({
                 name: "Six", symbol: "SIX", metadata: meta, salt: bytes32(uint256(8)),
                 mode: LaunchTokenV2.Mode.Reward, fee: 30_000, rewards: rewards,
+                perps: _noPerps(),
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
                 minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })
@@ -414,6 +598,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Reward,
                 fee: 30_000,
                 rewards: _oneReward(address(reward), true, 10_000),
+                perps: _noPerps(),
                 prizeToken: address(0),
                 prizeIsV3: false,
                 prizeV3Fee: 0,
@@ -437,6 +622,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Lottery,
                 fee: 100_000, // 10% fee -> a beefy pot
                 rewards: _noRewards(),
+                perps: _noPerps(),
                 prizeToken: address(0), // WETH pot
                 prizeIsV3: false,
                 prizeV3Fee: 0,
@@ -526,6 +712,7 @@ contract LaunchFairV4Test is Test, Deployers {
                 mode: LaunchTokenV2.Mode.Lottery,
                 fee: 100_000,
                 rewards: _noRewards(),
+                perps: _noPerps(),
                 prizeToken: address(prize), // token prize (not WETH)
                 prizeIsV3: true,
                 prizeV3Fee: 10_000,
@@ -575,6 +762,7 @@ contract LaunchFairV4Test is Test, Deployers {
             LaunchFairV4.CreateParams({
                 name: "Red", symbol: "RED", metadata: meta, salt: bytes32(uint256(77)),
                 mode: LaunchTokenV2.Mode.Increasing, fee: 30_000, rewards: _noRewards(),
+                perps: _noPerps(),
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
                 minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             }),
@@ -595,6 +783,7 @@ contract LaunchFairV4Test is Test, Deployers {
             LaunchFairV4.CreateParams({
                 name: "Red", symbol: "RED", metadata: meta, salt: bytes32(uint256(78)),
                 mode: LaunchTokenV2.Mode.Increasing, fee: 30_000, rewards: _noRewards(),
+                perps: _noPerps(),
                 prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
                 minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             }),

@@ -4,8 +4,8 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {V3Launchpad} from "../src/V3Launchpad.sol";
-import {FeeLocker} from "../src/FeeLocker.sol";
+import {V3Launchpad} from "../src/v1/V3Launchpad.sol";
+import {FeeLocker} from "../src/v1/FeeLocker.sol";
 import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
 import {MockWETH} from "../test/mocks/MockWETH.sol";
 import {MockV3Factory, MockPositionManager} from "../test/mocks/MockUniswapV3.sol";
@@ -43,8 +43,9 @@ contract Deploy is Script {
         if (factory == address(0)) factory = address(new MockV3Factory());
         address positionManager = vm.envOr("POSITION_MANAGER", address(0));
         if (positionManager == address(0)) positionManager = address(new MockPositionManager());
-        // Platform treasury: receives the 50% WETH fee share and the flat
-        // per-token creation fee. Override with TREASURY env if needed.
+        // Platform treasury: receives the 25% treasury WETH share, the flat per-token
+        // creation fee, and the 50% flagship-buyback slice until a flagshipSink is set.
+        // Override with TREASURY env if needed.
         address treasury = vm.envOr("TREASURY", address(0x82C8f63D0E578bA3d800BA5d48F8e9dD2a009Af3));
 
         FeeLocker locker = new FeeLocker(deployer, INonfungiblePositionManager(positionManager), IERC20(weth), treasury);
@@ -68,6 +69,11 @@ contract Deploy is Script {
         );
         locker.setLaunchpad(address(pad));
 
+        // Optionally point the 50% flagship-buyback slice at the keeper/sink wallet now
+        // (can also be set later via setFlagshipSink). Unset => the slice folds into treasury.
+        address flagshipSink = vm.envOr("FLAGSHIP_SINK", address(0));
+        if (flagshipSink != address(0)) locker.setFlagshipSink(flagshipSink);
+
         vm.stopBroadcast();
 
         console2.log("WETH:            ", weth);
@@ -76,5 +82,6 @@ contract Deploy is Script {
         console2.log("FeeLocker:       ", address(locker));
         console2.log("V3Launchpad:     ", address(pad));
         console2.log("Treasury:        ", treasury);
+        console2.log("FlagshipSink:    ", flagshipSink);
     }
 }

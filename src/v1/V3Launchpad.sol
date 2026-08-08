@@ -9,7 +9,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LaunchToken} from "./LaunchToken.sol";
 import {FeeLocker} from "./FeeLocker.sol";
-import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager, IWETH} from "./interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, IUniswapV3Pool, INonfungiblePositionManager, IWETH} from "../interfaces/IUniswapV3.sol";
 
 /// @notice V3 single-sided hybrid launchpad: every token launches straight into a
 /// REAL Uniswap V3 pool as a single-sided range order (full supply), so DEX

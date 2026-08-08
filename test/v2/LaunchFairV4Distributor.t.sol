@@ -520,6 +520,9 @@ contract V4DistributorTest is Test, Deployers {
         _settle(token, round1, rndR, _set1(A));
         assertEq(dist.jackpotWeth(tk), 3 ether, "regular win skimmed 30% to the pool");
 
+        // A just won → cooldown active; warp past it so the sole holder can win draw 2.
+        vm.warp(block.timestamp + dist.winCooldownSecs() + 1);
+
         // Draw 2 — a JACKPOT pays the new 2-ETH pot + the 3-ETH pool = 5 ETH.
         weth.mint(address(dist), 2 ether);
         dist.notify(tk, 2 ether);
@@ -533,6 +536,99 @@ contract V4DistributorTest is Test, Deployers {
         assertEq(token.lotteryEpoch(), 1, "session advances on the jackpot");
         (,,,,,,,, uint8 oc,) = dist.draws(address(token), 1);
         assertEq(oc, 2, "outcome = jackpot");
+    }
+
+    // A winner is blacklisted from winning the SAME token again for winCooldownSecs: a
+    // re-selected cooling winner voids the draw to a MISS (pot rolls over, winner unpaid);
+    // once the cooldown elapses they can win again.
+    function test_lottery_winnerCooldownVoidsRepeatWin() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 100_000 ether); // A is the sole eligible holder → always drawn
+        address tk = address(token);
+        dist.setLotteryOdds(tk, 0, 1, 7000); // 0 miss, ~0 jackpot (band = only 9999), 70% regular share
+
+        // Draw 1 — A wins (regular).
+        weth.mint(address(dist), 10 ether);
+        dist.notify(tk, 10 ether);
+        bytes32 rnd1 = keccak256("cd-1");
+        assertLt(_roll(rnd1, tk, 41), 9999, "beacon below the jackpot band");
+        dist.commitDraw(tk, 41);
+        uint256 a0 = weth.balanceOf(A);
+        _settle(token, 41, rnd1, _set1(A));
+        assertEq(weth.balanceOf(A) - a0, 7 ether, "A won draw 1");
+
+        // Draw 2 within the cooldown — A is re-drawn but blacklisted → void; pot rolls over.
+        weth.mint(address(dist), 5 ether);
+        dist.notify(tk, 5 ether);
+        uint256 potBefore = dist.pendingWeth(tk);
+        bytes32 rnd2 = keccak256("cd-2");
+        assertLt(_roll(rnd2, tk, 42), 9999, "beacon below the jackpot band");
+        dist.commitDraw(tk, 42);
+        uint256 a1 = weth.balanceOf(A);
+        _settle(token, 42, rnd2, _set1(A));
+        assertEq(weth.balanceOf(A), a1, "cooling winner is paid nothing");
+        assertEq(dist.pendingWeth(tk), potBefore, "pot untouched -> rolled over");
+
+        // After the cooldown, A can win again.
+        vm.warp(block.timestamp + dist.winCooldownSecs() + 1);
+        bytes32 rnd3 = keccak256("cd-3");
+        assertLt(_roll(rnd3, tk, 43), 9999, "beacon below the jackpot band");
+        dist.commitDraw(tk, 43);
+        uint256 a2 = weth.balanceOf(A);
+        _settle(token, 43, rnd3, _set1(A));
+        assertGt(weth.balanceOf(A) - a2, 0, "A wins again after the cooldown");
+    }
+
+    // In a MULTI-holder pool, a cooling winner no longer voids the draw: the winning ticket is
+    // re-drawn PAST the cooling holder to the next eligible holder, so the pot still pays (L-5).
+    function test_lottery_winnerCooldownRedrawsToNextHolder() public {
+        LaunchTokenV2 token = _setupLottery();
+        token.transfer(A, 399_999 ether); // A holds ~all tickets → the ticket lands on A
+        token.transfer(B, 1 ether); //       B is the next eligible holder
+        address tk = address(token);
+        uint256 total = token.totalEligibleSupply();
+        dist.setLotteryOdds(tk, 0, 1, 7000); // 0 miss, ~0 jackpot, 70% regular share
+
+        // Draw 1 — the ticket lands on A; A wins.
+        weth.mint(address(dist), 10 ether);
+        dist.notify(tk, 10 ether);
+        bytes32 rnd1 = keccak256("rd-1");
+        assertLt(_ticketFor(tk, rnd1, 41, total), 399_999 ether, "draw-1 ticket in A's range");
+        assertLt(_roll(rnd1, tk, 41), 9999, "regular-win band");
+        dist.commitDraw(tk, 41);
+        uint256 a0 = weth.balanceOf(A);
+        _settle(token, 41, rnd1, _set2(A, B));
+        assertEq(weth.balanceOf(A) - a0, 7 ether, "A won draw 1");
+
+        // Draw 2 within the cooldown — the ticket lands on A again, but A is cooling → RE-DRAW to
+        // B (not a void); B is paid and the pot is consumed.
+        weth.mint(address(dist), 10 ether);
+        dist.notify(tk, 10 ether);
+        bytes32 rnd2 = keccak256("rd-2");
+        assertLt(_ticketFor(tk, rnd2, 42, total), 399_999 ether, "draw-2 ticket in A's (cooling) range");
+        assertLt(_roll(rnd2, tk, 42), 9999, "regular-win band");
+        dist.commitDraw(tk, 42);
+        uint256 a1 = weth.balanceOf(A);
+        uint256 b0 = weth.balanceOf(B);
+        _settle(token, 42, rnd2, _set2(A, B));
+        assertEq(weth.balanceOf(A), a1, "cooling A is paid nothing");
+        assertEq(weth.balanceOf(B) - b0, 7 ether, "re-drawn to B, who is paid");
+    }
+
+    // N-1: the WethFeeHook can be authorized to notify() the pot alongside the locker, so a mode
+    // token launched through the hook funds its own mechanism. A non-locker/non-hook caller reverts.
+    function test_notify_authorizesFeeHook() public {
+        LaunchTokenV2 token = _setupLottery(); // sets locker = address(this)
+        address hookAddr = address(0xFEE);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(LaunchFairV4Distributor.OnlyLocker.selector);
+        dist.notify(address(token), 1 ether);
+
+        dist.setFeeHook(hookAddr);
+        vm.prank(hookAddr);
+        dist.notify(address(token), 1 ether);
+        assertEq(dist.pendingWeth(address(token)), 1 ether, "hook-notified pot credited");
     }
 
     // The holder set must be sorted-distinct — the operator can't steer the winner by
@@ -573,7 +669,7 @@ contract V4DistributorTest is Test, Deployers {
         // Chunk 1: just A → not complete, so no draw yet but progress is recorded.
         dist.settleDraw(address(token), _set1(A), 0);
         assertEq(dist.drawCount(address(token)), 0, "not finalized after chunk 1");
-        (bool active,,, uint256 cum,,) = dist.settlement(address(token));
+        (bool active,,,,, uint256 cum,,) = dist.settlement(address(token));
         assertTrue(active, "settlement in progress");
         assertEq(cum, 300_000 ether, "chunk 1 counted A");
 
@@ -582,7 +678,7 @@ contract V4DistributorTest is Test, Deployers {
         dist.settleDraw(address(token), _set1(B), 0);
         assertEq(dist.drawCount(address(token)), 1, "finalized after chunk 2");
         assertEq(weth.balanceOf(expected) - balBefore, pot, "winner paid the whole pot");
-        (bool stillActive,,,,,) = dist.settlement(address(token));
+        (bool stillActive,,,,,,,) = dist.settlement(address(token));
         assertFalse(stillActive, "settlement cleared on finalize");
     }
 
@@ -598,12 +694,12 @@ contract V4DistributorTest is Test, Deployers {
         vrf.deliver(1, keccak256("r"));
 
         dist.settleDraw(address(token), _set1(A), 0); // partial progress
-        (bool active,,, uint256 cum,,) = dist.settlement(address(token));
+        (bool active,,,,, uint256 cum,,) = dist.settlement(address(token));
         assertTrue(active);
         assertEq(cum, 300_000 ether);
 
         dist.resetSettlement(address(token));
-        (bool active2,,, uint256 cum2,,) = dist.settlement(address(token));
+        (bool active2,,,,, uint256 cum2,,) = dist.settlement(address(token));
         assertFalse(active2, "settlement cleared");
         assertEq(cum2, 0);
 

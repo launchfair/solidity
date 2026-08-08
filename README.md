@@ -1,81 +1,145 @@
-# LaunchFair — V3 hybrid launchpad
+# LaunchFair — token launchpad (Uniswap V3 + V4)
 
-A token launchpad where every token launches **straight into a real Uniswap V3 pool** as a single-sided range order, with the LP locked forever. Because the market is a normal V3 pool from block one, DEX terminals (GMGN, DexScreener, GeckoTerminal, …) index it automatically — no paid data integrations.
+A token launchpad where every token launches **straight into a real Uniswap pool** as a single-sided
+range order, with the LP locked forever. Because the market is a normal pool from block one, DEX
+terminals (GMGN, DexScreener, GeckoTerminal, …) index it automatically — no paid data integrations.
 
-**The curve is still here.** A single-sided V3 range order *is* a bonding curve — mathematically identical to a pump.fun-style virtual-reserve constant-product curve. All supply sits above the launch price, so price only moves by buyers walking it up a deterministic ladder. A token **bonds/graduates once `graduationWethAmount` of WETH has been raised into its pool** (net of sells, measured as `WETH.balanceOf(pool)`). Each token **snapshots its bond target at creation** from `defaultGraduationWethAmount` — the manual "WETH to bond" knob (`setGraduationWethAmount`, owner-settable). Changing it only affects **future** tokens; existing tokens keep the target they launched with (never retroactive). `V3Launchpad.curveProgress(token)` returns progress toward it in bps (0–10 000) for the frontend progress bar. The only differences from a standalone curve: it lives inside the pool (that's what makes it indexable), it never "sells out" (price can keep climbing past graduation), and there's no transfer lock.
+There are two contract stacks. See [`src/README.md`](src/README.md) for the full file-by-file layout.
 
-**Fee model** (via the pool's 1% fee tier — V3 fees accrue in the swap's *input* asset):
+| Stack | Path | AMM | What it is |
+|---|---|---|---|
+| **V1** (legacy) | `src/v1/` | Uniswap **V3** | The plain fair-launch launchpad — single-sided V3 curve, WETH-on-buy / burn-on-sell fees. Being retired. |
+| **V2** (current) | `src/v2/`, `src/v2/v4/` | Uniswap **V4** | The mode-token launchpad — a V4 hook fee engine + a distributor that pays holders per **reward mode**. |
 
-- **Buys pay 1% in WETH** → on claim, split **50% treasury / 50% token dev** (constant, no setter).
-- **Sells pay 1% in the token** → **burned**. Neither the dev nor the platform ever receives tokens, so nobody can dump fee-tokens on holders; seller fees are pure deflation.
+> Naming: "V2" is our launchpad's second generation; it runs on **Uniswap V4** under the hood, hence
+> the `v2/v4` nesting. Contract names (`LaunchTokenV2`, `LaunchFairV4`) carry the same distinction.
 
-Plus a **flat creation fee** of **0.000005 ETH** charged to the dev at `createToken` and forwarded to the treasury (overpayment refunded). Owner-tunable via `setCreationFee`, hard-capped at `MAX_CREATION_FEE_WEI` (0.001 ETH). The treasury address is `locker.treasury()` — a single source of truth shared with the WETH fee split.
+---
 
-**Anti-sniper launch guard.** For the first **360 blocks** after launch, no wallet may hold more than **2% of supply** (`maxBuyBps`/`maxBuyBlocks`, deploy-time config). Enforced in the token's transfer hook, so it applies to pool buys and wallet-to-wallet stacking alike; sells always work (the pool is exempt, as are the locker/position manager — protocol plumbing only, set by immutable launchpad code). The guard **auto-expires** and nobody can extend, tighten, or re-enable it — check `limitActive()` / `maxWalletAmount()` on the token.
+## The bonding curve (both stacks)
 
-**Trust model — everything is renounced at launch.** Tokens have no owner (`owner() == 0`), no mint, no fee knobs, no blacklist, and are freely transferable from creation. The LP NFT is minted directly into the `FeeLocker`, which has *no function* to withdraw it or decrease liquidity — the pool can never be rugged or migrated. The 50/50 WETH split is a compile-time constant. The only owner powers are the treasury payout address, the website stamped into future tokens, and the flat creation fee (capped).
+A single-sided range order *is* a bonding curve — mathematically identical to a pump.fun-style
+virtual-reserve constant-product curve. All supply sits above the launch price, so price only moves
+by buyers walking it up a deterministic ladder. A token **bonds/graduates once its
+`graduationWethAmount` of WETH has been raised into the pool** (net of sells, measured as
+`WETH.balanceOf(pool)`); the target is snapshotted per token at creation and never changes
+retroactively. `curveProgress(token)` returns progress in bps (0–10 000) for the frontend progress
+bar. The curve lives *inside* the pool (that's what makes it indexable), never "sells out" (price can
+keep climbing past graduation), and there is no transfer lock.
 
-## Contracts
+## Anti-sniper launch guard
 
-| Contract | Purpose |
-|---|---|
-| `src/V3Launchpad.sol` | `createToken(name, symbol[, metadata, salt])`: deploys the token (CREATE2, creator-scoped salt), creates + initializes the V3 pool at the configured launch price, mints the full supply as a single-sided range order with the `FeeLocker` as LP owner. `checkGraduation` is a permissionless poke that bonds a token once its pool has raised its snapshotted `graduationWethAmount` WETH (default owner-settable for future tokens; cosmetic — nothing migrates). Handles pool pre-creation griefing safely. |
-| `src/FeeLocker.sol` | Permanently holds every LP NFT. `claim(token)` (permissionless) collects pool fees: WETH → 50/50 treasury/dev, token side → burned. No liquidity-withdrawal path exists by construction. |
-| `src/LaunchToken.sol` | Vanilla OZ ERC20 + Burnable. Renounced, fixed supply. Carries creator metadata — logo (IPFS URI), website, Telegram, Discord, X — plus the platform site, immutable at creation, exposed as getters and via ERC-7572 `contractURI()` (validated at creation against JSON injection; emoji names fine). |
-| `src/interfaces/IUniswapV3.sol` | Minimal factory / pool / position-manager surfaces. |
+For a fixed window after launch (V1: `maxBuyBlocks`, default 360 L1 blocks ≈ 72 min on Robinhood
+Chain; V4: `setAntiSnipe(bps, blocks)`, default 2% / 100 blocks) no wallet may hold more than **2% of
+supply**. Enforced in the token's transfer hook, so it covers pool buys and wallet-to-wallet stacking
+alike; sells always work (the pool / locker / position manager are exempt — protocol plumbing only).
+The guard **auto-expires** and nobody can extend, tighten, or re-enable it.
 
-## Launch parameters (deploy-time, `V3Launchpad.PoolConfig`)
+## Trust model
 
-| Parameter | Default | Meaning |
+Tokens have no owner, no mint, no blacklist, and are freely transferable from creation. LP NFTs are
+minted directly into a **FeeLocker** that has *no function* to withdraw the NFT or decrease liquidity —
+the pool can never be rugged or migrated. The only owner powers are payout/treasury addresses, the
+site metadata stamped into future tokens, and capped fee knobs.
+
+---
+
+## V1 stack (`src/v1/`) — plain fair launch on Uniswap V3
+
+- **`V3Launchpad.sol`** — `createToken(...)`: deploys the token (CREATE2, creator-scoped salt),
+  creates + initializes the V3 pool at the configured launch price, mints the full supply as a
+  single-sided range order with the `FeeLocker` as LP owner. `checkGraduation` is a permissionless
+  poke that bonds a token once its pool has raised its snapshotted `graduationWethAmount`. Also carries
+  the treasury-only community-takeover hook `transferCreatorByTreasury`.
+- **`FeeLocker.sol`** — permanently holds every LP NFT. `claim(token)` (permissionless) collects pool
+  fees: **buys pay 1% in WETH**, split (owner-tunable) **treasury / dev / flagship-buyback**; **sells
+  pay 1% in the token → burned** (pure deflation; nobody can dump fee-tokens on holders). No
+  liquidity-withdrawal path exists by construction.
+- **`LaunchToken.sol`** — vanilla OZ ERC20 + Burnable, renounced, fixed supply; creator metadata
+  (logo, website, Telegram, Discord, X) immutable at creation, exposed via getters + ERC-7572
+  `contractURI()`.
+
+Plus a flat **creation fee** (default 0.000005 ETH, owner-tunable, hard-capped) forwarded to treasury.
+
+## V2 / V4 stack (`src/v2/`, `src/v2/v4/`) — mode tokens on Uniswap V4
+
+`LaunchTokenV2` picks one **mode** at launch (immutable); `LaunchFairV4Distributor` turns the
+mechanism fee slice into holder value per mode:
+
+| Mode | # | Payout |
 |---|---|---|
-| `tokenTotalSupply` | 1,000,000,000 | Full supply — all of it becomes pool liquidity |
-| `initialPriceWethPerToken` | 1.491e9 wei | Launch price (~1.49 gwei/token) |
-| `feeTier` | 10 000 (1%) | The "1%/1% both ends" — enforced by the pool itself |
-| `tickLower0` / `tickUpper0` | −203 200 / 887 200 | Curve bounds (token0 orientation; mirrored automatically) |
-| `graduationWethAmount` (→ `defaultGraduationWethAmount`) | 4.6 WETH | WETH raised into the pool that bonds a token; snapshotted per token at creation. Owner-settable default (`setGraduationWethAmount`) for **future** tokens only; drives `checkGraduation` + `curveProgress` |
+| **Base** | 0 | Plain fair launch, no mechanism payout. |
+| **Reward** | 1 | Buys up to 5 dev-chosen external tokens and distributes them to holders. |
+| **Increasing** | 2 | Auto-compounding — buys back THIS token and distributes it (balances grow). |
+| **Lottery** | 3 | Holdings-weighted three-outcome draw (miss / regular win / jackpot); a random holder takes the pot. |
+| **Perps** | 4 | Deposits the fee as margin into an `IPerpsVenue` → mints a fungible `PerpPositionToken` (a share of a pooled leveraged stock-perp position), distributed hands-off like a reward token; holders hold / sell / **redeem for WETH at NAV**. |
 
-## Run it
+Supporting contracts:
+
+- **`LaunchFairV4.sol`** — the launchpad/factory: `createToken` + atomic **`createAndBuy`**
+  (front-run-proof dev buy in the launch tx); wires the fee hook and the swap router.
+- **`WethFeeHook.sol`** — the V4 hook that takes the fee in **WETH on BOTH buys and sells** (no token
+  sell pressure) as ERC-6909 claims, on every trade regardless of router, then runs the 4-way split.
+- **`LaunchFairV4FeeLocker.sol`** — locks the V4 LP, claims fees, carves the flagship slice from the
+  dev share.
+- **`LaunchFairV4Distributor.sol`** — the reward / lottery / perps mechanism + WETH→asset buyback
+  engine (V3 & V4 venues).
+- **`LaunchFairVRFCoordinator.sol` + `DrandBLS.sol`** — trustless lottery randomness: on-chain
+  BLS12-381 verification of the public drand beacon (a draw snapshots holdings at its commit block, so
+  the winner is frozen before the beacon is public).
+- **Lottery** is three-outcome with two pools (pot + jackpot): **miss** rolls the pot over, **regular**
+  pays a random holder a share and skims the rest to the jackpot, **jackpot** pays pot + whole jackpot
+  pool. Odds are dev-tunable and set-once.
+- **Perps** — `IPerpsVenue` / `PerpPositionToken` / `ReferenceStockPerpVenue`. The reference venue is
+  **not production** (operator-set oracle) — a real venue must swap in a genuine push oracle
+  (Chainlink/Pyth) + liquidations/funding. See [`AUDIT_PERPS_MODE.md`](AUDIT_PERPS_MODE.md).
+
+## Flagship flywheel (`src/flywheel/`)
+
+Fees across both stacks feed a **flagship** platform token: a slice funds **buybacks** of the flagship,
+and each weekly **season** the bought flagship is split pro-rata by trading points and users **claim
+on-chain** from **`SeasonMerkleDistributor.sol`** (per-season Merkle roots; transparent +
+admin-recoverable). See [`FLAGSHIP_FLYWHEEL_STATUS.md`](FLAGSHIP_FLYWHEEL_STATUS.md).
+
+---
+
+## Build & test
 
 ```bash
-forge test          # 18 tests, each run under BOTH token/WETH address orderings
+forge build
+forge test          # 153 tests pass (0 failed); fork tests are gated behind RUN_FORK_TESTS
 
-# Local end-to-end demo (launch -> fees -> claim/burn -> graduation):
-anvil                                                                          # terminal 1
-forge script script/Demo.s.sol --rpc-url http://127.0.0.1:8545 --broadcast    # terminal 2
-```
-
-Real deployment (`script/Deploy.s.sol`) — set `WETH`, `UNIV3_FACTORY`, `POSITION_MANAGER`, `TREASURY`, `WEBSITE`, `PRIVATE_KEY`; local runs fall back to mocks and anvil's account 0.
-
-## Robinhood Chain deployment (chain id 4663)
-
-Verified on-chain (2026-07-09) against mainnet `https://rpc.mainnet.chain.robinhood.com`:
-
-| Contract | Address | Verification |
-|---|---|---|
-| WETH | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` | Robinhood docs + live `symbol()` |
-| UniswapV3Factory | `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` | owner = aliased Uniswap governance timelock; 21k+ pools |
-| NonfungiblePositionManager | `0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3` | `factory()`/`WETH9()` match; "Uniswap V3 Positions NFT-V1" |
-
-**`block.number` on this chain returns the Ethereum L1 block (~12s), not the 100ms L2 block** (verified via Multicall3: EVM sees ~25.49M vs L2 height ~4.8M). So `maxBuyBlocks = 360` ≈ **72 minutes** of launch protection.
-
-```bash
-# Fork test against the LIVE chain (launch, real swaps, guard, claim, graduation):
+# Fork tests against the LIVE Robinhood Chain (real pool init, swaps, guard, claim, graduation):
 RUN_FORK_TESTS=true forge test --match-contract RobinhoodChainFork -vv
-
-# Deploy:
-WETH=0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73 \
-UNIV3_FACTORY=0x1f7d7550B1b028f7571E69A784071F0205FD2EfA \
-POSITION_MANAGER=0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3 \
-TREASURY=<multisig> WEBSITE=<your site> PRIVATE_KEY=<deployer> \
-forge script script/Deploy.s.sol --rpc-url https://rpc.mainnet.chain.robinhood.com --broadcast
 ```
 
-DexScreener already indexes Robinhood Chain Uniswap V3 pairs (dexscreener.com/robinhood), so launched tokens chart automatically.
+Toolchain: solc **0.8.26**, `via_ir = true`, optimizer runs 200. Tests mirror `src/`: `test/v1/`,
+`test/v2/` (the V4 engine), `test/flywheel/`, shared mocks in `test/mocks/`.
 
-## Before mainnet — non-negotiables
+Deploy scripts (`script/`): `Deploy.s.sol` (V1), `DeployV4.s.sol` (V4),
+`DeploySeasonDistributor.s.sol` (after the flagship launches), `DeployWethFeeHook.s.sol` + `HookMiner.sol`.
 
-1. ~~Fork test against the real Uniswap V3~~ **Done for Robinhood Chain** — `test/RobinhoodChainFork.t.sol` passes against live mainnet state (pool init, single-sided mint at our ticks, real swaps, max-buy guard, fee claim, graduation).
-2. ~~Verify tick constants~~ **Done for the default config** — the real position manager accepted the mint (spacing 200, 1% tier).
-3. ~~Confirm terminal indexing~~ **DexScreener covers Robinhood Chain Uniswap V3.** Check GMGN/GeckoTerminal coverage as they roll out support for the (very new) chain.
-4. Independent security review; `AUDIT.md` records the internal one.
-5. Use a multisig for `TREASURY` and the owner key.
+## Robinhood Chain (chain id 4663)
+
+Stable infra, verified on-chain against `https://rpc.mainnet.chain.robinhood.com`:
+
+| Contract | Address |
+|---|---|
+| WETH | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
+| UniswapV3Factory | `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
+| NonfungiblePositionManager | `0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3` |
+| Uniswap V4 PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+
+> **Two block numbers on this chain:** the EVM `block.number` opcode returns the **Ethereum L1 block**
+> (~12 s), while `eth_blockNumber` returns the **L2 block** (~100 ms). The anti-snipe guard is in
+> L1-block terms — read the current L1 block via `Multicall3.getBlockNumber()`, not `eth_blockNumber`.
+
+Live launchpad/distributor/locker addresses rotate across redeploys — the frontend/indexer configs are
+the source of truth for the current deployment.
+
+## Security
+
+Internal reviews: [`AUDIT.md`](AUDIT.md) (V1), [`AUDIT_V4_HOOK.md`](AUDIT_V4_HOOK.md) (the WETH fee
+hook), [`AUDIT_PERPS_MODE.md`](AUDIT_PERPS_MODE.md) (the perps reward mode). Before mainnet: an
+independent external review, a real oracle + liquidations for any production Perps venue, and a
+multisig for every owner/treasury key.

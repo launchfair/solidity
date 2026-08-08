@@ -5,12 +5,12 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {V3Launchpad} from "../src/V3Launchpad.sol";
-import {FeeLocker} from "../src/FeeLocker.sol";
-import {LaunchToken} from "../src/LaunchToken.sol";
-import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
-import {MockWETH} from "./mocks/MockWETH.sol";
-import {MockV3Factory, MockV3Pool, MockPositionManager} from "./mocks/MockUniswapV3.sol";
+import {V3Launchpad} from "../../src/v1/V3Launchpad.sol";
+import {FeeLocker} from "../../src/v1/FeeLocker.sol";
+import {LaunchToken} from "../../src/v1/LaunchToken.sol";
+import {IUniswapV3Factory, INonfungiblePositionManager} from "../../src/interfaces/IUniswapV3.sol";
+import {MockWETH} from "../mocks/MockWETH.sol";
+import {MockV3Factory, MockV3Pool, MockPositionManager} from "../mocks/MockUniswapV3.sol";
 
 /// Token/WETH address ordering flips every piece of tick & price math, so the
 /// whole suite runs twice: once with WETH at a high address (token = token0)
@@ -142,6 +142,12 @@ abstract contract V3LaunchpadTestBase is Test {
     function test_claim_devGetsOnlyWeth_tokenFeesBurned() public {
         V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
 
+        // Point the 50% flagship-buyback slice at a sink so we exercise the real
+        // 25 treasury / 25 dev / 50 flagship split (not the pre-flagship fallback).
+        address flagshipSink = makeAddr("flagshipSink");
+        vm.prank(owner);
+        locker.setFlagshipSink(flagshipSink);
+
         // Simulate accrued pool fees: 2 WETH (from buys) + 5M tokens (from sells).
         uint256 wethFees = 2 ether;
         uint256 tokenFees = 5_000_000 ether;
@@ -153,13 +159,15 @@ abstract contract V3LaunchpadTestBase is Test {
 
         uint256 supplyBefore = IERC20(token).totalSupply();
         vm.prank(alice); // permissionless
-        (uint256 toTreasury, uint256 toDev, uint256 burned) = locker.claim(token);
+        (uint256 toTreasury, uint256 toDev, uint256 toFlagship, uint256 burned) = locker.claim(token);
 
-        // WETH: exact 50/50 between treasury and dev.
-        assertEq(toTreasury, wethFees / 2);
-        assertEq(toDev, wethFees - wethFees / 2);
+        // WETH: 25% treasury / 25% dev / 50% flagship buyback.
+        assertEq(toTreasury, wethFees / 4);
+        assertEq(toDev, wethFees / 4);
+        assertEq(toFlagship, wethFees - toTreasury - toDev);
         assertEq(weth.balanceOf(treasury), toTreasury);
         assertEq(weth.balanceOf(creator), toDev);
+        assertEq(weth.balanceOf(flagshipSink), toFlagship);
 
         // Token-side fees are burned — the dev NEVER receives tokens to dump.
         assertEq(burned, tokenFees);
@@ -170,6 +178,59 @@ abstract contract V3LaunchpadTestBase is Test {
 
         vm.expectRevert(FeeLocker.NothingToClaim.selector);
         locker.claim(token);
+    }
+
+    /// Before a flagshipSink is set, the 50% buyback slice folds into treasury so
+    /// V1 works fully pre-flagship (dev still gets exactly 25%, nothing is stuck).
+    function test_claim_flagshipSinkUnset_foldsIntoTreasury() public {
+        V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
+        uint256 wethFees = 4 ether;
+        vm.deal(address(pm), wethFees);
+        vm.prank(address(pm));
+        weth.deposit{value: wethFees}();
+        if (expectToken0) pm.setCollectable(info.positionTokenId, 0, wethFees);
+        else pm.setCollectable(info.positionTokenId, wethFees, 0);
+
+        (uint256 toTreasury, uint256 toDev, uint256 toFlagship,) = locker.claim(token);
+        assertEq(toFlagship, 0, "no flagship route until sink set");
+        assertEq(toDev, wethFees / 4, "dev still 25%");
+        assertEq(toTreasury, wethFees - toDev, "treasury gets its 25% + the folded 50%");
+        assertEq(weth.balanceOf(treasury), toTreasury);
+        assertEq(weth.balanceOf(creator), toDev);
+    }
+
+    /// The split is owner-tunable mid-flight; a retune applies to the next claim.
+    function test_setFeeShares_retunesSplit() public {
+        V3Launchpad.LaunchInfo memory info = pad.getLaunch(token);
+        address flagshipSink = makeAddr("flagshipSink2");
+        vm.startPrank(owner);
+        locker.setFlagshipSink(flagshipSink);
+        locker.setFeeShares(1000, 3000, 6000); // 10% treasury / 30% dev / 60% flagship
+        vm.stopPrank();
+
+        uint256 wethFees = 10 ether;
+        vm.deal(address(pm), wethFees);
+        vm.prank(address(pm));
+        weth.deposit{value: wethFees}();
+        if (expectToken0) pm.setCollectable(info.positionTokenId, 0, wethFees);
+        else pm.setCollectable(info.positionTokenId, wethFees, 0);
+
+        (uint256 toTreasury, uint256 toDev, uint256 toFlagship,) = locker.claim(token);
+        assertEq(toTreasury, wethFees / 10, "10% treasury");
+        assertEq(toDev, (wethFees * 3) / 10, "30% dev");
+        assertEq(toFlagship, wethFees - toTreasury - toDev, "60% flagship (remainder)");
+        assertEq(weth.balanceOf(flagshipSink), toFlagship);
+    }
+
+    function test_setFeeShares_mustSumToBps() public {
+        vm.prank(owner);
+        vm.expectRevert(FeeLocker.InvalidShares.selector);
+        locker.setFeeShares(3000, 3000, 3000); // sums to 9000, not 10000
+    }
+
+    function test_setFeeShares_onlyOwner() public {
+        vm.expectRevert(); // non-owner
+        locker.setFeeShares(2500, 2500, 5000);
     }
 
     /// Bond WETH into a pool (simulate buys) so checkGraduation/curveProgress see it.
@@ -470,7 +531,7 @@ abstract contract V3LaunchpadTestBase is Test {
         if (expectToken0) pm.setCollectable(info.positionTokenId, 0, 1 ether);
         else pm.setCollectable(info.positionTokenId, 1 ether, 0);
         locker.claim(token);
-        assertEq(weth.balanceOf(bob), 0.5 ether, "CTO creator receives the dev WETH share");
+        assertEq(weth.balanceOf(bob), 0.25 ether, "CTO creator receives the 25% dev WETH share");
         assertEq(weth.balanceOf(creator), 0, "abandoning dev gets nothing after takeover");
 
         // Treasury can't null the creator.
