@@ -43,6 +43,20 @@ interface ILaunchFairV4SwapRouter {
         returns (uint256 out);
 }
 
+/// StockPairRouter.buy — used by createStockAndBuy for an atomic dev buy on a stock-paired token.
+interface IStockPairRouter {
+    function buy(address token, uint256 minOut, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256 out);
+}
+
+/// RouterGateHook.router — the router a gate hook is (immutably) bound to; used to verify the
+/// stock router and gate hook are a matched pair before wiring.
+interface IRouterGate {
+    function router() external view returns (address);
+}
+
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -83,10 +97,31 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     /// the owner at deploy (kept off the constructor to avoid a 16-arg signature).
     address public swapRouter;
 
+    // ── Stock-paired launches (additive; existing WETH-paired flow is untouched) ──
+    // A new token type whose pool is TOKEN/<stock> (e.g. TOKEN/AAPL) instead of TOKEN/WETH. Users
+    // still buy/sell with native ETH via the StockPairRouter (ETH↔WETH↔stock↔TOKEN); the pool is a
+    // 0-fee, RouterGateHook-gated pool and the WETH fee is charged at the router, so dev-fee logic is
+    // unchanged. v1: stock tokens launch as Base mode only.
+    /// @notice The 2-hop router that trades stock-paired tokens with native ETH.
+    address public stockPairRouter;
+    /// @notice The gate hook attached to every stock pool (reverts non-router swaps).
+    address public stockGateHook;
+    /// @notice Owner-approved quote (stock) tokens a launch may pair against.
+    mapping(address stock => bool) public allowedQuote;
+    /// @notice The Uniswap-V3 fee tier of each allowed quote's <stock>/WETH pool (for the router hop).
+    mapping(address stock => uint24) public quoteV3Fee;
+    event StockPairRouterSet(address router);
+    event StockGateHookSet(address hook);
+    event AllowedQuoteSet(address indexed stock, bool allowed, uint24 v3Fee);
+    event StockTokenLaunched(
+        address indexed token, address indexed creator, address indexed quoteToken, string name, string symbol
+    );
+
     struct Launch {
         address creator;
         PoolKey key;
         uint24 fee;
+        address quoteToken; // 0 for WETH-paired; the stock token for stock-paired launches
         bool exists;
     }
 
@@ -163,6 +198,8 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     error UnknownToken();
     error SwapRouterNotSet();
     error AlreadySet();
+    error QuoteNotAllowed();
+    error StockNotConfigured();
 
     constructor(
         address owner_,
@@ -239,6 +276,51 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 }
             } catch {
                 // Buy failed (e.g. exceeds the launch cap) — the token is live; refund the buy.
+                (bool okB,) = msg.sender.call{value: buyAmount}("");
+                if (!okB) revert CreationFeeTransferFailed();
+            }
+        }
+    }
+
+    /// @notice Create a **stock-paired** token: its pool is TOKEN/`quoteToken` (an allowed stock),
+    /// traded with native ETH via the StockPairRouter. v1: `p.mode` must be Base.
+    function createStockToken(CreateParams calldata p, address quoteToken)
+        external
+        payable
+        nonReentrant
+        returns (address token)
+    {
+        if (msg.value < creationFeeWei) revert InsufficientCreationFee();
+        token = _createStock(p, quoteToken);
+        _payCreationFee(token);
+        uint256 refund = msg.value - creationFeeWei; // no dev buy → refund any excess
+        if (refund > 0) {
+            (bool okR,) = msg.sender.call{value: refund}("");
+            if (!okR) revert CreationFeeTransferFailed();
+        }
+    }
+
+    /// @notice Create a stock-paired token AND buy some in the same tx (atomic dev buy, routed
+    /// through the StockPairRouter). Same refund-on-failure semantics as `createAndBuy`.
+    function createStockAndBuy(CreateParams calldata p, address quoteToken, uint256 minOut)
+        external
+        payable
+        nonReentrant
+        returns (address token)
+    {
+        if (msg.value < creationFeeWei) revert InsufficientCreationFee();
+        if (stockPairRouter == address(0)) revert StockNotConfigured();
+        token = _createStock(p, quoteToken);
+        _payCreationFee(token);
+        uint256 buyAmount = msg.value - creationFeeWei;
+        if (buyAmount > 0) {
+            try IStockPairRouter(stockPairRouter).buy{value: buyAmount}(token, minOut, msg.sender, block.timestamp) {
+                uint256 leftover = address(this).balance;
+                if (leftover > 0) {
+                    (bool okL,) = msg.sender.call{value: leftover}("");
+                    if (!okL) revert CreationFeeTransferFailed();
+                }
+            } catch {
                 (bool okB,) = msg.sender.call{value: buyAmount}("");
                 if (!okB) revert CreationFeeTransferFailed();
             }
@@ -431,7 +513,85 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             IDistributorV4Register(distributor).setPayoutInterval(token, p.payoutIntervalBlocks);
         }
 
-        _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, exists: true});
+        _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, quoteToken: address(0), exists: true});
+    }
+
+    /// @dev Core stock-token creation: validate, deploy a Base-mode token, launch it into a
+    /// TOKEN/`quoteToken` pool. Kept separate from `_create` so the WETH-paired path is untouched.
+    function _createStock(CreateParams calldata p, address quoteToken) internal returns (address token) {
+        if (!allowedQuote[quoteToken]) revert QuoteNotAllowed();
+        if (stockPairRouter == address(0) || stockGateHook == address(0)) revert StockNotConfigured();
+        if (p.mode != LaunchTokenV2.Mode.Base) revert InvalidMode(); // v1: stock tokens are Base only
+        _validate(p.name);
+        _validate(p.symbol);
+        _validate(p.metadata.logoURI);
+        _validate(p.metadata.website);
+        _validate(p.metadata.telegram);
+        _validate(p.metadata.discord);
+        _validate(p.metadata.twitter);
+
+        address[] memory noRewards; // Base mode → no reward assets
+        uint16[] memory noWeights;
+        token = deployer.deploy(
+            TokenDeployerV2.Params({
+                name: p.name,
+                symbol: p.symbol,
+                supply: tokenTotalSupply,
+                platformWebsite: officialWebsite,
+                metadata: p.metadata,
+                maxBuyBps: maxBuyBps,
+                maxBuyBlocks: maxBuyBlocks,
+                mode: LaunchTokenV2.Mode.Base,
+                rewardTokens: noRewards,
+                rewardWeights: noWeights,
+                prizeToken: address(0),
+                minHoldForRewards: 0
+            }),
+            keccak256(abi.encode(msg.sender, p.salt))
+        );
+
+        _launchStockOnV4(token, quoteToken);
+        emit StockTokenLaunched(token, msg.sender, quoteToken, p.name, p.symbol);
+    }
+
+    /// @dev Launch a stock-paired token: a TOKEN/`quoteToken` V4 pool at fee 0 with the gate hook,
+    /// the full supply locked single-sided. The pool price reuses `initialPriceWethPerToken` as
+    /// quote-per-token (both stock and WETH are 18-dp, so the math is identical); the resulting USD
+    /// launch mcap tracks the stock's price — a per-quote price knob can be added later if desired.
+    function _launchStockOnV4(address token, address quoteToken) internal {
+        LaunchTokenV2 t = LaunchTokenV2(token);
+        bool tokenIsCurrency0 = token < quoteToken;
+        (Currency c0, Currency c1) = tokenIsCurrency0
+            ? (Currency.wrap(token), Currency.wrap(quoteToken))
+            : (Currency.wrap(quoteToken), Currency.wrap(token));
+        PoolKey memory key = PoolKey({
+            currency0: c0,
+            currency1: c1,
+            fee: 0, // no LP fee — the fee is taken in WETH at the StockPairRouter
+            tickSpacing: tickSpacing,
+            hooks: IHooks(stockGateHook)
+        });
+
+        poolManager.initialize(key, _sqrtPriceX96For(initialPriceWethPerToken, tokenIsCurrency0));
+
+        (int24 tl, int24 tu) = tokenIsCurrency0 ? (tickLower0, tickUpper0) : (-tickUpper0, -tickLower0);
+        uint128 liquidity = tokenIsCurrency0
+            ? LiquidityMath.getLiquidityForAmount0(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), tokenTotalSupply)
+            : LiquidityMath.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), tokenTotalSupply);
+
+        // Plumbing: exclude from dividends + exempt from the launch guard. The stock router holds
+        // tokens transiently while executing a sell, so it must be limit-exempt too.
+        t.excludeFromDividends(address(poolManager), true);
+        t.excludeFromDividends(address(locker), true);
+        t.excludeFromDividends(stockPairRouter, true);
+        t.setLimitExempt(address(poolManager), true);
+        t.setLimitExempt(address(locker), true);
+        t.setLimitExempt(stockPairRouter, true);
+
+        IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
+        locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);
+
+        _launches[token] = Launch({creator: msg.sender, key: key, fee: 0, quoteToken: quoteToken, exists: true});
     }
 
     /// @dev A reward/prize venue must actually route WETH -> asset, else the
@@ -491,6 +651,36 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     function setFeeHook(address hook) external onlyOwner {
         feeHook = hook;
         emit FeeHookSet(hook);
+    }
+
+    /// @notice Set the stock-pair router used to trade stock-paired tokens (and by createStockAndBuy).
+    /// Set-once: the gate hook baked into every stock pool is immutably bound to this router, so
+    /// changing it would orphan (permanently un-trade) all existing stock pools. Migrate by
+    /// redeploying the launchpad (immutable-stack model).
+    function setStockPairRouter(address r) external onlyOwner {
+        if (r == address(0)) revert ZeroAddress();
+        if (stockPairRouter != address(0)) revert AlreadySet();
+        stockPairRouter = r;
+        emit StockPairRouterSet(r);
+    }
+
+    /// @notice Set the gate hook attached to new stock pools (a properly-mined `RouterGateHook`
+    /// bound to `stockPairRouter`). Set-once and consistency-checked so hook and router can never be
+    /// a mismatched pair (which would brick swaps). Set the router first.
+    function setStockGateHook(address hook) external onlyOwner {
+        if (hook == address(0)) revert ZeroAddress();
+        if (stockGateHook != address(0)) revert AlreadySet();
+        if (stockPairRouter == address(0) || IRouterGate(hook).router() != stockPairRouter) revert StockNotConfigured();
+        stockGateHook = hook;
+        emit StockGateHookSet(hook);
+    }
+
+    /// @notice Allow/deny a quote (stock) token and record its <stock>/WETH V3 fee tier for routing.
+    function setAllowedQuote(address stock, bool allowed, uint24 v3Fee) external onlyOwner {
+        if (stock == address(0) || stock == weth) revert QuoteNotAllowed();
+        allowedQuote[stock] = allowed;
+        quoteV3Fee[stock] = v3Fee;
+        emit AllowedQuoteSet(stock, allowed, v3Fee);
     }
 
     /// @notice Set the stock-perp venue for Mode.Perps launches. The venue is pinned per token at

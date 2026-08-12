@@ -83,6 +83,7 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     error DistributorAlreadySet();
     error AlreadyLocked();
     error UnknownToken();
+    error NotWethPaired();
     error ZeroAddress();
 
     constructor(address owner_, IPoolManager pm_, IERC20 weth_, address treasury_) Ownable(owner_) {
@@ -171,6 +172,12 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     {
         Position memory p = _positions[token];
         if (!p.exists) revert UnknownToken();
+        // Stock-paired pools (TOKEN/<stock>, no WETH leg) take their fee at the StockPairRouter, not
+        // here — their non-token side is the stock, so processing it as WETH would mis-transfer. This
+        // locker only handles WETH-paired positions (every pool this locker locks otherwise has WETH
+        // as one leg). Fee-0 WETH-paired hook pools still pass and sweep stray WETH to treasury.
+        address w = address(weth);
+        if (Currency.unwrap(p.key.currency0) != w && Currency.unwrap(p.key.currency1) != w) revert NotWethPaired();
 
         (uint256 tokenFees, uint256 wethFees) =
             abi.decode(poolManager.unlock(abi.encode(ACTION_CLAIM, token, uint256(0))), (uint256, uint256));

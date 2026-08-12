@@ -26,7 +26,9 @@ src/
 │       ├── LiquidityMath.sol           sqrtPrice / liquidity helpers
 │       ├── IPerpsVenue.sol             Perps-mode venue interface (marginToken / open / positionTokenFor)
 │       ├── PerpPositionToken.sol       fungible ERC20 share of a pooled leveraged position (redeem for WETH at NAV)
-│       └── ReferenceStockPerpVenue.sol reference venue — WETH margin, operator oracle, mints PerpPositionToken (NOT production)
+│       ├── ReferenceStockPerpVenue.sol reference venue — WETH margin, operator oracle, mints PerpPositionToken (NOT production)
+│       ├── StockPairRouter.sol         stock-paired tokens: buy/sell in ETH over a TOKEN/<stock> pool (2-hop V3+V4), WETH fee at the router
+│       └── RouterGateHook.sol          gate hook: only the StockPairRouter may swap a stock pool (so the WETH fee can't be bypassed)
 │
 ├── interfaces/
 │   └── IUniswapV3.sol       SHARED — used by V1 pools AND the V4 distributor's V3 buyback venue
@@ -67,6 +69,18 @@ into holder value per mode:
   `PerpPositionToken` (a share of a pooled leveraged stock-perp position) and distributes it hands-off
   like a reward token; holders hold / sell / redeem for WETH at NAV. `ReferenceStockPerpVenue` is a
   reference only (operator-set oracle) — a production venue needs a real oracle + liquidations.
+
+## Stock-paired tokens (`createStockToken`)
+
+An additive launch type whose liquidity pool is **`TOKEN/<stock>`** (e.g. `TOKEN/AAPL`, using the
+first-party Robinhood tokenized stocks) instead of `TOKEN/WETH` — so holders get built-in equity
+exposure. Users still **buy with native ETH and sell for ETH**: the `StockPairRouter` routes
+`ETH→WETH→stock→TOKEN` (and back) in one tx, hopping the `<stock>/WETH` leg on Uniswap V3 and the
+`TOKEN/<stock>` leg on our V4 pool. The **fee is taken in WETH at the router**, then split
+treasury/dev/flagship exactly like the WETH-paired path — so dev-fee economics are unchanged. The pool
+is a **0-fee, `RouterGateHook`-gated** pool (only the router may swap it), so the fee can't be
+bypassed. Quotes are an owner allowlist (`setAllowedQuote`); v1 launches are Base mode. Deploy with
+`script/DeployStockPair.s.sol`.
 
 ## Audits
 
