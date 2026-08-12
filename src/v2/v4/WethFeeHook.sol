@@ -28,6 +28,10 @@ interface IModeToken {
     function mode() external view returns (uint8); // 0 = Base/plain (no reward/lottery mechanism)
 }
 
+interface IWETH {
+    function withdraw(uint256) external;
+}
+
 /// @notice Uniswap V4 hook that charges a fee **in WETH on both buys and sells**, always taken
 /// from the WETH leg of the swap — so a sell produces **no token sell pressure**, and the fee is
 /// captured on **every** swap on the pool regardless of which router/aggregator routes it.
@@ -83,6 +87,14 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
     error InvalidSplit();
     error InvalidFeeBps();
     error NotConfigured();
+    error NotAuthorized();
+    error EthTransferFailed();
+
+    /// @dev The global tax knobs are settable by the owner (deployer) OR the treasury.
+    modifier onlyOwnerOrTreasury() {
+        if (msg.sender != owner() && msg.sender != treasury) revert NotAuthorized();
+        _;
+    }
 
     event FeeTaken(address indexed token, bool isBuy, uint256 wethFee);
     event Distributed(address indexed token, uint256 toTreasury, uint256 toDev, uint256 toMechanism, uint256 toFlagship);
@@ -122,7 +134,7 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         );
     }
 
-    function setFeeBps(uint16 bps) external onlyOwner {
+    function setFeeBps(uint16 bps) external onlyOwnerOrTreasury {
         if (bps > MAX_FEE_BPS) revert InvalidFeeBps();
         feeBps = bps;
         emit FeeBpsSet(bps);
@@ -139,8 +151,8 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         emit DestinationsSet(treasury_, distributor_, flagshipSink_, launchpad_);
     }
 
-    /// @notice Retune the 4-way WETH split (the four bps MUST sum to BPS).
-    function setSplit(uint16 t, uint16 d, uint16 m, uint16 f) external onlyOwner {
+    /// @notice Retune the 4-way split (the four bps MUST sum to BPS). Owner or treasury.
+    function setSplit(uint16 t, uint16 d, uint16 m, uint16 f) external onlyOwnerOrTreasury {
         if (uint256(t) + d + m + f != BPS) revert InvalidSplit();
         treasuryBps = t;
         devBps = d;
@@ -241,28 +253,41 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         uint256 toFlagship = (amount * flagshipBps) / BPS;
         uint256 toMechanism = amount - toTreasury - toDev - toFlagship; // remainder (mechanism + dust)
 
-        if (toTreasury > 0) w.safeTransfer(t, toTreasury);
+        // Mechanism slice stays in WETH — it feeds the on-chain buyback engine (the distributor swaps
+        // WETH→reward). Plain (Base) tokens have no mechanism → the slice folds into the flagship.
+        // Fund the mechanism only if the token has one AND the distributor accepts it; else fold.
+        bool notified;
+        if (toMechanism > 0 && distributor != address(0) && _hasMechanism(token)) {
+            try IDistributorV4(distributor).notify(token, toMechanism) {
+                w.safeTransfer(distributor, toMechanism);
+                notified = true;
+            } catch {}
+        }
+        uint256 flagshipTotal = toFlagship + (notified ? 0 : toMechanism);
+
+        // treasury + dev + flagship are paid in NATIVE ETH (never WETH) — unwrap that portion.
+        uint256 ethPortion = toTreasury + toDev + flagshipTotal;
+        if (ethPortion > 0) IWETH(weth).withdraw(ethPortion);
+        if (toTreasury > 0) _payEth(t, toTreasury);
         if (toDev > 0) {
             address dev = launchpad != address(0) ? ICreatorRegistryV4(launchpad).creatorOf(token) : address(0);
-            w.safeTransfer(dev == address(0) ? t : dev, toDev);
+            _payEth(dev == address(0) ? t : dev, toDev);
         }
-        if (toFlagship > 0) w.safeTransfer(flagshipSink == address(0) ? t : flagshipSink, toFlagship);
-        if (toMechanism > 0) {
-            // Plain (Base, mode 0) tokens have no reward/lottery mechanism → their mechanism slice
-            // funds the FLAGSHIP instead (like V1 plain tokens). Mode tokens route to the distributor.
-            bool notified;
-            if (distributor != address(0) && _hasMechanism(token)) {
-                // Credit the mechanism, then fund it. If the distributor rejects this token (e.g. the
-                // hook isn't an authorized notifier, or an unknown token), fall back to the flagship
-                // so a token's fees can never strand on a reverting notify.
-                try IDistributorV4(distributor).notify(token, toMechanism) {
-                    w.safeTransfer(distributor, toMechanism);
-                    notified = true;
-                } catch {}
-            }
-            if (!notified) w.safeTransfer(flagshipSink == address(0) ? t : flagshipSink, toMechanism);
-        }
-        emit Distributed(token, toTreasury, toDev, toMechanism, toFlagship);
+        if (flagshipTotal > 0) _payEth(flagshipSink == address(0) ? t : flagshipSink, flagshipTotal);
+
+        emit Distributed(token, toTreasury, toDev, notified ? toMechanism : 0, toFlagship);
+    }
+
+    /// @dev Send native ETH; reverts if the recipient rejects it (retryable — `accrued` was already
+    /// zeroed in `distribute`, but a revert unwinds that too). Recipients should accept ETH.
+    function _payEth(address to, uint256 value) private {
+        (bool ok,) = to.call{value: value}("");
+        if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Accept ETH only from unwrapping WETH (during `distribute`).
+    receive() external payable {
+        if (msg.sender != weth) revert EthTransferFailed();
     }
 
     /// @dev True when the token has a reward/lottery mechanism (mode != Base). Falls back to false

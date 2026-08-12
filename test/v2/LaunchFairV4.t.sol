@@ -95,6 +95,7 @@ contract LaunchFairV4Test is Test, Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         weth = new MockWethT();
+        vm.deal(address(weth), 10_000 ether);
         v3factory = new MockV3FactoryT();
         v3router = new MockV3RouterT();
 
@@ -204,7 +205,7 @@ contract LaunchFairV4Test is Test, Deployers {
         );
         address hookAddr = address(flags | (uint160(0x7777) << 144));
         deployCodeTo("WethFeeHook.sol:WethFeeHook", abi.encode(address(this), manager, address(weth), uint16(100)), hookAddr);
-        WethFeeHook hook = WethFeeHook(hookAddr);
+        WethFeeHook hook = WethFeeHook(payable(hookAddr));
         hook.setDestinations(TREASURY, address(dist), FLAGSHIP, address(pad));
         pad.setFeeHook(hookAddr);
 
@@ -249,8 +250,8 @@ contract LaunchFairV4Test is Test, Deployers {
         // Distribute → plain token: mechanism folds into the flagship (no reward/lottery).
         hook.distribute(token);
         assertEq(hook.accrued(token), 0, "accrual cleared");
-        assertGt(weth.balanceOf(FLAGSHIP), 0, "flagship funded (flagship + mechanism for a plain token)");
-        assertGt(weth.balanceOf(TREASURY), 0, "treasury funded");
+        assertGt(FLAGSHIP.balance, 0, "flagship funded (flagship + mechanism for a plain token)");
+        assertGt(TREASURY.balance, 0, "treasury funded");
         assertEq(dist.pendingWeth(token), 0, "plain token never funds the reward/lottery distributor");
     }
 

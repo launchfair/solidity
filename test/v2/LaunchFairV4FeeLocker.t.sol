@@ -20,6 +20,9 @@ contract MockToken is ERC20 {
     function mint(address to, uint256 a) external {
         _mint(to, a);
     }
+    function deposit() external payable { _mint(msg.sender, msg.value); }
+    function withdraw(uint256 a) external { _burn(msg.sender, a); (bool ok,) = msg.sender.call{value: a}(""); require(ok, "w"); }
+    receive() external payable { _mint(msg.sender, msg.value); }
 }
 
 contract MockDistributor {
@@ -53,6 +56,7 @@ contract V4FeeLockerTest is Test, Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         weth = new MockToken("WETH", "WETH");
+        vm.deal(address(weth), 10_000 ether);
 
         LaunchTokenV2.Metadata memory meta;
         token = new LaunchTokenV2(
@@ -119,8 +123,8 @@ contract V4FeeLockerTest is Test, Deployers {
         // Buy-side WETH split (3% tier): treasury == dev, mechanism ~4x each side.
         assertGt(t, 0, "treasury got WETH");
         assertEq(t, d, "treasury == dev");
-        assertEq(weth.balanceOf(TREASURY), t, "treasury paid in WETH");
-        assertEq(weth.balanceOf(DEV), d, "dev paid in WETH");
+        assertEq(TREASURY.balance, t, "treasury paid in WETH");
+        assertEq(DEV.balance, d, "dev paid in WETH");
         assertApproxEqRel(mech, t * 4, 0.02e18, "mechanism ~4x each side (66.66/16.67)");
         assertEq(dist.pendingWeth(address(token)), mech, "mechanism routed to distributor");
 
@@ -141,11 +145,11 @@ contract V4FeeLockerTest is Test, Deployers {
         (, uint256 t, uint256 d, uint256 mech, uint256 flag) = locker.claim(address(token));
 
         assertGt(flag, 0, "flagship got a cut");
-        assertEq(weth.balanceOf(FLAGSHIP), flag, "flagship paid to the sink");
+        assertEq(FLAGSHIP.balance, flag, "flagship paid to the sink");
         // Carved from dev ONLY: treasury == the pre-carve dev (= reduced dev + flagship cut).
         assertEq(t, d + flag, "flagship carved from the dev slice; treasury untouched");
-        assertEq(weth.balanceOf(TREASURY), t, "treasury paid its full slice");
-        assertEq(weth.balanceOf(DEV), d, "dev paid the reduced slice");
+        assertEq(TREASURY.balance, t, "treasury paid its full slice");
+        assertEq(DEV.balance, d, "dev paid the reduced slice");
         // Mechanism (reward/lottery buyback) is never reduced.
         assertEq(dist.pendingWeth(address(token)), mech, "mechanism untouched, routed to distributor");
         // 0.1% of the trade @ the 3% tier == ~20% of the (16.67%) dev slice.

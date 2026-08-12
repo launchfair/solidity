@@ -19,6 +19,9 @@ contract HookMockToken is ERC20 {
     function mint(address to, uint256 a) external {
         _mint(to, a);
     }
+    function deposit() external payable { _mint(msg.sender, msg.value); }
+    function withdraw(uint256 a) external { _burn(msg.sender, a); (bool ok,) = msg.sender.call{value: a}(""); require(ok, "w"); }
+    receive() external payable { _mint(msg.sender, msg.value); }
 }
 
 contract WethFeeHookTest is Test, Deployers {
@@ -35,6 +38,7 @@ contract WethFeeHookTest is Test, Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         weth = new HookMockToken("WETH", "WETH");
+        vm.deal(address(weth), 10_000 ether);
         token = new HookMockToken("TOK", "TOK");
         token.mint(address(this), 1_000_000_000 ether);
         weth.mint(address(this), 10_000_000 ether);
@@ -46,7 +50,7 @@ contract WethFeeHookTest is Test, Deployers {
         );
         address hookAddr = address(flags | (uint160(0x4444) << 144));
         deployCodeTo("WethFeeHook.sol:WethFeeHook", abi.encode(address(this), manager, address(weth), FEE_BPS), hookAddr);
-        hook = WethFeeHook(hookAddr);
+        hook = WethFeeHook(payable(hookAddr));
         // dev + mechanism fold into treasury here (launchpad + distributor left unset).
         hook.setDestinations(TREASURY, address(0), FLAGSHIP, address(0));
 
@@ -109,8 +113,8 @@ contract WethFeeHookTest is Test, Deployers {
         // gets treasury+dev (50%), flagship gets flagship+mechanism (50%).
         uint256 tre = (acc * 2500) / 10_000 + (acc * 2500) / 10_000;
         uint256 flag = acc - tre;
-        assertEq(weth.balanceOf(TREASURY), tre, "treasury + dev = 50%");
-        assertEq(weth.balanceOf(FLAGSHIP), flag, "flagship + mechanism = 50%");
+        assertEq(TREASURY.balance, tre, "treasury + dev = 50%");
+        assertEq(FLAGSHIP.balance, flag, "flagship + mechanism = 50%");
     }
 
     function test_setSplit_mustSumToBps() public {

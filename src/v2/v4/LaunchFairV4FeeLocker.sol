@@ -26,6 +26,10 @@ interface IDistributorV4 {
     function notify(address token, uint256 amount) external;
 }
 
+interface IWETH {
+    function withdraw(uint256) external;
+}
+
 /// @notice Owns each V4 token's single-sided liquidity FOREVER (added once, never
 /// removed — no decrease function exists) and routes claimed fees:
 ///   - sell-side token fees -> BURNED (deflationary, no sell pressure)
@@ -85,6 +89,14 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     error UnknownToken();
     error NotWethPaired();
     error ZeroAddress();
+    error NotAuthorized();
+    error EthTransferFailed();
+
+    /// @dev Fee-routing knobs are settable by the owner (deployer) OR the treasury.
+    modifier onlyOwnerOrTreasury() {
+        if (msg.sender != owner() && msg.sender != treasury) revert NotAuthorized();
+        _;
+    }
 
     constructor(address owner_, IPoolManager pm_, IERC20 weth_, address treasury_) Ownable(owner_) {
         if (address(pm_) == address(0) || address(weth_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
@@ -123,13 +135,13 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
 
     /// @notice Set the flat flagship-buyback cut, in bps OF THE TRADE (10 = 0.1%). Carved from
     /// the dev slice only, capped at it; treasury + mechanism are never touched.
-    function setFlagshipTradeBps(uint16 tradeBps) external onlyOwner {
+    function setFlagshipTradeBps(uint16 tradeBps) external onlyOwnerOrTreasury {
         flagshipTradeBps = tradeBps;
         emit FlagshipTradeBpsSet(tradeBps);
     }
 
-    /// @notice Owner-tune a fee tier's per-side split (treasury == dev).
-    function setSideBps(uint24 fee, uint16 side) external onlyOwner {
+    /// @notice Tune a fee tier's per-side split (treasury == dev). Owner or treasury.
+    function setSideBps(uint24 fee, uint16 side) external onlyOwnerOrTreasury {
         _setSideBps(fee, side);
     }
 
@@ -189,11 +201,10 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
         if (wethFees > 0) {
             if (!isSupportedFee(p.key.fee)) {
                 // Fee-0 (hook) pool: the locked LP position earns no swap fees, so any WETH here is
-                // a stray donation. Sweep it to treasury rather than splitting — `splitOf` would
-                // revert UnsupportedFee and the carve would divide by a 0 fee. Hook-launched tokens
-                // route their real fees through the WethFeeHook, not this locker.
+                // a stray donation. Sweep it to treasury (in ETH) rather than splitting.
                 wethToTreasury = wethFees;
-                weth.safeTransfer(treasury, wethToTreasury);
+                IWETH(address(weth)).withdraw(wethFees);
+                _payEth(treasury, wethFees);
             } else {
                 (wethToTreasury, wethToDev, wethToMechanism) = splitOf(p.key.fee, wethFees);
 
@@ -210,12 +221,16 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
                     wethToFlagship = cut;
                 }
 
-                if (wethToTreasury > 0) weth.safeTransfer(treasury, wethToTreasury);
+                // treasury + dev + flagship are paid in NATIVE ETH (unwrap that portion); the
+                // mechanism slice stays WETH — it feeds the on-chain buyback engine (distributor).
+                uint256 ethPortion = wethToTreasury + wethToDev + wethToFlagship;
+                if (ethPortion > 0) IWETH(address(weth)).withdraw(ethPortion);
+                if (wethToTreasury > 0) _payEth(treasury, wethToTreasury);
                 if (wethToDev > 0) {
                     address dev = ICreatorRegistryV4(launchpad).creatorOf(token);
-                    weth.safeTransfer(dev == address(0) ? treasury : dev, wethToDev);
+                    _payEth(dev == address(0) ? treasury : dev, wethToDev);
                 }
-                if (wethToFlagship > 0) weth.safeTransfer(sink, wethToFlagship);
+                if (wethToFlagship > 0) _payEth(sink, wethToFlagship);
                 if (wethToMechanism > 0) {
                     weth.safeTransfer(distributor, wethToMechanism);
                     IDistributorV4(distributor).notify(token, wethToMechanism);
@@ -225,6 +240,17 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
         emit FeesClaimed(
             token, uint8(LaunchTokenV2(token).mode()), tokensBurned, wethToTreasury, wethToDev, wethToMechanism, wethToFlagship
         );
+    }
+
+    /// @dev Send native ETH; reverts if the recipient rejects it. Recipients should accept ETH.
+    function _payEth(address to, uint256 value) private {
+        (bool ok,) = to.call{value: value}("");
+        if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Accept ETH only from unwrapping WETH during a claim.
+    receive() external payable {
+        if (msg.sender != address(weth)) revert EthTransferFailed();
     }
 
     // ── V4 flash-accounting callback ─────────────────────────────────────────

@@ -181,20 +181,35 @@ contract StockPairRouterTest is Test, Deployers {
         assertEq(stock.balanceOf(address(router)), 0, "router holds no stock");
     }
 
-    function test_distribute_splitsWethExactly() public {
+    function test_distribute_paysEth() public {
         vm.deal(ALICE, 5 ether);
         vm.prank(ALICE);
         router.buy{value: 1 ether}(address(token), 0, ALICE, block.timestamp + 1);
 
         uint256 amt = router.accrued(address(token)); // 0.01 ether
+        uint256 t0 = TREASURY.balance;
+        uint256 c0 = CREATOR.balance;
+        uint256 f0 = FLAGSHIP.balance;
         router.distribute(address(token));
 
+        // Fees are paid out as native ETH, not WETH.
         assertEq(router.accrued(address(token)), 0, "accrued zeroed");
-        assertEq(weth.balanceOf(TREASURY), amt * 2500 / 10000, "treasury 25%");
-        assertEq(weth.balanceOf(CREATOR), amt * 2500 / 10000, "dev 25% to creator");
+        assertEq(TREASURY.balance - t0, amt * 2500 / 10000, "treasury 25% in ETH");
+        assertEq(CREATOR.balance - c0, amt * 2500 / 10000, "dev 25% in ETH");
         // flagship gets its 10% + the folded 40% mechanism = 50% (Base token, no mechanism).
-        assertEq(weth.balanceOf(FLAGSHIP), amt - (amt * 2500 / 10000) * 2, "flagship 50%");
-        assertEq(weth.balanceOf(address(router)), 0, "router drained");
+        assertEq(FLAGSHIP.balance - f0, amt - (amt * 2500 / 10000) * 2, "flagship 50% in ETH");
+        assertEq(address(router).balance, 0, "router holds no ETH");
+        assertEq(weth.balanceOf(address(router)), 0, "router holds no WETH");
+    }
+
+    /// The global tax is settable by the treasury as well as the owner.
+    function test_setFeeBps_ownerOrTreasury() public {
+        vm.prank(TREASURY);
+        router.setFeeBps(250);
+        assertEq(router.feeBps(), 250, "treasury retuned the global tax");
+        vm.prank(ALICE);
+        vm.expectRevert(StockPairRouter.NotAuthorized.selector);
+        router.setFeeBps(300);
     }
 
     function test_buy_slippageReverts() public {

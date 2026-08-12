@@ -102,6 +102,25 @@ sibling contracts.
 `createStockToken`/`createStockAndBuy` end-to-end, quote-not-allowed / non-Base rejects, and the three
 audit-fix guards (M-1 set-once + consistency, L-1 locker rejection). Full suite: **167 pass, 0 fail**.
 
+## Post-audit change (2026-08-12): ETH payout + treasury-settable tax
+
+Per product direction ("everyone should get ETH; deployer or treasury can set the tax"), the fee
+distribution now pays **native ETH** to dev/treasury/flagship (unwrapping the WETH first), and the
+global tax knobs are settable by **owner OR treasury**. Applied to `StockPairRouter.distribute`,
+`WethFeeHook._split`, and `LaunchFairV4FeeLocker.claim`. The **mechanism slice stays WETH** everywhere
+(it feeds the on-chain buyback engine, which swaps WETH→reward).
+
+Security of the ETH-payout (reentrancy is the main concern — `.call{value}` to dev/treasury/flagship):
+- `StockPairRouter.distribute` and `FeeLocker.claim` are `nonReentrant`, and each zeroes its accrued
+  state before paying — a reentrant call reverts on the guard.
+- `WethFeeHook._split` runs **inside** the PoolManager `unlock` (the ETH send happens mid-unlock), so a
+  reentrant `distribute` would attempt a nested `poolManager.unlock`, which the PoolManager rejects —
+  the reentry can't complete. `accrued` is also zeroed before the unlock.
+- DoS: a fee recipient that reverts on ETH receive makes that token's distribute/claim revert
+  (retryable — state unwinds); dev = `creatorOf` (usually an EOA), treasury/flagship are
+  platform-controlled. Accepted. The `flagshipSink`, once set, must accept ETH (have a `receive`).
+Full suite: 168 pass.
+
 ## Conclusion
 No Critical/High/Medium fund-safety or correctness issues survived review. The router faithfully
 preserves the invariants of the two audited templates it is built from, the fee cannot be bypassed, and

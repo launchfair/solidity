@@ -98,6 +98,14 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
     error InvalidFeeBps();
     error InvalidSplit();
     error NotConfigured();
+    error NotAuthorized();
+
+    /// @dev The global tax knobs (feeBps + split) are settable by the owner (deployer) OR the
+    /// treasury, so either can retune the tax for ALL stock tokens at once.
+    modifier onlyOwnerOrTreasury() {
+        if (msg.sender != owner() && msg.sender != treasury) revert NotAuthorized();
+        _;
+    }
 
     constructor(
         address owner_,
@@ -120,13 +128,14 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
     }
 
     // ── admin ────────────────────────────────────────────────────────────────
-    function setFeeBps(uint16 bps) external onlyOwner {
+    /// @notice Global tax for ALL stock tokens (bps of the WETH leg), settable by owner OR treasury.
+    function setFeeBps(uint16 bps) external onlyOwnerOrTreasury {
         if (bps > MAX_FEE_BPS) revert InvalidFeeBps();
         feeBps = bps;
         emit FeeBpsSet(bps);
     }
 
-    function setSplit(uint16 t, uint16 d, uint16 m, uint16 f) external onlyOwner {
+    function setSplit(uint16 t, uint16 d, uint16 m, uint16 f) external onlyOwnerOrTreasury {
         if (uint256(t) + d + m + f != BPS) revert InvalidSplit();
         treasuryBps = t;
         devBps = d;
@@ -260,30 +269,38 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
     }
 
     // ── fees ─────────────────────────────────────────────────────────────────
-    /// @notice Distribute a token's accrued WETH fees through the split (permissionless). The router
-    /// already holds the fee as real WETH, so this is a plain fan-out (no PoolManager redeem needed).
-    /// Dev = the token's creator (`creatorOf`); every unset destination falls back to treasury. The
-    /// mechanism slice folds into the flagship (stock tokens are Base — no reward/lottery mechanism).
+    /// @notice Distribute a token's accrued fees through the split (permissionless). The fee is held
+    /// as WETH but **paid out as native ETH** — devs and treasury get ETH, never WETH. Dev = the
+    /// token's creator (`creatorOf`); every unset destination falls back to treasury. The mechanism
+    /// slice folds into the flagship, so the flagship flywheel is funded from stock tokens too (set
+    /// `flagshipSink` to route it to the buyback; while unset it folds to treasury).
     function distribute(address token) external nonReentrant returns (uint256 amount) {
         amount = accrued[token];
         if (amount == 0) return 0;
         if (treasury == address(0)) revert NotConfigured();
         accrued[token] = 0;
 
-        IERC20 w = IERC20(address(weth));
         uint256 toTreasury = (amount * treasuryBps) / BPS;
         uint256 toDev = (amount * devBps) / BPS;
         // flagship gets its own slice + the folded mechanism slice + any rounding dust (remainder).
         uint256 toFlagship = amount - toTreasury - toDev;
 
+        weth.withdraw(amount); // unwrap the whole fee → native ETH; pay everyone in ETH
+        address dev = launchpad.creatorOf(token);
+        if (dev == address(0)) dev = treasury;
         address sink = flagshipSink == address(0) ? treasury : flagshipSink;
-        if (toTreasury > 0) w.safeTransfer(treasury, toTreasury);
-        if (toDev > 0) {
-            address dev = launchpad.creatorOf(token);
-            w.safeTransfer(dev == address(0) ? treasury : dev, toDev);
-        }
-        if (toFlagship > 0) w.safeTransfer(sink, toFlagship);
+        _payEth(treasury, toTreasury);
+        _payEth(dev, toDev);
+        _payEth(sink, toFlagship);
         emit Distributed(token, toTreasury, toDev, toFlagship);
+    }
+
+    /// @dev Send native ETH; reverts if the recipient rejects it (retryable — `accrued` is restored
+    /// by the revert). Recipients should be able to receive ETH (EOAs always can).
+    function _payEth(address to, uint256 value) private {
+        if (value == 0) return;
+        (bool ok,) = to.call{value: value}("");
+        if (!ok) revert EthTransferFailed();
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
