@@ -8,8 +8,10 @@ interface IUniswapV3Factory {
     function createPool(address tokenA, address tokenB, uint24 fee) external returns (address);
 }
 
-/// @notice SwapRouter02's exact-input single-hop swap (no deadline in the struct).
-/// Used to buy a reward token that lives on a Uniswap V3 pool.
+/// @notice SwapRouter02's exact-input swaps (no deadline in the structs).
+/// Used to buy a reward token that lives on a Uniswap V3 pool, and by the StockPairRouter
+/// for the <stock>/WETH leg (single-hop, or multi-hop via `exactInput` for stocks whose
+/// liquidity is quoted in USDG rather than WETH).
 interface IV3SwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -22,6 +24,16 @@ interface IV3SwapRouter {
     }
 
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    /// @notice Multi-hop exact-input. `path` = token(20) ++ fee(3) ++ token(20) [++ fee ++ token …].
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
 interface IWETH {

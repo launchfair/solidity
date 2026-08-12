@@ -72,6 +72,16 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
     /// @notice WETH fees accrued per token, pending `distribute`.
     mapping(address token => uint256) public accrued;
 
+    // ── multi-hop routes (owner/treasury-settable) ────────────────────────────
+    /// @notice Optional multi-hop V3 route per stock, for stocks whose deepest liquidity is quoted
+    /// in USDG (or any other bridge) rather than WETH: buy = WETH→…→stock, sell = stock→…→WETH,
+    /// in SwapRouter02 `exactInput` path encoding (token ++ fee ++ token […]). Empty ⇒ direct
+    /// single-hop through the launchpad's `quoteV3Fee` pool. Routes only affect execution quality —
+    /// the fee is skimmed on the WETH leg before/after routing, and the user's `minOut` still
+    /// guards the whole trade — so they carry the same trust level as the fee knobs.
+    mapping(address stock => bytes) public buyPathOf;
+    mapping(address stock => bytes) public sellPathOf;
+
     // ── fee-split config (owner-settable). Stock tokens are Base (no mechanism), so the mechanism
     //    slice folds into the flagship — matching the WethFeeHook's behavior for plain tokens. ──
     address public treasury; // platform treasury (fallback for any unset destination)
@@ -88,7 +98,9 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
     event FeeBpsSet(uint16 feeBps);
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
     event DestinationsSet(address treasury, address flagshipSink);
+    event QuoteRouteSet(address indexed stock, bytes buyPath, bytes sellPath);
 
+    error InvalidPath();
     error OnlyPoolManager();
     error Slippage();
     error Expired();
@@ -150,6 +162,33 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
         emit DestinationsSet(treasury_, flagshipSink_);
     }
 
+    /// @notice Set (or clear, with two empty paths) a stock's multi-hop V3 route. Both paths must
+    /// be set together and are shape-checked: buy runs WETH→…→stock, sell runs stock→…→WETH.
+    /// Settable by owner OR treasury — same trust level as the tax knobs (see `buyPathOf`).
+    function setQuoteRoute(address stock, bytes calldata buyPath, bytes calldata sellPath)
+        external
+        onlyOwnerOrTreasury
+    {
+        if (buyPath.length == 0 && sellPath.length == 0) {
+            delete buyPathOf[stock];
+            delete sellPathOf[stock];
+        } else {
+            _validatePath(buyPath, address(weth), stock);
+            _validatePath(sellPath, stock, address(weth));
+            buyPathOf[stock] = buyPath;
+            sellPathOf[stock] = sellPath;
+        }
+        emit QuoteRouteSet(stock, buyPath, sellPath);
+    }
+
+    /// @dev A well-formed `exactInput` path: token(20) ++ fee(3) ++ token(20) [++ fee ++ token …],
+    /// at least one hop, starting at `first` and ending at `last`.
+    function _validatePath(bytes calldata path, address first, address last) private pure {
+        if (path.length < 43 || (path.length - 20) % 23 != 0) revert InvalidPath();
+        if (address(bytes20(path[0:20])) != first) revert InvalidPath();
+        if (address(bytes20(path[path.length - 20:])) != last) revert InvalidPath();
+    }
+
     // ── trade ────────────────────────────────────────────────────────────────
     /// @notice Buy `token` with native ETH. Routes ETH→WETH→stock→TOKEN; the WETH fee is skimmed
     /// before the stock hop. `minOut` is the minimum TOKEN delivered to `to`.
@@ -169,8 +208,8 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
             accrued[token] += fee;
             emit FeeAccrued(token, true, fee);
         }
-        // Hop 1: WETH → stock on V3.
-        uint256 stockAmt = _v3ExactIn(address(weth), stock, v3Fee, msg.value - fee);
+        // Hop 1: WETH → stock on V3 (multi-hop via the stock's route when one is set).
+        uint256 stockAmt = _v3ToStock(stock, v3Fee, msg.value - fee);
         // Hop 2: stock → TOKEN on our V4 pool, delivered straight to `to`.
         uint256 stockSpent;
         (out, stockSpent) =
@@ -201,8 +240,8 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
         (stockAmt, tokenSpent) =
             abi.decode(poolManager.unlock(abi.encode(key, token, amountIn, stock, address(this))), (uint256, uint256));
         if (tokenSpent < amountIn) IERC20(token).safeTransfer(msg.sender, amountIn - tokenSpent);
-        // Hop 2: stock → WETH on V3.
-        uint256 wethOut = _v3ExactIn(stock, address(weth), v3Fee, stockAmt);
+        // Hop 2: stock → WETH on V3 (multi-hop via the stock's route when one is set).
+        uint256 wethOut = _v3FromStock(stock, v3Fee, stockAmt);
         // Skim the fee off the WETH out.
         uint256 fee = (wethOut * feeBps) / BPS;
         out = wethOut - fee;
@@ -215,6 +254,20 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
         (bool ok,) = to.call{value: out}("");
         if (!ok) revert EthTransferFailed();
         emit Sold(token, msg.sender, to, amountIn, out);
+    }
+
+    /// @dev WETH → stock: the stock's multi-hop route when set, else direct via `quoteV3Fee`.
+    function _v3ToStock(address stock, uint24 v3Fee, uint256 amountIn) internal returns (uint256) {
+        bytes memory path = buyPathOf[stock];
+        if (path.length == 0) return _v3ExactIn(address(weth), stock, v3Fee, amountIn);
+        return _v3ExactInPath(address(weth), path, amountIn);
+    }
+
+    /// @dev stock → WETH: the stock's multi-hop route when set, else direct via `quoteV3Fee`.
+    function _v3FromStock(address stock, uint24 v3Fee, uint256 amountIn) internal returns (uint256) {
+        bytes memory path = sellPathOf[stock];
+        if (path.length == 0) return _v3ExactIn(stock, address(weth), v3Fee, amountIn);
+        return _v3ExactInPath(stock, path, amountIn);
     }
 
     /// @dev V3 exact-input single-hop swap, output to this router. Slippage is enforced by the
@@ -233,6 +286,23 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
                 amountIn: amountIn,
                 amountOutMinimum: 0,
                 sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
+    /// @dev V3 exact-input multi-hop swap along `path`, output to this router. Same slippage model
+    /// as `_v3ExactIn`: the caller's final `minOut` guards the whole trade, intermediate min is 0.
+    function _v3ExactInPath(address tokenIn, bytes memory path, uint256 amountIn)
+        internal
+        returns (uint256 amountOut)
+    {
+        IERC20(tokenIn).forceApprove(address(v3Router), amountIn);
+        amountOut = v3Router.exactInput(
+            IV3SwapRouter.ExactInputParams({
+                path: path,
+                recipient: address(this),
+                amountIn: amountIn,
+                amountOutMinimum: 0
             })
         );
     }

@@ -45,13 +45,28 @@ contract MockWethT is ERC20 {
 
 /// Minimal SwapRouter02 stand-in: pulls `amountIn` of `tokenIn` and mints `amountIn` of `tokenOut`
 /// (1:1) to the recipient. Both tokens are MockWethT (mintable); WETH out is backed by ETH the test
-/// pre-funds into the WETH mock.
+/// pre-funds into the WETH mock. `exactInput` (multi-hop) records the path so tests can assert the
+/// routed leg was actually taken.
 contract MockV3Router {
+    bytes public lastPath;
+    uint256 public pathCalls;
+
     function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external returns (uint256 out) {
         MockWethT(payable(p.tokenIn)).transferFrom(msg.sender, address(this), p.amountIn);
         out = p.amountIn; // 1:1
         require(out >= p.amountOutMinimum, "slip");
         MockWethT(payable(p.tokenOut)).mint(p.recipient, out);
+    }
+
+    function exactInput(IV3SwapRouter.ExactInputParams calldata p) external returns (uint256 out) {
+        lastPath = p.path;
+        pathCalls++;
+        address tokenIn = address(bytes20(p.path[0:20]));
+        address tokenOut = address(bytes20(p.path[p.path.length - 20:]));
+        MockWethT(payable(tokenIn)).transferFrom(msg.sender, address(this), p.amountIn);
+        out = p.amountIn; // 1:1 across the whole path
+        require(out >= p.amountOutMinimum, "slip");
+        MockWethT(payable(tokenOut)).mint(p.recipient, out);
     }
 }
 
@@ -250,6 +265,95 @@ contract StockPairRouterTest is Test, Deployers {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+    }
+
+    // ── multi-hop quote routes (stocks whose liquidity is quoted in USDG, not WETH) ──
+
+    function _usdgPaths(address usdg) internal view returns (bytes memory buyPath, bytes memory sellPath) {
+        buyPath = abi.encodePacked(address(weth), uint24(100), usdg, uint24(3000), address(stock));
+        sellPath = abi.encodePacked(address(stock), uint24(3000), usdg, uint24(100), address(weth));
+    }
+
+    function test_setQuoteRoute_validatesPaths() public {
+        MockWethT usdg = new MockWethT();
+        (bytes memory buyPath, bytes memory sellPath) = _usdgPaths(address(usdg));
+
+        // Wrong first token on the buy path (must start at WETH).
+        bytes memory badStart = abi.encodePacked(address(usdg), uint24(100), address(weth), uint24(3000), address(stock));
+        vm.expectRevert(StockPairRouter.InvalidPath.selector);
+        router.setQuoteRoute(address(stock), badStart, sellPath);
+
+        // Wrong last token on the sell path (must end at WETH).
+        bytes memory badEnd = abi.encodePacked(address(stock), uint24(3000), address(usdg));
+        vm.expectRevert(StockPairRouter.InvalidPath.selector);
+        router.setQuoteRoute(address(stock), buyPath, badEnd);
+
+        // Malformed length (not 20 + n*23).
+        vm.expectRevert(StockPairRouter.InvalidPath.selector);
+        router.setQuoteRoute(address(stock), abi.encodePacked(address(weth), uint24(100)), sellPath);
+
+        // Only owner or treasury may set routes.
+        vm.prank(ALICE);
+        vm.expectRevert(StockPairRouter.NotAuthorized.selector);
+        router.setQuoteRoute(address(stock), buyPath, sellPath);
+
+        // Treasury can set (same trust level as the tax knobs).
+        vm.prank(TREASURY);
+        router.setQuoteRoute(address(stock), buyPath, sellPath);
+        assertEq(router.buyPathOf(address(stock)), buyPath, "buy path stored");
+        assertEq(router.sellPathOf(address(stock)), sellPath, "sell path stored");
+    }
+
+    function test_buy_viaMultiHopRoute() public {
+        MockWethT usdg = new MockWethT();
+        (bytes memory buyPath, bytes memory sellPath) = _usdgPaths(address(usdg));
+        router.setQuoteRoute(address(stock), buyPath, sellPath);
+
+        vm.deal(ALICE, 5 ether);
+        vm.prank(ALICE);
+        uint256 out = router.buy{value: 1 ether}(address(token), 0, ALICE, block.timestamp + 1);
+
+        assertGt(out, 0, "received tokens");
+        assertEq(token.balanceOf(ALICE), out, "tokens landed with ALICE");
+        assertEq(router.accrued(address(token)), 0.01 ether, "fee still skimmed on the WETH leg");
+        assertEq(v3router.pathCalls(), 1, "multi-hop path used");
+        assertEq(v3router.lastPath(), buyPath, "buy took the WETH->USDG->stock route");
+        assertEq(stock.balanceOf(address(router)), 0, "router holds no stock");
+    }
+
+    function test_sell_viaMultiHopRoute() public {
+        MockWethT usdg = new MockWethT();
+        (bytes memory buyPath, bytes memory sellPath) = _usdgPaths(address(usdg));
+        router.setQuoteRoute(address(stock), buyPath, sellPath);
+
+        vm.deal(ALICE, 5 ether);
+        vm.prank(ALICE);
+        uint256 bought = router.buy{value: 1 ether}(address(token), 0, ALICE, block.timestamp + 1);
+
+        uint256 ethBefore = ALICE.balance;
+        vm.startPrank(ALICE);
+        token.approve(address(router), bought);
+        uint256 ethOut = router.sell(address(token), bought, 0, ALICE, block.timestamp + 1);
+        vm.stopPrank();
+
+        assertGt(ethOut, 0, "received ETH");
+        assertEq(ALICE.balance, ethBefore + ethOut, "ETH landed with ALICE");
+        assertEq(v3router.pathCalls(), 2, "both legs used the path");
+        assertEq(v3router.lastPath(), sellPath, "sell took the stock->USDG->WETH route");
+    }
+
+    function test_clearQuoteRoute_fallsBackToDirect() public {
+        MockWethT usdg = new MockWethT();
+        (bytes memory buyPath, bytes memory sellPath) = _usdgPaths(address(usdg));
+        router.setQuoteRoute(address(stock), buyPath, sellPath);
+        router.setQuoteRoute(address(stock), "", ""); // clear
+
+        assertEq(router.buyPathOf(address(stock)).length, 0, "buy path cleared");
+        vm.deal(ALICE, 5 ether);
+        vm.prank(ALICE);
+        uint256 out = router.buy{value: 1 ether}(address(token), 0, ALICE, block.timestamp + 1);
+        assertGt(out, 0, "direct route still works");
+        assertEq(v3router.pathCalls(), 0, "multi-hop path not used after clearing");
     }
 }
 
