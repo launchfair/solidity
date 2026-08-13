@@ -334,9 +334,10 @@ receiving exactly its 50%.
    curve-token fee controls in the dashboard.
 4. **Post-TGE sink repoint** — flip both flagship sinks from the TGE to the buyback keeper
    (dashboard action, §5).
-5. **Production rollout checklist** — updated indexer + envs on the servers (including the stock
-   router address and the WS push secret — remember it fails *closed*), frontend RPC pointed at the
-   API proxy, X callback URLs registered in the X developer portal, shared API secret on both
-   servers, X quest scanner running on a schedule, and previously-linked X users relinking once.
+5. **Production rollout checklist** — updated indexer + envs on the servers (the new stack
+   addresses, `ROBINHOOD_CORE_TGE` so the core token indexes at launch, and the WS push secret —
+   remember it fails *closed*), frontend RPC pointed at the API proxy, X callback URLs registered
+   in the X developer portal, shared API secret on both servers, X quest scanner running on a
+   schedule, and previously-linked X users relinking once.
 6. **Later / optional:** Perps mode production venue + oracle (then un-sunset the UI), trustless
    drand lottery via the new BLS precompiles.
