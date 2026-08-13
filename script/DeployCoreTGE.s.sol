@@ -30,7 +30,7 @@ contract DeployCoreTGE is Script {
     address constant DEFAULT_STOCK_FEE_HOOK = 0x37Db3428A84f72e0df3d786483eaa1d1558d80CC;
     /// The live launchpad's TokenDeployerV2 (LaunchFairV4.deployer()) — the core token must
     /// come from the SAME factory as every launchpad token so aggregators index it as ours.
-    address constant DEFAULT_TOKEN_DEPLOYER = 0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6;
+    address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
     string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
 
     function run() external {

@@ -47,17 +47,15 @@ contract E2ECoreLaunch is Script {
         address core = tge.launch("Fair Core", "FCORE", 1_000_000_000 ether, meta);
         vm.stopBroadcast();
 
-        // 4. A mimic user buys the core off the locked V3 pool (1% tier), ETH in.
-        uint256 mimicPk = uint256(keccak256(abi.encodePacked("lf-e2e-mimic", uint256(0)))) % ORDER;
-        address mimic = vm.addr(mimicPk);
-        vm.startBroadcast(mimicPk);
-        uint256 got = v3r.exactInputSingle{value: 0.0005 ether}(
+        // 4. Sanity buy off the locked V3 pool (1% tier), ETH in — tester-funded dust clip.
+        vm.startBroadcast(pk);
+        uint256 got = v3r.exactInputSingle{value: 0.00005 ether}(
             IV3SwapRouter.ExactInputSingleParams({
                 tokenIn: WETH,
                 tokenOut: core,
                 fee: 10_000,
-                recipient: mimic,
-                amountIn: 0.0005 ether,
+                recipient: vm.addr(pk),
+                amountIn: 0.00005 ether,
                 amountOutMinimum: 0,
                 sqrtPriceLimitX96: 0
             })

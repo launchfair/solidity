@@ -60,7 +60,7 @@ contract DeployV4 is Script {
     // The live TokenDeployerV2 (stateless CREATE2 factory, reused across redeploys so every
     // token generation — including the CoreTGE's core token — shares ONE on-chain creator,
     // which is what external indexers key on). Zero => deploy a fresh one.
-    address constant DEFAULT_TOKEN_DEPLOYER = 0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6;
+    address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
 
     function run() external {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level

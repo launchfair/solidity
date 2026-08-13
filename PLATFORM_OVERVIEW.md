@@ -309,18 +309,18 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 | Contract | Address |
 |---|---|
-| CoreTGE (war chest + factory launcher, LAUNCHED) | `0x1cc508B77E14922cb77a2D8fcBfAB2D2aD977Ff2` |
-| **FCORE core token** (factory-deployed, locked LP `681930`) | `0xDf7242C0032abCe3Ec0084E19E7B8A8e63A7F7d0` |
-| **FlagshipBuyback vault** (contract-held buybacks, all sinks point here) | `0x542dfe0300C7B54f084Efa235EB97c0deDe5dFfd` |
-| SeasonMerkleDistributor (rootPublisher = the vault) | `0xd5434a639334634144Eed1771459a675096B11A2` |
-| LaunchFair V4 launchpad (vault-mode stack, per-quote launch prices) | `0xc2FA0e5fd621fd3e4C6b963CB113AA607435D02c` |
-| TokenDeployerV2 (the one token factory, reused across stacks) | `0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6` |
-| V4 FeeLocker | `0xb77d0647Ad8Ff7654EE7060EaE19D5FDeb900935` |
-| V4 Distributor (modes engine) | `0x20a848694CE9Ab6cDd749dC7ccD16DB372aBBFDB` |
-| VRF Coordinator (drand) | `0x36174C3F4Efd37d70e1068634f74127054d85f70` |
+| CoreTGE (war chest + factory launcher, LAUNCHED) | `0x4b797B3258f2412494254714c421A80cB49684d0` |
+| **FCORE core token** (factory-deployed, locked LP `682103`, launch-price FLOOR active) | `0xc9843e2ff8Cf6Cc74ef0EAA96EA9E2016772fDdf` |
+| **FlagshipBuyback vault** (contract-held buybacks, all sinks point here) | `0xedc336402D985B3FD7116E443d7C2c280CbCEa94` |
+| SeasonMerkleDistributor (rootPublisher = the vault) | `0x60F3c300C208c5bF26F6e722f6d5Aa4D37fC35B2` |
+| LaunchFair V4 launchpad (guarded stack: 1%/60s launch window, per-quote launch prices) | `0xbb872Eb5Fc3F10B45df627caBc6B7d8aD000185B` |
+| TokenDeployerV2 (token factory gen-2: time-based launch guard) | `0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7` |
+| V4 FeeLocker | `0xa67c2deDC1A84b5a190825d1c028E1F9c11e4861` |
+| V4 Distributor (modes engine) | `0x47F18ac5F59F89ff304C5728Fc20d2729189dCe7` |
+| VRF Coordinator (drand) | `0x6166d96AC6abDD5c57a5a7D746c2932202232F55` |
 | V4 SwapRouter (stateless, reused) | `0x0e6c53664388B68F6b41851D224248F391CC8947` |
-| StockPairRouter (20 quotes, LIVE-priced ~$2.5k launches, fee 0) | `0x1c9FD39F147FddfD912E1d3ddEf43dCcd85F8Cfb` |
-| StockFeeHook (in-pool 1% stock fee, open pools) | `0x30eb524ab7a3f70e1A0A72E51b2205C58dd5c0CC` |
+| StockPairRouter (20 quotes, LIVE-priced ~$2.5k launches, fee 0) | `0x6D39EA3819575DbeDAf926B3860B66A00E8DC578` |
+| StockFeeHook (in-pool 1% stock fee, open pools) | `0x40EDAa62C8593B32957FcbC21DDb600E876680CC` |
 | V1/V3 FeeLocker (legacy, pre-fix) | `0x749f23a5616a473f4d43dafcce8a7214c986849b` |
 
 **Vault-mode flywheel (2026-08-13 night), verified live:** the flagship sink is now the
