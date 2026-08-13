@@ -92,6 +92,19 @@ contract MockPositionManager {
         return (tokenId, uint128(1e18), p.amount0Desired, p.amount1Desired);
     }
 
+    function increaseLiquidity(INonfungiblePositionManager.IncreaseLiquidityParams calldata p)
+        external
+        payable
+        returns (uint128 liquidity, uint256 amount0, uint256 amount1)
+    {
+        Minted storage m = minted[p.tokenId];
+        if (p.amount0Desired > 0) IERC20(m.token0).transferFrom(msg.sender, address(this), p.amount0Desired);
+        if (p.amount1Desired > 0) IERC20(m.token1).transferFrom(msg.sender, address(this), p.amount1Desired);
+        m.amount0 += p.amount0Desired;
+        m.amount1 += p.amount1Desired;
+        return (uint128(1e18), p.amount0Desired, p.amount1Desired);
+    }
+
     /// Test hook: pretend the position accrued fees.
     function setCollectable(uint256 tokenId, uint256 amount0, uint256 amount1) external {
         collectable0[tokenId] = amount0;

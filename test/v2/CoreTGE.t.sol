@@ -103,7 +103,9 @@ contract CoreTGETest is Test {
 
         tge.setClaimsDistributor(DISTRIBUTOR);
         tge.fundClaims(100_000_000 ether); // season 1 tranche — purely the admin's call
-        assertEq(IERC20(tokenAddr).balanceOf(DISTRIBUTOR), 100_000_000 ether);
+        // 10% season dev cut to devFeeRecipient (defaults to the owner), 90% to the distributor.
+        assertEq(IERC20(tokenAddr).balanceOf(DISTRIBUTOR), 90_000_000 ether, "90% to claims");
+        assertEq(IERC20(tokenAddr).balanceOf(address(this)), 10_000_000 ether, "10% dev cut");
         assertEq(tge.claimsRemaining(), SUPPLY / 2 - 100_000_000 ether);
 
         vm.expectRevert(CoreTGE.InsufficientBucket.selector);
@@ -133,6 +135,76 @@ contract CoreTGETest is Test {
         vm.prank(address(0xbad));
         vm.expectRevert();
         tge.launch("x", "x", 1);
+    }
+
+    function test_devFeeConfig_capsAndRecipient() public {
+        // Pool cut may be ANYTHING up to 100% ("the whole 1% fee"); season skim capped at 20%.
+        tge.setDevFeeConfig(TEAM, 500, 10_000);
+        assertEq(tge.devFeeRecipient(), TEAM);
+        assertEq(tge.seasonDevFeeBps(), 500);
+        assertEq(tge.poolDevFeeBps(), 10_000);
+
+        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
+        tge.setDevFeeConfig(TEAM, 2_001, 0); // season skim above the 20% ceiling
+        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
+        tge.setDevFeeConfig(TEAM, 0, 10_001); // pool cut above 100%
+        vm.expectRevert(CoreTGE.ZeroAddress.selector);
+        tge.setDevFeeConfig(address(0), 0, 0);
+        vm.prank(address(0xbad));
+        vm.expectRevert();
+        tge.setDevFeeConfig(address(0xbad), 0, 0);
+    }
+
+    function test_collectPoolFees_devCarveAndCompound() public {
+        tge.seed{value: 10 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        tge.setDevFeeConfig(TEAM, 1_000, 1_000);
+
+        // Pretend the locked position accrued 1%-pool fees: 1 WETH + 1000 tokens.
+        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
+        uint256 fee0 = t0 == tokenAddr ? 1_000 ether : 1 ether;
+        uint256 fee1 = t0 == tokenAddr ? 1 ether : 1_000 ether;
+        npm.setCollectable(tge.lpTokenId(), fee0, fee1);
+
+        uint256 tgeTokBefore = CoreToken(tokenAddr).balanceOf(address(tge));
+        uint256 npmTokBefore = CoreToken(tokenAddr).balanceOf(address(npm));
+        uint256 npmWethBefore = weth.balanceOf(address(npm));
+        tge.collectPoolFees();
+
+        // Dev gets 10% of each side; the ENTIRE remainder compounds back into the position.
+        assertEq(CoreToken(tokenAddr).balanceOf(TEAM), 100 ether, "10% of token-side fees to dev");
+        assertEq(weth.balanceOf(TEAM), 0.1 ether, "10% of WETH-side fees to dev");
+        assertEq(CoreToken(tokenAddr).balanceOf(address(npm)), npmTokBefore - 1_000 ether + 900 ether, "token remainder reinvested");
+        assertEq(weth.balanceOf(address(npm)), npmWethBefore - 1 ether + 0.9 ether, "WETH remainder reinvested");
+        assertEq(CoreToken(tokenAddr).balanceOf(address(tge)), tgeTokBefore, "TGE retains nothing");
+        assertEq(weth.balanceOf(address(tge)), 0, "TGE retains no WETH");
+    }
+
+    function test_collectPoolFees_fullDevCut() public {
+        tge.seed{value: 10 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        tge.setDevFeeConfig(TEAM, 1_000, 10_000); // take the whole 1% fee
+
+        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
+        npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 100 ether : 1 ether, t0 == tokenAddr ? 1 ether : 100 ether);
+        tge.collectPoolFees();
+        assertEq(CoreToken(tokenAddr).balanceOf(TEAM), 100 ether, "whole token side to dev");
+        assertEq(weth.balanceOf(TEAM), 1 ether, "whole WETH side to dev");
+    }
+
+    function test_withdrawToken_respectsBuckets() public {
+        tge.seed{value: 1 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+
+        // No surplus above the buckets → nothing withdrawable of the core token.
+        vm.expectRevert(CoreTGE.InsufficientBucket.selector);
+        tge.withdrawToken(tokenAddr, address(this), 1);
+
+        // Create surplus (tokens above the tracked buckets) and only IT is withdrawable.
+        tge.claimTeam(address(tge), 100 ether); // teamRemaining drops; balance stays → surplus 100
+        tge.withdrawToken(tokenAddr, TEAM, 100 ether);
+        vm.expectRevert(CoreTGE.InsufficientBucket.selector);
+        tge.withdrawToken(tokenAddr, TEAM, 1 ether); // surplus exhausted
     }
 
     function test_withdrawEth_escapeHatch() public {
