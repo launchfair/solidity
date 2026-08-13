@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Script, console2} from "forge-std/Script.sol";
+import {CoreTGE, IWETH9} from "../src/v2/v4/CoreTGE.sol";
+import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
+
+interface ISinkAdmin {
+    function setFlagshipSink(address sink) external;
+    function setDestinations(address treasury_, address flagshipSink_) external;
+    function treasury() external view returns (address);
+}
+
+/// Deploys the CoreTGE war chest and points BOTH flagship fee sinks at it, so a slice of
+/// every trade on the platform starts accumulating toward the seeded core-token launch:
+///   - LaunchFairV4FeeLocker.setFlagshipSink(tge)   (mode-token trades, 0.1% carve)
+///   - StockPairRouter.setDestinations(treasury, tge) (stock-token trades, flagship split)
+/// The claims distributor is wired later (it needs the token address, which exists post-TGE).
+///
+/// Env: PRIVATE_KEY [required]; WETH, V3_FACTORY, POSITION_MANAGER, FEE_LOCKER, STOCK_ROUTER
+/// [defaults below]; CLAIMS_BPS/TEAM_BPS/COMMUNITY_BPS/LP_BPS [default 5000/1000/3000/1000].
+contract DeployCoreTGE is Script {
+    address constant DEFAULT_WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
+    address constant DEFAULT_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
+    address constant DEFAULT_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
+    address constant DEFAULT_FEE_LOCKER = 0x366d2dC5d7b600D582e553C1380cf0F45F684651;
+    address constant DEFAULT_STOCK_ROUTER = 0x502Bba6Bf09C430e63709335904dCE5AcA2b6cF6;
+
+    function run() external {
+        uint256 pk = vm.envUint("PRIVATE_KEY");
+        address owner = vm.addr(pk);
+        address weth = vm.envOr("WETH", DEFAULT_WETH);
+        address factory = vm.envOr("V3_FACTORY", DEFAULT_V3_FACTORY);
+        address npm = vm.envOr("POSITION_MANAGER", DEFAULT_POSITION_MANAGER);
+        address locker = vm.envOr("FEE_LOCKER", DEFAULT_FEE_LOCKER);
+        address stockRouter = vm.envOr("STOCK_ROUTER", DEFAULT_STOCK_ROUTER);
+        uint16 claimsBps = uint16(vm.envOr("CLAIMS_BPS", uint256(5000)));
+        uint16 teamBps = uint16(vm.envOr("TEAM_BPS", uint256(1000)));
+        uint16 communityBps = uint16(vm.envOr("COMMUNITY_BPS", uint256(3000)));
+        uint16 lpBps = uint16(vm.envOr("LP_BPS", uint256(1000)));
+
+        vm.startBroadcast(pk);
+
+        CoreTGE tge = new CoreTGE(
+            owner,
+            IWETH9(weth),
+            IUniswapV3Factory(factory),
+            INonfungiblePositionManager(npm),
+            10_000, // 1% pool fee tier for the seeded pool
+            claimsBps,
+            teamBps,
+            communityBps,
+            lpBps
+        );
+
+        // Point both flagship sinks at the war chest — accumulation starts NOW.
+        ISinkAdmin(locker).setFlagshipSink(address(tge));
+        ISinkAdmin(stockRouter).setDestinations(ISinkAdmin(stockRouter).treasury(), address(tge));
+
+        vm.stopBroadcast();
+
+        console2.log("CoreTGE (war chest + flagship sink):", address(tge));
+        console2.log("  allocation bps (claims/team/community/lp):", claimsBps, teamBps);
+        console2.log("  ", communityBps, lpBps);
+        console2.log("  FeeLocker + StockPairRouter flagship sinks -> TGE");
+    }
+}
