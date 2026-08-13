@@ -8,7 +8,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {CoreTGE, IWETH9} from "../../src/v2/v4/CoreTGE.sol";
 import {TokenDeployerV2} from "../../src/v2/TokenDeployerV2.sol";
 import {LaunchTokenV2} from "../../src/v2/LaunchTokenV2.sol";
-import {IUniswapV3Factory, INonfungiblePositionManager} from "../../src/interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, INonfungiblePositionManager, IV3SwapRouter} from "../../src/interfaces/IUniswapV3.sol";
 import {MockV3Factory, MockPositionManager} from "../mocks/MockUniswapV3.sol";
 
 contract MockWeth9 is ERC20 {
@@ -18,12 +18,23 @@ contract MockWeth9 is ERC20 {
     }
 }
 
+/// 1:1 WETH->core mock for the Buyback fee modes (fund it with core via claimTeam first).
+contract TgeMockV3Router {
+    function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external returns (uint256 out) {
+        IERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        out = p.amountIn;
+        require(out >= p.amountOutMinimum, "slip");
+        IERC20(p.tokenOut).transfer(p.recipient, out);
+    }
+}
+
 contract CoreTGETest is Test {
     CoreTGE tge;
     MockWeth9 weth;
     MockV3Factory factory;
     MockPositionManager npm;
     TokenDeployerV2 tokenDeployer; // the REAL platform factory — the core must come from it
+    TgeMockV3Router v3router;
 
     address constant TEAM = address(0x7e40);
     address constant COMMUNITY = address(0xc0);
@@ -35,12 +46,14 @@ contract CoreTGETest is Test {
         factory = new MockV3Factory();
         npm = new MockPositionManager();
         tokenDeployer = new TokenDeployerV2();
+        v3router = new TgeMockV3Router();
         tge = new CoreTGE(
             address(this),
             IWETH9(address(weth)),
             IUniswapV3Factory(address(factory)),
             INonfungiblePositionManager(address(npm)),
             tokenDeployer,
+            IV3SwapRouter(address(v3router)),
             "https://hood.launchfair.app/",
             10_000,
             5_000, // claims 50%
@@ -86,10 +99,10 @@ contract CoreTGETest is Test {
     function test_allocationMustSumAndHaveLp() public {
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, "", 10_000, 5_000, 1_000, 3_000, 500);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), "", 10_000, 5_000, 1_000, 3_000, 500);
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, "", 10_000, 6_000, 1_000, 3_000, 0);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), "", 10_000, 6_000, 1_000, 3_000, 0);
     }
 
     /// The split is a live dashboard knob until launch; the values in force at launch freeze.
@@ -140,6 +153,45 @@ contract CoreTGETest is Test {
         // Post-launch the floor is frozen with everything else.
         vm.expectRevert(CoreTGE.AlreadyLaunched.selector);
         tge.setMinLaunchPrice(0);
+    }
+
+    /// Pool-fee remainder modes: BuybackBurn converts the WETH side to core and burns ALL of
+    /// it; BuybackReward sends it to the reward sink (the buyback vault → season pots).
+    function test_poolFeeMode_buybackBurn() public {
+        tge.seed{value: 10 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        tge.claimTeam(address(v3router), 10 ether); // 1:1 mock router inventory
+        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackBurn, address(0));
+
+        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
+        npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 1_000 ether : 1 ether, t0 == tokenAddr ? 1 ether : 1_000 ether);
+        tge.collectPoolFees();
+
+        // dev 10% off each side; remainder = 900 core + 0.9 WETH → 0.9 core bought (1:1) → burned.
+        address dead = tge.DEAD();
+        assertEq(IERC20(tokenAddr).balanceOf(dead), 900.9 ether, "core remainder + buyback burned");
+        assertEq(weth.balanceOf(TEAM), 0, "sanity");
+        assertEq(IERC20(tokenAddr).balanceOf(address(this)), 100 ether, "dev cut still paid (core side)");
+        assertEq(weth.balanceOf(address(this)), 0.1 ether, "dev cut still paid (WETH side)");
+    }
+
+    function test_poolFeeMode_buybackReward_andGuards() public {
+        tge.seed{value: 10 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        tge.claimTeam(address(v3router), 10 ether);
+
+        vm.expectRevert(CoreTGE.ZeroAddress.selector);
+        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackReward, address(0)); // sink required
+        vm.prank(address(0xbad));
+        vm.expectRevert();
+        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackBurn, address(0)); // owner only
+
+        address SINK = address(0x5111c);
+        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackReward, SINK);
+        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
+        npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 1_000 ether : 1 ether, t0 == tokenAddr ? 1 ether : 1_000 ether);
+        tge.collectPoolFees();
+        assertEq(IERC20(tokenAddr).balanceOf(SINK), 900.9 ether, "remainder + buyback to the reward sink");
     }
 
     /// A big pot needs no clamp: natural price above the floor pairs the full LP slice.

@@ -28,7 +28,7 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {IUniswapV3Factory, INonfungiblePositionManager, IUniswapV3Pool} from "../../interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, INonfungiblePositionManager, IUniswapV3Pool, IV3SwapRouter} from "../../interfaces/IUniswapV3.sol";
 import {TokenDeployerV2} from "../TokenDeployerV2.sol";
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 
@@ -50,6 +50,9 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     /// The platform's token factory — the SAME contract that deploys every launchpad token,
     /// so the core token shares their on-chain creator + bytecode (indexers treat it as ours).
     TokenDeployerV2 public immutable tokenDeployer;
+    /// Uniswap V3 SwapRouter02 — used by the Buyback fee modes to turn the WETH side of
+    /// collected pool fees back into core.
+    IV3SwapRouter public immutable v3Router;
     uint24 public immutable poolFee; // V3 fee tier of the seeded pool (default 10000 = 1%)
     string public platformWebsite; // baked into the token like every launchpad token
 
@@ -98,9 +101,34 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         emit MinLaunchPriceSet(wethWeiPerToken);
     }
     /// Dev share of the locked position's collected 1% pool fees (default 10%; settable up
-    /// to 100% — "the whole 1%"). Whatever ISN'T taken is compounded back into the locked
-    /// liquidity, so the pool only ever deepens.
+    /// to 100% — "the whole 1%"). What ISN'T taken follows `poolFeeMode` below.
     uint16 public poolDevFeeBps = 1_000;
+
+    /// What happens with the REMAINDER of collected pool fees (after the dev cut):
+    ///   Compound       — reinvest into the locked liquidity (default; the pool only deepens)
+    ///   BuybackBurn    — WETH side buys core on the pool, everything is sent to 0xdead
+    ///   BuybackReward  — WETH side buys core, everything goes to `rewardSink` (the buyback
+    ///                    vault ⇒ straight into season rewards)
+    enum PoolFeeMode {
+        Compound,
+        BuybackBurn,
+        BuybackReward
+    }
+
+    PoolFeeMode public poolFeeMode = PoolFeeMode.Compound;
+    address public rewardSink; // BuybackReward destination (the FlagshipBuyback vault)
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    event PoolFeeModeSet(PoolFeeMode mode, address rewardSink);
+    event PoolFeesRouted(PoolFeeMode mode, uint256 coreOut, address to);
+
+    /// @notice Choose the pool-fee remainder's destiny. `rewardSink_` is required for
+    /// BuybackReward (ignored otherwise). Owner-settable any time.
+    function setPoolFeeMode(PoolFeeMode mode, address rewardSink_) external onlyOwner {
+        if (mode == PoolFeeMode.BuybackReward && rewardSink_ == address(0)) revert ZeroAddress();
+        poolFeeMode = mode;
+        rewardSink = rewardSink_;
+        emit PoolFeeModeSet(mode, rewardSink_);
+    }
 
     event AllocationSet(uint16 claimsBps, uint16 teamBps, uint16 communityBps, uint16 lpBps);
     event Seeded(address indexed from, uint256 amount);
@@ -130,6 +158,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         IUniswapV3Factory factory_,
         INonfungiblePositionManager positionManager_,
         TokenDeployerV2 tokenDeployer_,
+        IV3SwapRouter v3Router_,
         string memory platformWebsite_,
         uint24 poolFee_,
         uint16 claimsBps_,
@@ -147,6 +176,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         factory = factory_;
         positionManager = positionManager_;
         tokenDeployer = tokenDeployer_;
+        v3Router = v3Router_;
         platformWebsite = platformWebsite_;
         poolFee = poolFee_;
         _setAllocation(claimsBps_, teamBps_, communityBps_, lpBps_);
@@ -368,24 +398,54 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         if (dev0 > 0) IERC20(t0).safeTransfer(devFeeRecipient, dev0);
         if (dev1 > 0) IERC20(t1).safeTransfer(devFeeRecipient, dev1);
 
-        // Reinvest the remainder into the locked position. NOTE: only the core token side is
-        // bucket-tracked; the reinvested core tokens come from collected fees (surplus above
+        // Route the remainder per `poolFeeMode`. NOTE: only the core token side is
+        // bucket-tracked; the routed core tokens come from collected fees (surplus above
         // the buckets), never from claims/team/community reserves.
         uint256 re0 = amount0 - dev0;
         uint256 re1 = amount1 - dev1;
-        if (re0 > 0 || re1 > 0) {
-            if (re0 > 0) IERC20(t0).forceApprove(address(positionManager), re0);
-            if (re1 > 0) IERC20(t1).forceApprove(address(positionManager), re1);
-            (liquidityAdded,,) = positionManager.increaseLiquidity(
-                INonfungiblePositionManager.IncreaseLiquidityParams({
-                    tokenId: lpTokenId,
-                    amount0Desired: re0,
-                    amount1Desired: re1,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    deadline: block.timestamp
-                })
-            );
+        if (poolFeeMode == PoolFeeMode.Compound) {
+            if (re0 > 0 || re1 > 0) {
+                if (re0 > 0) IERC20(t0).forceApprove(address(positionManager), re0);
+                if (re1 > 0) IERC20(t1).forceApprove(address(positionManager), re1);
+                (liquidityAdded,,) = positionManager.increaseLiquidity(
+                    INonfungiblePositionManager.IncreaseLiquidityParams({
+                        tokenId: lpTokenId,
+                        amount0Desired: re0,
+                        amount1Desired: re1,
+                        amount0Min: 0,
+                        amount1Min: 0,
+                        deadline: block.timestamp
+                    })
+                );
+            }
+        } else {
+            // Buyback modes: the WETH side buys core on the locked pool (owner-triggered
+            // admin op on fee-sized amounts — pool-price floor left to the caller's timing),
+            // then EVERYTHING goes to the dead address (BuybackBurn) or the reward sink
+            // (BuybackReward ⇒ the buyback vault ⇒ season pots).
+            (uint256 coreRem, uint256 wethRem) = t0 == address(token) ? (re0, re1) : (re1, re0);
+            uint256 boughtCore;
+            if (wethRem > 0) {
+                IERC20(address(weth)).forceApprove(address(v3Router), wethRem);
+                boughtCore = v3Router.exactInputSingle(
+                    IV3SwapRouter.ExactInputSingleParams({
+                        tokenIn: address(weth),
+                        tokenOut: address(token),
+                        fee: poolFee,
+                        recipient: address(this),
+                        amountIn: wethRem,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
+            }
+            uint256 totalCore = coreRem + boughtCore;
+            if (totalCore > 0) {
+                address to = poolFeeMode == PoolFeeMode.BuybackBurn ? DEAD : rewardSink;
+                if (to == address(0)) revert ZeroAddress();
+                IERC20(address(token)).safeTransfer(to, totalCore);
+                emit PoolFeesRouted(poolFeeMode, totalCore, to);
+            }
         }
         emit PoolFeesCollected(amount0, amount1, dev0, dev1, liquidityAdded);
     }

@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {CoreTGE, IWETH9} from "../src/v2/v4/CoreTGE.sol";
 import {TokenDeployerV2} from "../src/v2/TokenDeployerV2.sol";
-import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, INonfungiblePositionManager, IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol";
 
 interface ISinkAdmin {
     function setFlagshipSink(address sink) external;
@@ -31,6 +31,7 @@ contract DeployCoreTGE is Script {
     /// The live launchpad's TokenDeployerV2 (LaunchFairV4.deployer()) — the core token must
     /// come from the SAME factory as every launchpad token so aggregators index it as ours.
     address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
+    address constant DEFAULT_V3_ROUTER = 0xCaf681a66D020601342297493863E78C959E5cb2;
     string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
 
     function run() external {
@@ -65,6 +66,7 @@ contract DeployCoreTGE is Script {
             IUniswapV3Factory(factory),
             INonfungiblePositionManager(npm),
             TokenDeployerV2(tokenDeployer),
+            IV3SwapRouter(vm.envOr("V3_ROUTER", DEFAULT_V3_ROUTER)),
             PLATFORM_WEBSITE,
             10_000, // 1% pool fee tier for the seeded pool
             claimsBps,
