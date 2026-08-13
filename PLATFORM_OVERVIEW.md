@@ -309,16 +309,27 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 | Contract | Address |
 |---|---|
-| CoreTGE v5 (war chest + factory launcher, dynamic split) | `0x8A91b039b1777F05b70665f8362589505505d6dc` |
-| LaunchFair V4 launchpad (open-stock-pool stack, 2026-08-13) | `0xAc6Cd88cc87F781BE1A820D8c00A146047A77957` |
+| CoreTGE (war chest + factory launcher, LAUNCHED) | `0xE12c7daA81AC7633295700C55A7C69a00a55C6CA` |
+| **FCORE core token** (factory-deployed, locked LP `681602`) | `0x43B787FAd34777d4C23fC0E00C104542A8159856` |
+| SeasonMerkleDistributor (FCORE seasons) | `0x01be15060Fca8D850Ab9BFDf92A1D90f674b1202` |
+| LaunchFair V4 launchpad (ground-up E2E stack, 2026-08-13) | `0xe2b05E9d4Eb2ac36937f82766BccE524ddb4eB7B` |
 | TokenDeployerV2 (the one token factory, reused across stacks) | `0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6` |
-| V4 FeeLocker | `0x9c7C88D8338b13B4D04ee43334dd02522757AAC6` |
-| V4 Distributor (modes engine) | `0x23DBB9D05E23D117f70EfA9Add28E7A108015065` |
-| VRF Coordinator (drand) | `0xD3C4C0922D18f41c01cF7937639c74c41edd9020` |
+| V4 FeeLocker | `0xA32dE6bb4D915fCE16167c30c7BEe31fbCBab51b` |
+| V4 Distributor (modes engine) | `0x67C744eD3BF9C522FfdFEfB521536C07eFb9F9C2` |
+| VRF Coordinator (drand) | `0x06686D7DFe74bc028d654198645E0a32FF0d501d` |
 | V4 SwapRouter (stateless, reused) | `0x0e6c53664388B68F6b41851D224248F391CC8947` |
-| StockPairRouter (20 stock quotes, fee 0 — ETH convenience path) | `0xBb6f952a5fD28566b7f0d32Ac02F2aFc6bD782BC` |
-| StockFeeHook (in-pool 1% stock fee, open pools) | `0x37Db3428A84f72e0df3d786483eaa1d1558d80CC` |
+| StockPairRouter (20 stock quotes, fee 0 — ETH convenience path) | `0xe69746104cB2a54301D391ac4F11FF23853b8F7e` |
+| StockFeeHook (in-pool 1% stock fee, open pools) | `0x4Be4D014fbD4D07a381BD4D37d61c187A75D40Cc` |
 | V1/V3 FeeLocker (legacy, pre-fix) | `0x749f23a5616a473f4d43dafcce8a7214c986849b` |
+
+**Ground-up E2E (2026-08-13 evening), everything above verified live:** clean DB + fresh stack;
+five imaged demo tokens (Reward/Redistribute/Lottery/2×stock-paired); six funded mimic wallets
+traded both directions; **real sniper bots (160 wallets, ~937 buys in 4 minutes) traded GCHIP
+through its open pool from external routers**, paying 0.34 NVDA of in-pool fees; those fees were
+converted and (with a manual seed) formed a **0.0224 ETH war chest** that launched FCORE through
+the factory (90% LP locked, 10% team); sinks repointed to the keeper; a season settled through the
+keeper with the **10% team cut carved**; a mimic wallet **claimed 540k FCORE on-chain** via the
+API-served Merkle proof; the tester wallet holds 7.67M CROCK for external-terminal testing.
 | WETH | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
 | USDG (stock-route bridge) | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
 | Uniswap V3 SwapRouter02 | `0xCaf681a66D020601342297493863E78C959E5cb2` |

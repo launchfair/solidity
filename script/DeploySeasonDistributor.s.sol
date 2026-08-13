@@ -20,7 +20,8 @@ import {SeasonMerkleDistributor} from "../src/flywheel/SeasonMerkleDistributor.s
 ///   TREASURY       — safe rescue destination (default 0x82C8…)           [optional]
 contract DeploySeasonDistributor is Script {
     function run() external {
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
+        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
         address deployer = vm.addr(pk);
         address flagship = vm.envAddress("FLAGSHIP");
         address rootPublisher = vm.envAddress("ROOT_PUBLISHER");
