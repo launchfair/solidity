@@ -309,20 +309,30 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 | Contract | Address |
 |---|---|
-| CoreTGE (war chest + factory launcher, LAUNCHED) | `0xE12c7daA81AC7633295700C55A7C69a00a55C6CA` |
-| **FCORE core token** (factory-deployed, locked LP `681602`) | `0x43B787FAd34777d4C23fC0E00C104542A8159856` |
-| SeasonMerkleDistributor (FCORE seasons) | `0x01be15060Fca8D850Ab9BFDf92A1D90f674b1202` |
-| LaunchFair V4 launchpad (ground-up E2E stack, 2026-08-13) | `0xe2b05E9d4Eb2ac36937f82766BccE524ddb4eB7B` |
+| CoreTGE (war chest + factory launcher, LAUNCHED) | `0x1cc508B77E14922cb77a2D8fcBfAB2D2aD977Ff2` |
+| **FCORE core token** (factory-deployed, locked LP `681930`) | `0xDf7242C0032abCe3Ec0084E19E7B8A8e63A7F7d0` |
+| **FlagshipBuyback vault** (contract-held buybacks, all sinks point here) | `0x542dfe0300C7B54f084Efa235EB97c0deDe5dFfd` |
+| SeasonMerkleDistributor (rootPublisher = the vault) | `0xd5434a639334634144Eed1771459a675096B11A2` |
+| LaunchFair V4 launchpad (vault-mode stack, per-quote launch prices) | `0xc2FA0e5fd621fd3e4C6b963CB113AA607435D02c` |
 | TokenDeployerV2 (the one token factory, reused across stacks) | `0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6` |
-| V4 FeeLocker | `0xA32dE6bb4D915fCE16167c30c7BEe31fbCBab51b` |
-| V4 Distributor (modes engine) | `0x67C744eD3BF9C522FfdFEfB521536C07eFb9F9C2` |
-| VRF Coordinator (drand) | `0x06686D7DFe74bc028d654198645E0a32FF0d501d` |
+| V4 FeeLocker | `0xb77d0647Ad8Ff7654EE7060EaE19D5FDeb900935` |
+| V4 Distributor (modes engine) | `0x20a848694CE9Ab6cDd749dC7ccD16DB372aBBFDB` |
+| VRF Coordinator (drand) | `0x36174C3F4Efd37d70e1068634f74127054d85f70` |
 | V4 SwapRouter (stateless, reused) | `0x0e6c53664388B68F6b41851D224248F391CC8947` |
-| StockPairRouter (20 stock quotes, fee 0 — ETH convenience path) | `0xe69746104cB2a54301D391ac4F11FF23853b8F7e` |
-| StockFeeHook (in-pool 1% stock fee, open pools) | `0x4Be4D014fbD4D07a381BD4D37d61c187A75D40Cc` |
+| StockPairRouter (20 quotes, LIVE-priced ~$2.5k launches, fee 0) | `0x1c9FD39F147FddfD912E1d3ddEf43dCcd85F8Cfb` |
+| StockFeeHook (in-pool 1% stock fee, open pools) | `0x30eb524ab7a3f70e1A0A72E51b2205C58dd5c0CC` |
 | V1/V3 FeeLocker (legacy, pre-fix) | `0x749f23a5616a473f4d43dafcce8a7214c986849b` |
 
-**Ground-up E2E (2026-08-13 evening), everything above verified live:** clean DB + fresh stack;
+**Vault-mode flywheel (2026-08-13 night), verified live:** the flagship sink is now the
+**FlagshipBuyback CONTRACT** — fee ETH accumulates in the vault, `buyback()` (deployer-only,
+argumentless, self-quoted slippage floor) buys core the vault itself holds, the season team cut
+is carved by `withdrawToken`, and `publishSeason` funds the Merkle distributor straight from the
+vault: bought core never touches an EOA, and the cron key custodies nothing. Stock-paired
+launches now start at **~$2.5k mcap** via live-priced per-quote launch prices
+(`setAllowedQuotePrice`, owner-retunable). Full cycle proven on-chain: contract buybacks →
+vault-carved 10% team cut → vault-published season → user Merkle claim.
+
+**Earlier ground-up E2E (same day), on the previous stack:** clean DB + fresh stack;
 five imaged demo tokens (Reward/Redistribute/Lottery/2×stock-paired); six funded mimic wallets
 traded both directions; **real sniper bots (160 wallets, ~937 buys in 4 minutes) traded GCHIP
 through its open pool from external routers**, paying 0.34 NVDA of in-pool fees; those fees were
