@@ -254,8 +254,10 @@ contract StockFeeHook is IHooks, Ownable2Step {
     }
 
     // ── distribute: stock claims → real stock → WETH → 4-way ETH split ───────────
-    /// @notice Redeem a token's accrued stock fees, convert them to WETH, and split. Keeper
-    /// (owner/treasury) call: `minWethOut` guards the V3 conversion against sandwiching.
+    /// @notice Redeem a token's accrued stock fees, convert them to WETH, and split. STRICTLY
+    /// owner/treasury (platform policy: creators NEVER trigger or pull distributions — their
+    /// share is pushed to them when the platform distributes). `minWethOut` guards the V3
+    /// conversion against sandwiching.
     function distribute(address token, uint256 minWethOut) external onlyOwnerOrTreasury returns (uint256 wethOut) {
         uint256 amount = accrued[token];
         if (amount == 0) return 0;

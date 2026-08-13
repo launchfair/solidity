@@ -246,10 +246,23 @@ contract StockFeeHookTest is Test, Deployers {
         assertEq(hook.accrued(address(token)), acc, "revert unwound the accrual too");
     }
 
-    function test_distribute_onlyOwnerOrTreasury() public {
+    function test_distribute_strictlyOwnerOrTreasury_neverCreator() public {
         vm.prank(address(0xbad));
         vm.expectRevert(StockFeeHook.NotAuthorized.selector);
         hook.distribute(address(token), 0);
+
+        // Platform policy: the token's CREATOR can NEVER trigger/pull a distribution —
+        // their share is pushed when the platform (owner/treasury) distributes.
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 10 ether);
+        vm.prank(DEV); // creatorOf(token) == DEV in the mock launchpad
+        vm.expectRevert(StockFeeHook.NotAuthorized.selector);
+        hook.distribute(address(token), 0);
+
+        // Owner distributes → the creator's share arrives without them doing anything.
+        uint256 out = hook.distribute(address(token), 0);
+        assertGt(out, 0);
+        assertGt(DEV.balance, 0, "creator share was PUSHED on platform distribution");
     }
 
     function test_feeCap_andSplitSum() public {
