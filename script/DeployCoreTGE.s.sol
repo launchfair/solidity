@@ -48,10 +48,14 @@ contract DeployCoreTGE is Script {
         address stockRouter = vm.envOr("STOCK_ROUTER", DEFAULT_STOCK_ROUTER);
         address stockFeeHook = vm.envOr("STOCK_FEE_HOOK", DEFAULT_STOCK_FEE_HOOK);
         address tokenDeployer = vm.envOr("TOKEN_DEPLOYER", DEFAULT_TOKEN_DEPLOYER);
-        uint16 claimsBps = uint16(vm.envOr("CLAIMS_BPS", uint256(5000)));
+        // Genesis split (2026-08-13): 90% into the locked pool (real float, deep liquidity,
+        // FDV ≈ 1.11× the pot) + 10% team. Seasons are BUYBACK-funded (the keeper buys core
+        // with fee ETH and funds each Merkle pot with the bought tokens), so no pre-minted
+        // claims/community reserve is needed. Still owner-retunable until launch.
+        uint16 claimsBps = uint16(vm.envOr("CLAIMS_BPS", uint256(0)));
         uint16 teamBps = uint16(vm.envOr("TEAM_BPS", uint256(1000)));
-        uint16 communityBps = uint16(vm.envOr("COMMUNITY_BPS", uint256(3000)));
-        uint16 lpBps = uint16(vm.envOr("LP_BPS", uint256(1000)));
+        uint16 communityBps = uint16(vm.envOr("COMMUNITY_BPS", uint256(0)));
+        uint16 lpBps = uint16(vm.envOr("LP_BPS", uint256(9000)));
 
         vm.startBroadcast(pk);
 

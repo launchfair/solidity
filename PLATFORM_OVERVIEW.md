@@ -142,29 +142,34 @@ the dashboard. In a single transaction it:
    same on-chain creator and verified bytecode and index it as one of ours). It launches in Base
    mode with the launch limits off, which makes it behave as a **plain fixed-supply ERC-20**: no
    reflection, no tax hook, exchange-friendly, 100% supply visible at birth, owner reads renounced.
-2. Splits the supply into four buckets. The split is a **live dashboard knob right up until
-   launch** (`setAllocation`, must sum to 100%, LP > 0) — whatever is set at the moment of launch
-   freezes into the buckets forever. Current defaults:
-   - **50% Claims** — season rewards, released in admin-sized tranches
-   - **10% Team**
-   - **30% Community** — initiatives, partnerships, listings
-   - **10% LP** — the launch liquidity: the only slice that goes into the trading pool
+2. Splits the supply into buckets. The split is a **live dashboard knob right up until launch**
+   (`setAllocation`, must sum to 100%, LP > 0) — whatever is set at the moment of launch freezes
+   forever. **The Genesis split is 90% LP / 10% Team** (claims and community buckets zeroed):
+   - **90% LP** — the launch liquidity. Nearly the whole supply is genuinely in the pool: real
+     float, deep liquidity, nothing overhanging the market from reserve buckets.
+   - **10% Team** — the only held allocation.
+   - Claims/community buckets exist in the contract but are set to 0: **season rewards are
+     buyback-funded** — the keeper buys core off the pool with fee ETH and funds each weekly
+     Merkle pot with the bought tokens, so rewards scale with real revenue instead of a
+     pre-minted reserve.
 3. Deposits the LP bucket **together with the entire ETH war chest** into a **full-range Uniswap
    V3 position at the 1% fee tier** — ETH on one side, the LP tokens on the other. That's what
-   "paired" means: the LP slice is the token half of the liquidity pair, and it's the only float
-   tradeable at birth (the other 90% sits in buckets until released). Starting price = pot ÷ LP
-   tokens — so the same pot with a smaller LP slice launches at a higher price, and the launch
-   market cap is directly proportional to how much the chest accumulated.
+   "paired" means: the LP slice is the token half of the liquidity pair. Starting price = pot ÷
+   LP tokens, which makes the LP share the **FDV multiplier**: fully-diluted mcap = pot ÷
+   LP-share. At 90% LP the launch FDV ≈ 1.11× the pot — a modest headline number, but an honest
+   one, since the float is real rather than optical.
 4. **Locks that LP NFT in the contract forever.** There is *no function to withdraw the position* —
    not even for the owner. The liquidity cannot be pulled. This is the anti-rug guarantee, verifiable
    on-chain by anyone.
 
 **Phase 3 — Life after launch.**
 
-- **Claims tranches:** `fundClaims(amount)` moves a chosen slice of the Claims bucket to the season
-  Merkle distributor. On every tranche, `seasonDevFeeBps` (default **10%**, hard-capped at 20% in
-  the bytecode) is skimmed to the dev wallet first — our fixed season revenue. The cap means even a
-  fat-fingered config can never gut users' rewards.
+- **Season funding:** with the Genesis split, seasons are funded by the **buyback keeper** (fee
+  ETH → buy core on the pool → bought tokens into the Merkle pot), and the team's **10% season
+  cut is carved by the keeper** from each bought batch before funding. The on-chain
+  `fundClaims(amount)` tranche path (with its `seasonDevFeeBps` skim, hard-capped at 20%) still
+  exists but is dormant while the Claims bucket is 0 — it comes back into play if a future
+  redeploy allocates one.
 - **Team / Community:** `claimTeam` / `claimCommunity` pay out to any address, strictly bounded by
   the remaining bucket balance. Purely admin functions, driven from the dashboard.
 - **Pool fees:** the locked position earns the 1% pool fee on every Core trade forever.
@@ -332,7 +337,9 @@ receiving exactly its 50%.
 ## 13. What's left before the real launch
 
 1. **Genesis settlement keeper** — sum the accumulated pre-Genesis epochs into the Season-1 pot and
-   publish the first Merkle root. Must land before *Start Genesis* is pressed in production.
+   publish the first Merkle root. Must land before *Start Genesis* is pressed in production. With
+   the 90/10 split it must also **carve the team's 10% season cut from each bought-back batch**
+   before funding the pot (the on-chain `fundClaims` skim is dormant at Claims = 0).
 2. **SeasonMerkleDistributor deploy** — can only happen *after* the Core token exists (the token
    address is an immutable constructor argument), then `setClaimsDistributor` on the TGE.
 3. **V1 FeeLocker redeploy** — ships the WETH-drain fix + `setFeeShares`, which also lights up the
