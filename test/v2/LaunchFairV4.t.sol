@@ -162,6 +162,46 @@ contract LaunchFairV4Test is Test, Deployers {
         p = new LaunchFairV4.PerpLeg[](0);
     }
 
+    /// Stock-paired launches honor the per-quote launch price: the single-sided range (whose
+    /// BOTTOM is the effective launch price) shifts up by the configured price ratio, so a
+    /// stock quote can target a sane USD launch mcap instead of inheriting the WETH-calibrated
+    /// default ("1.49 units of quote" ⇒ ~$270 for an NVDA quote).
+    function test_stockLaunch_quoteInitialPrice_shiftsRange() public {
+        MockWethT stockQ = new MockWethT();
+        address stubRouter = address(0x570c);
+        address gateAddr =
+            address((uint160(uint256(keccak256("gate-shift"))) & ~uint160(0x3FFF)) | uint160(Hooks.BEFORE_SWAP_FLAG));
+        deployCodeTo("RouterGateHook.sol:RouterGateHook", abi.encode(address(manager), stubRouter), gateAddr);
+        pad.setStockPairRouter(stubRouter);
+        pad.setStockGateHook(gateAddr);
+        pad.setAllowedQuote(address(stockQ), true, 3000);
+
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        LaunchFairV4.CreateParams memory p = LaunchFairV4.CreateParams({
+            name: "Stock A", symbol: "SA", metadata: meta, salt: keccak256("sa"),
+            mode: LaunchTokenV2.Mode.Base, fee: 30_000, rewards: _noRewards(), perps: _noPerps(),
+            prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0,
+            missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+        });
+        address a = pad.createStockToken{value: 0.000005 ether}(p, address(stockQ));
+
+        // 100x the default launch price ⇒ ln(100)/ln(1.0001) ≈ 46054 ticks, floored to the
+        // 200-tick spacing = 46000.
+        pad.setAllowedQuotePrice(address(stockQ), pad.initialPriceWethPerToken() * 100);
+        p.symbol = "SB";
+        p.salt = keccak256("sb");
+        address b = pad.createStockToken{value: 0.000005 ether}(p, address(stockQ));
+
+        // Normalize the range bottom to token-per-quote orientation regardless of address order.
+        LaunchFairV4FeeLocker.Position memory pa = locker.positionOf(a);
+        LaunchFairV4FeeLocker.Position memory pb = locker.positionOf(b);
+        int24 bottomA = pa.tokenIsCurrency0 ? pa.tickLower : -pa.tickUpper;
+        int24 bottomB = pb.tokenIsCurrency0 ? pb.tickLower : -pb.tickUpper;
+        assertEq(bottomB - bottomA, 46_000, "range bottom lifted by the configured price ratio");
+    }
+
     // A single reward asset taking the full fee weight, on a V3 (or V4) venue.
     function _oneReward(address asset, bool isV3, uint24 v3Fee)
         internal

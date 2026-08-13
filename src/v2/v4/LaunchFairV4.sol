@@ -110,6 +110,19 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     mapping(address stock => bool) public allowedQuote;
     /// @notice The Uniswap-V3 fee tier of each allowed quote's <stock>/WETH pool (for the router hop).
     mapping(address stock => uint24) public quoteV3Fee;
+    /// @notice Per-quote LAUNCH PRICE for stock-paired tokens, in quote-wei per whole token
+    /// (0 ⇒ fall back to `initialPriceWethPerToken`). The global default is calibrated for a
+    /// WETH quote — reused verbatim it prices a launch at "1.49 units of quote" (~$6k for WETH
+    /// but only ~$270 when the quote is NVDA), so each stock gets its own knob targeting a sane
+    /// USD launch mcap. Owner-tunable any time; applies to NEW launches only.
+    mapping(address stock => uint256) public quoteInitialPrice;
+    event QuoteInitialPriceSet(address indexed stock, uint256 quoteWeiPerToken);
+
+    /// @notice Set a quote's launch price (quote-wei per whole token; 0 restores the default).
+    function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external onlyOwner {
+        quoteInitialPrice[stock] = quoteWeiPerToken;
+        emit QuoteInitialPriceSet(stock, quoteWeiPerToken);
+    }
     event StockPairRouterSet(address router);
     event StockGateHookSet(address hook);
     event AllowedQuoteSet(address indexed stock, bool allowed, uint24 v3Fee);
@@ -574,7 +587,14 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
         poolManager.initialize(key, _sqrtPriceX96For(initialPriceWethPerToken, tokenIsCurrency0));
 
-        (int24 tl, int24 tu) = tokenIsCurrency0 ? (tickLower0, tickUpper0) : (-tickUpper0, -tickLower0);
+        // Shift the single-sided range by the quote's launch-price knob (the range BOTTOM is
+        // the effective launch price). The init price above stays at the WETH-calibrated
+        // default — at or below the (only ever raised) range in both orientations, so the
+        // first buy still walks the price up to the range edge exactly as on WETH pools.
+        int24 shift = _quoteTickShift(quoteToken);
+        (int24 tl, int24 tu) = tokenIsCurrency0
+            ? (tickLower0 + shift, tickUpper0 + shift)
+            : (-(tickUpper0 + shift), -(tickLower0 + shift));
         uint128 liquidity = tokenIsCurrency0
             ? LiquidityMath.getLiquidityForAmount0(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), tokenTotalSupply)
             : LiquidityMath.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), tokenTotalSupply);
@@ -717,5 +737,16 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             ? Math.mulDiv(priceWethPerToken, 1 << 192, 1e18)
             : Math.mulDiv(1e18, 1 << 192, priceWethPerToken);
         return uint160(Math.sqrt(ratioX192));
+    }
+
+    /// @dev Tick delta (rounded to tickSpacing) lifting the launch range from the WETH-calibrated
+    /// default price to the quote's configured launch price. 0 when unset or not higher — the
+    /// range is only ever RAISED, so the default init price stays valid below it.
+    function _quoteTickShift(address quoteToken) internal view returns (int24) {
+        uint256 p = quoteInitialPrice[quoteToken];
+        if (p == 0 || p <= initialPriceWethPerToken) return 0;
+        int24 tDefault = TickMath.getTickAtSqrtPrice(_sqrtPriceX96For(initialPriceWethPerToken, true));
+        int24 tWanted = TickMath.getTickAtSqrtPrice(_sqrtPriceX96For(p, true));
+        return ((tWanted - tDefault) / tickSpacing) * tickSpacing;
     }
 }

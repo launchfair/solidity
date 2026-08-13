@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {StockPairRouter, IWETH, ILaunchpadV4} from "../src/v2/v4/StockPairRouter.sol";
 import {StockFeeHook, ILaunchpadStockView, IStockRoutesView} from "../src/v2/v4/StockFeeHook.sol";
 import {IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol";
@@ -14,6 +15,16 @@ interface ILaunchpadAdmin {
     function setStockPairRouter(address r) external;
     function setStockGateHook(address hook) external;
     function setAllowedQuote(address stock, bool allowed, uint24 v3Fee) external;
+    function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external;
+}
+
+interface IV3FactoryMin {
+    function getPool(address, address, uint24) external view returns (address);
+}
+
+interface IV3PoolMin {
+    function token0() external view returns (address);
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool);
 }
 
 /// Deploys the stock-paired stack for an existing LaunchFairV4: the StockPairRouter + a mined
@@ -45,6 +56,12 @@ contract DeployStockPair is Script {
     /// ~2.7k WETH / $4.2M, so the extra hop is effectively free.
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     uint24 constant USDG_BRIDGE_FEE = 100; // WETH/USDG leg
+    address constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
+    /// Target USD launch mcap for stock-paired tokens. The launchpad's global initial price is
+    /// WETH-calibrated ("1.49 units of quote" ≈ $6k on WETH but ~$270 on NVDA), so each quote
+    /// gets a live-priced `setAllowedQuotePrice` targeting this figure (owner-retunable later).
+    uint256 constant TARGET_MCAP_USD = 2_500;
+    uint256 constant SUPPLY_TOKENS = 1_000_000_000; // launchpad tokenTotalSupply in whole tokens
 
     // ── first-party Robinhood tokenized stocks (depths verified on-chain 2026-08-12) ──
     // DIRECT: deep <stock>/WETH pool (fee = that pool's tier).
@@ -119,9 +136,13 @@ contract DeployStockPair is Script {
 
         // DIRECT quotes: the stock's own <stock>/WETH pool carries the trade.
         pad.setAllowedQuote(COIN, true, 3000);
+        _priceDirect(pad, weth, COIN, 3000);
         pad.setAllowedQuote(SPY, true, 500);
+        _priceDirect(pad, weth, SPY, 500);
         pad.setAllowedQuote(MSTR, true, 10000);
+        _priceDirect(pad, weth, MSTR, 10000);
         pad.setAllowedQuote(META, true, 3000);
+        _priceDirect(pad, weth, META, 3000);
 
         // ROUTED quotes: multi-hop WETH → USDG → stock (deepest liquidity is USDG-side).
         _routed(pad, router, weth, NVDA, 500);
@@ -163,5 +184,39 @@ contract DeployStockPair is Script {
             abi.encodePacked(weth, USDG_BRIDGE_FEE, USDG, usdgFee, stock),
             abi.encodePacked(stock, usdgFee, USDG, USDG_BRIDGE_FEE, weth)
         );
+        _priceQuote(pad, stock, _usdgWeiPerStock(stock, usdgFee));
+    }
+
+    /// Direct quotes price via their <stock>/WETH pool × the WETH/USDG spot.
+    function _priceDirect(ILaunchpadAdmin pad, address weth, address stock, uint24 wethFee) internal {
+        uint256 wethPerStock = _spot1e18(weth, stock, wethFee); // WETH-wei per whole stock
+        uint256 usdgPerWeth = _spot1e18(USDG, weth, USDG_BRIDGE_FEE); // USDG-wei per whole WETH
+        _priceQuote(pad, stock, Math.mulDiv(wethPerStock, usdgPerWeth, 1e18));
+    }
+
+    /// Set the quote's launch price so launch mcap ≈ TARGET_MCAP_USD:
+    /// price(quote-wei per whole token) = TARGET × 1e6(USDG dp) × 1e18 / (usdgWeiPerStock × SUPPLY).
+    function _priceQuote(ILaunchpadAdmin pad, address stock, uint256 usdgWeiPerStock) internal {
+        if (usdgWeiPerStock == 0) return; // no live pool → leave the default (owner can set later)
+        uint256 p = Math.mulDiv(TARGET_MCAP_USD * 1e6, 1e18, usdgWeiPerStock * SUPPLY_TOKENS);
+        pad.setAllowedQuotePrice(stock, p);
+        console2.log("  quote price set:", stock, p);
+    }
+
+    function _usdgWeiPerStock(address stock, uint24 usdgFee) internal view returns (uint256) {
+        return _spot1e18(USDG, stock, usdgFee);
+    }
+
+    /// `out`-wei received for 1e18 wei of `base` at the pool's spot (0 if the pool is missing).
+    function _spot1e18(address out, address base, uint24 fee) internal view returns (uint256) {
+        address pool = IV3FactoryMin(V3_FACTORY).getPool(out, base, fee);
+        if (pool == address(0)) return 0;
+        (uint160 s,,,,,,) = IV3PoolMin(pool).slot0();
+        address t0 = IV3PoolMin(pool).token0();
+        uint256 ratioQ96 = Math.mulDiv(uint256(s), uint256(s), 1 << 96); // token1-wei per token0-wei
+        if (ratioQ96 == 0) return 0;
+        return base == t0
+            ? Math.mulDiv(ratioQ96, 1e18, 1 << 96) // out is token1
+            : Math.mulDiv(1 << 96, 1e18, ratioQ96); // out is token0
     }
 }
