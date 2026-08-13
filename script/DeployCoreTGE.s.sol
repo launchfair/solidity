@@ -32,7 +32,12 @@ contract DeployCoreTGE is Script {
     string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
 
     function run() external {
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
+        // secret plumbing is needed to run this script.
+        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
+        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        // WIRE_SINKS=0 skips repointing the live fee sinks — for throwaway/e2e TGE deploys.
+        bool wireSinks = vm.envOr("WIRE_SINKS", uint256(1)) != 0;
         address owner = vm.addr(pk);
         address weth = vm.envOr("WETH", DEFAULT_WETH);
         address factory = vm.envOr("V3_FACTORY", DEFAULT_V3_FACTORY);
@@ -62,8 +67,10 @@ contract DeployCoreTGE is Script {
         );
 
         // Point both flagship sinks at the war chest — accumulation starts NOW.
-        ISinkAdmin(locker).setFlagshipSink(address(tge));
-        ISinkAdmin(stockRouter).setDestinations(ISinkAdmin(stockRouter).treasury(), address(tge));
+        if (wireSinks) {
+            ISinkAdmin(locker).setFlagshipSink(address(tge));
+            ISinkAdmin(stockRouter).setDestinations(ISinkAdmin(stockRouter).treasury(), address(tge));
+        }
 
         vm.stopBroadcast();
 
