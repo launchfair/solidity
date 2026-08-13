@@ -6,7 +6,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 import {StockPairRouter, IWETH, ILaunchpadV4} from "../src/v2/v4/StockPairRouter.sol";
-import {RouterGateHook} from "../src/v2/v4/RouterGateHook.sol";
+import {StockFeeHook, ILaunchpadStockView, IStockRoutesView} from "../src/v2/v4/StockFeeHook.sol";
 import {IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol";
 import {HookMiner} from "./HookMiner.sol";
 
@@ -17,8 +17,12 @@ interface ILaunchpadAdmin {
 }
 
 /// Deploys the stock-paired stack for an existing LaunchFairV4: the StockPairRouter + a mined
-/// RouterGateHook bound to it, wires them onto the launchpad, sets the router's fee destinations,
-/// and allow-lists the liquid Robinhood stock quotes (chain-scanned 2026-08-12):
+/// StockFeeHook bound to it, wires them onto the launchpad, sets both contracts' fee
+/// destinations, and allow-lists the liquid Robinhood stock quotes (chain-scanned 2026-08-12).
+///
+/// FEE MODEL (since the open-pool change): the pool fee lives in the HOOK (charged on the stock
+/// leg in-pool, so ANY router/terminal/aggregator can trade the pools and the fee can't be
+/// bypassed); the router itself charges 0 and is just the ETH-in/ETH-out convenience path.
 ///  - DIRECT quotes trade through their own <stock>/WETH V3 pool (fee tier recorded on the pad);
 ///  - ROUTED quotes have no (or thin) WETH pool — their depth is in <stock>/USDG — so the router
 ///    gets a multi-hop route WETH →(0.01%)→ USDG →(fee)→ stock via `setQuoteRoute`.
@@ -32,7 +36,8 @@ interface ILaunchpadAdmin {
 ///   LAUNCHPAD      the LaunchFairV4 to extend                                 [required]
 ///   TREASURY       platform treasury (fee split + fallback)                   [required]
 ///   FLAGSHIP_SINK  flagship buyback sink                                      [optional]
-///   STOCK_FEE_BPS  router fee in bps of the WETH leg (default 100 = 1%)       [optional]
+///   STOCK_FEE_BPS  router fee in bps of the WETH leg (default 0 — in-pool now) [optional]
+///   HOOK_FEE_BPS   hook fee in bps of the stock leg (default 100 = 1%)        [optional]
 contract DeployStockPair is Script {
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
@@ -66,7 +71,10 @@ contract DeployStockPair is Script {
     address constant AMZN = 0x12f190a9F9d7D37a250758b26824B97CE941bF54; // $8.9k @ 0.3%
 
     function run() external {
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
+        // secret plumbing is needed to run this script.
+        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
+        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
         address owner = vm.addr(pk);
         IPoolManager pm = IPoolManager(vm.envAddress("POOL_MANAGER"));
         address weth = vm.envAddress("WETH");
@@ -74,7 +82,8 @@ contract DeployStockPair is Script {
         address launchpad = vm.envAddress("LAUNCHPAD");
         address treasury = vm.envAddress("TREASURY");
         address flagshipSink = vm.envOr("FLAGSHIP_SINK", address(0));
-        uint16 feeBps = uint16(vm.envOr("STOCK_FEE_BPS", uint256(100)));
+        uint16 feeBps = uint16(vm.envOr("STOCK_FEE_BPS", uint256(0))); // fee moved into the pool
+        uint16 hookFeeBps = uint16(vm.envOr("HOOK_FEE_BPS", uint256(100)));
 
         vm.startBroadcast(pk);
 
@@ -83,17 +92,30 @@ contract DeployStockPair is Script {
         );
         router.setDestinations(treasury, flagshipSink);
 
-        // The gate hook's address must encode BEFORE_SWAP only; CREATE2-mine a matching salt.
-        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG);
-        bytes memory args = abi.encode(pm, address(router));
+        // The fee hook replaces the old RouterGateHook: pools are OPEN (any router can swap) and
+        // the fee is charged in-pool on the stock leg. Its address must encode the four swap flags.
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
+        bytes memory args = abi.encode(owner, pm, weth, v3Router, launchpad, address(router), hookFeeBps);
         (address hookAddr, bytes32 salt) =
-            HookMiner.find(CREATE2_DEPLOYER, flags, type(RouterGateHook).creationCode, args);
-        RouterGateHook gate = new RouterGateHook{salt: salt}(pm, address(router));
-        require(address(gate) == hookAddr, "mined-address mismatch");
+            HookMiner.find(CREATE2_DEPLOYER, flags, type(StockFeeHook).creationCode, args);
+        StockFeeHook hook = new StockFeeHook{salt: salt}(
+            owner,
+            pm,
+            weth,
+            IV3SwapRouter(v3Router),
+            ILaunchpadStockView(launchpad),
+            IStockRoutesView(address(router)),
+            hookFeeBps
+        );
+        require(address(hook) == hookAddr, "mined-address mismatch");
+        hook.setDestinations(treasury, flagshipSink);
 
         ILaunchpadAdmin pad = ILaunchpadAdmin(launchpad);
         pad.setStockPairRouter(address(router));
-        pad.setStockGateHook(address(gate));
+        pad.setStockGateHook(address(hook)); // hook.router() satisfies the consistency check
 
         // DIRECT quotes: the stock's own <stock>/WETH pool carries the trade.
         pad.setAllowedQuote(COIN, true, 3000);
@@ -122,8 +144,9 @@ contract DeployStockPair is Script {
         vm.stopBroadcast();
 
         console2.log("StockPairRouter:", address(router));
-        console2.log("RouterGateHook: ", address(gate));
-        console2.log("  feeBps:       ", feeBps);
+        console2.log("StockFeeHook:   ", address(hook));
+        console2.log("  router feeBps:", feeBps);
+        console2.log("  hook feeBps:  ", hookFeeBps);
         console2.log("Quotes: 4 direct (COIN/SPY/MSTR/META) + 16 routed via USDG (NVDA/SPCX/USO/GME/");
         console2.log("        QQQ/COST/TSLA/AAPL/INTC/MU/NFLX/GOOGL/MSFT/PLTR/AMD/AMZN)");
     }

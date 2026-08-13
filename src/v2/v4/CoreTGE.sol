@@ -8,7 +8,10 @@ pragma solidity ^0.8.24;
 // flagship sink both point here, so a slice of every trade on the platform accrues as ETH.
 // The owner can also seed ETH manually at any time (the "seed it ourselves" option).
 //
-// When the owner triggers `launch`, the core token is minted ONCE and split:
+// When the owner triggers `launch`, the core token is deployed ONCE — through the platform's
+// own TokenDeployerV2 factory (the same contract that creates every launchpad token), as a
+// Base-mode LaunchTokenV2 with the launch limits off: byte-for-byte the bytecode aggregators
+// and explorers already recognize as ours, behaving as a plain fixed-supply ERC20 — and split:
 //   - claims    → held here, released to the season Merkle distributor in ADMIN-SIZED tranches
 //                 (`fundClaims`) — volume-based seasonal rewards, computed off-chain per points
 //   - team      → held here, claimable by the owner from the dashboard (`claimTeam`)
@@ -19,7 +22,6 @@ pragma solidity ^0.8.24;
 //
 // Starting price = accumulated ETH ÷ LP tokens: every pre-TGE trade raises the launch floor.
 
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -27,18 +29,12 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IUniswapV3Factory, INonfungiblePositionManager, IUniswapV3Pool} from "../../interfaces/IUniswapV3.sol";
+import {TokenDeployerV2} from "../TokenDeployerV2.sol";
+import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 
 interface IWETH9 {
     function deposit() external payable;
     function approve(address, uint256) external returns (bool);
-}
-
-/// @notice The core token itself: a plain fixed-supply ERC20. All supply mints to the TGE
-/// contract, which owns the allocation buckets. No owner, no mint, no hooks — nothing to rug.
-contract CoreToken is ERC20 {
-    constructor(string memory name_, string memory symbol_, uint256 supply, address to) ERC20(name_, symbol_) {
-        _mint(to, supply);
-    }
 }
 
 contract CoreTGE is Ownable2Step, ReentrancyGuard {
@@ -51,7 +47,11 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     IWETH9 public immutable weth;
     IUniswapV3Factory public immutable factory;
     INonfungiblePositionManager public immutable positionManager;
+    /// The platform's token factory — the SAME contract that deploys every launchpad token,
+    /// so the core token shares their on-chain creator + bytecode (indexers treat it as ours).
+    TokenDeployerV2 public immutable tokenDeployer;
     uint24 public immutable poolFee; // V3 fee tier of the seeded pool (default 10000 = 1%)
+    string public platformWebsite; // baked into the token like every launchpad token
 
     // ── allocation (bps of total supply, fixed at construction, sum == 10000) ──
     uint16 public immutable claimsBps;
@@ -59,7 +59,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     uint16 public immutable communityBps;
     uint16 public immutable lpBps;
 
-    CoreToken public token; // zero until launch
+    IERC20 public token; // zero until launch (a factory-deployed Base-mode LaunchTokenV2)
     uint256 public lpTokenId; // the locked full-range position NFT (held here forever)
     uint256 public seededEth; // ETH that went into the pool at launch (for the record)
 
@@ -109,19 +109,26 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         IWETH9 weth_,
         IUniswapV3Factory factory_,
         INonfungiblePositionManager positionManager_,
+        TokenDeployerV2 tokenDeployer_,
+        string memory platformWebsite_,
         uint24 poolFee_,
         uint16 claimsBps_,
         uint16 teamBps_,
         uint16 communityBps_,
         uint16 lpBps_
     ) Ownable(owner_) {
-        if (address(weth_) == address(0) || address(factory_) == address(0) || address(positionManager_) == address(0)) {
+        if (
+            address(weth_) == address(0) || address(factory_) == address(0)
+                || address(positionManager_) == address(0) || address(tokenDeployer_) == address(0)
+        ) {
             revert ZeroAddress();
         }
         if (uint256(claimsBps_) + teamBps_ + communityBps_ + lpBps_ != BPS || lpBps_ == 0) revert BadAllocation();
         weth = weth_;
         factory = factory_;
         positionManager = positionManager_;
+        tokenDeployer = tokenDeployer_;
+        platformWebsite = platformWebsite_;
         poolFee = poolFee_;
         claimsBps = claimsBps_;
         teamBps = teamBps_;
@@ -149,9 +156,15 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     }
 
     // ── launch ───────────────────────────────────────────────────────────────
-    /// @notice Mint the core token and seed the locked pool with ALL accumulated ETH.
-    /// One-shot. Starting price = accumulated ETH ÷ LP-token slice.
-    function launch(string calldata name_, string calldata symbol_, uint256 supply)
+    /// @notice Deploy the core token THROUGH THE PLATFORM FACTORY and seed the locked pool
+    /// with ALL accumulated ETH. One-shot. Starting price = accumulated ETH ÷ LP-token slice.
+    /// The token is a Base-mode LaunchTokenV2 from the same TokenDeployerV2 that creates every
+    /// launchpad token — same creator address + verified bytecode, so external indexers
+    /// (Codex, DEX terminals…) pick it up like any of ours. Launch limits are off (supply
+    /// lives in the TGE buckets, the pool starts deep-seeded), which in Base mode makes its
+    /// transfer path a plain ERC20's. This TGE is the token's `launchpad_`, so the full
+    /// supply mints here; no privileged token call is ever made and owner() reads renounced.
+    function launch(string calldata name_, string calldata symbol_, uint256 supply, LaunchTokenV2.Metadata calldata meta)
         external
         onlyOwner
         nonReentrant
@@ -161,8 +174,26 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         uint256 eth = address(this).balance;
         if (eth == 0 || supply == 0) revert NothingAccumulated();
 
-        token = new CoreToken(name_, symbol_, supply, address(this));
-        tokenAddr = address(token);
+        address[] memory noRewards; // Base mode: no reward assets
+        uint16[] memory noWeights;
+        tokenAddr = tokenDeployer.deploy(
+            TokenDeployerV2.Params({
+                name: name_,
+                symbol: symbol_,
+                supply: supply,
+                platformWebsite: platformWebsite,
+                metadata: meta,
+                maxBuyBps: 0, // limits off ⇒ limitActive() is permanently false
+                maxBuyBlocks: 0,
+                mode: LaunchTokenV2.Mode.Base,
+                rewardTokens: noRewards,
+                rewardWeights: noWeights,
+                prizeToken: address(0),
+                minHoldForRewards: 0
+            }),
+            keccak256(abi.encode(address(this), symbol_))
+        );
+        token = IERC20(tokenAddr);
 
         claimsRemaining = (supply * claimsBps) / BPS;
         teamRemaining = (supply * teamBps) / BPS;

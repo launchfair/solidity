@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {CoreTGE, IWETH9} from "../src/v2/v4/CoreTGE.sol";
+import {TokenDeployerV2} from "../src/v2/TokenDeployerV2.sol";
 import {IUniswapV3Factory, INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
 
 interface ISinkAdmin {
@@ -25,6 +26,10 @@ contract DeployCoreTGE is Script {
     address constant DEFAULT_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
     address constant DEFAULT_FEE_LOCKER = 0x366d2dC5d7b600D582e553C1380cf0F45F684651;
     address constant DEFAULT_STOCK_ROUTER = 0x502Bba6Bf09C430e63709335904dCE5AcA2b6cF6;
+    /// The live launchpad's TokenDeployerV2 (LaunchFairV4.deployer()) — the core token must
+    /// come from the SAME factory as every launchpad token so aggregators index it as ours.
+    address constant DEFAULT_TOKEN_DEPLOYER = 0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6;
+    string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
 
     function run() external {
         uint256 pk = vm.envUint("PRIVATE_KEY");
@@ -34,6 +39,7 @@ contract DeployCoreTGE is Script {
         address npm = vm.envOr("POSITION_MANAGER", DEFAULT_POSITION_MANAGER);
         address locker = vm.envOr("FEE_LOCKER", DEFAULT_FEE_LOCKER);
         address stockRouter = vm.envOr("STOCK_ROUTER", DEFAULT_STOCK_ROUTER);
+        address tokenDeployer = vm.envOr("TOKEN_DEPLOYER", DEFAULT_TOKEN_DEPLOYER);
         uint16 claimsBps = uint16(vm.envOr("CLAIMS_BPS", uint256(5000)));
         uint16 teamBps = uint16(vm.envOr("TEAM_BPS", uint256(1000)));
         uint16 communityBps = uint16(vm.envOr("COMMUNITY_BPS", uint256(3000)));
@@ -46,6 +52,8 @@ contract DeployCoreTGE is Script {
             IWETH9(weth),
             IUniswapV3Factory(factory),
             INonfungiblePositionManager(npm),
+            TokenDeployerV2(tokenDeployer),
+            PLATFORM_WEBSITE,
             10_000, // 1% pool fee tier for the seeded pool
             claimsBps,
             teamBps,

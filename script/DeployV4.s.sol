@@ -57,9 +57,16 @@ contract DeployV4 is Script {
     // The standalone LaunchFairV4SwapRouter (stateless, reused across redeploys) — used by
     // createAndBuy for the atomic dev buy.
     address constant DEFAULT_V4_SWAP_ROUTER = 0x0e6c53664388B68F6b41851D224248F391CC8947;
+    // The live TokenDeployerV2 (stateless CREATE2 factory, reused across redeploys so every
+    // token generation — including the CoreTGE's core token — shares ONE on-chain creator,
+    // which is what external indexers key on). Zero => deploy a fresh one.
+    address constant DEFAULT_TOKEN_DEPLOYER = 0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6;
 
     function run() external {
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
+        // secret plumbing is needed to run this script.
+        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
+        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
         address deployer = vm.addr(pk);
         address owner = vm.envOr("OWNER", deployer);
         address keeper = vm.envOr("KEEPER", deployer);
@@ -89,7 +96,9 @@ contract DeployV4 is Script {
             new LaunchFairV4Distributor(owner, pm, v3Router, IERC20(weth), owner);
 
         // 4. Token deployer (holds the token bytecode; keeps the launchpad under EIP-170).
-        TokenDeployerV2 tokenDeployer = new TokenDeployerV2();
+        //    Reused across stack generations by default — one creator address for every token.
+        address td = vm.envOr("TOKEN_DEPLOYER", DEFAULT_TOKEN_DEPLOYER);
+        TokenDeployerV2 tokenDeployer = td == address(0) ? new TokenDeployerV2() : TokenDeployerV2(td);
 
         // 5. The launchpad.
         LaunchFairV4 pad = new LaunchFairV4(

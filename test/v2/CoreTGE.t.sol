@@ -5,7 +5,9 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-import {CoreTGE, CoreToken, IWETH9} from "../../src/v2/v4/CoreTGE.sol";
+import {CoreTGE, IWETH9} from "../../src/v2/v4/CoreTGE.sol";
+import {TokenDeployerV2} from "../../src/v2/TokenDeployerV2.sol";
+import {LaunchTokenV2} from "../../src/v2/LaunchTokenV2.sol";
 import {IUniswapV3Factory, INonfungiblePositionManager} from "../../src/interfaces/IUniswapV3.sol";
 import {MockV3Factory, MockPositionManager} from "../mocks/MockUniswapV3.sol";
 
@@ -21,6 +23,7 @@ contract CoreTGETest is Test {
     MockWeth9 weth;
     MockV3Factory factory;
     MockPositionManager npm;
+    TokenDeployerV2 tokenDeployer; // the REAL platform factory — the core must come from it
 
     address constant TEAM = address(0x7e40);
     address constant COMMUNITY = address(0xc0);
@@ -31,11 +34,14 @@ contract CoreTGETest is Test {
         weth = new MockWeth9();
         factory = new MockV3Factory();
         npm = new MockPositionManager();
+        tokenDeployer = new TokenDeployerV2();
         tge = new CoreTGE(
             address(this),
             IWETH9(address(weth)),
             IUniswapV3Factory(address(factory)),
             INonfungiblePositionManager(address(npm)),
+            tokenDeployer,
+            "https://hood.launchfair.app/",
             10_000,
             5_000, // claims 50%
             1_000, // team 10%
@@ -44,13 +50,46 @@ contract CoreTGETest is Test {
         );
     }
 
+    function _meta() internal pure returns (LaunchTokenV2.Metadata memory) {
+        return LaunchTokenV2.Metadata({
+            logoURI: "ipfs://core-logo",
+            website: "https://core.example",
+            telegram: "",
+            discord: "",
+            twitter: "@core"
+        });
+    }
+
+    /// The core token must be a FACTORY token: deployed by the same TokenDeployerV2 (same
+    /// creator + LaunchTokenV2 bytecode external indexers key on), Base mode with the launch
+    /// limits off — i.e. it behaves exactly like a plain fixed-supply ERC20.
+    function test_launch_viaPlatformFactory_plainBaseToken() public {
+        tge.seed{value: 1 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        LaunchTokenV2 t = LaunchTokenV2(tokenAddr);
+
+        assertEq(t.launchpad(), address(tge), "TGE is the token's (unused) launchpad");
+        assertEq(uint8(t.mode()), uint8(LaunchTokenV2.Mode.Base), "Base mode");
+        assertFalse(t.limitActive(), "launch limits permanently off");
+        assertEq(t.owner(), address(0), "reads renounced on explorers");
+        assertEq(t.website(), "https://core.example", "metadata baked into the token");
+        assertEq(t.platformWebsite(), "https://hood.launchfair.app/", "platform site set");
+
+        // Plain transfer path: a bucket release then a wallet-to-wallet hop, no tax/hooks.
+        tge.claimTeam(TEAM, 1_000 ether);
+        vm.prank(TEAM);
+        t.transfer(COMMUNITY, 400 ether);
+        assertEq(t.balanceOf(COMMUNITY), 400 ether);
+        assertEq(t.balanceOf(TEAM), 600 ether);
+    }
+
     function test_allocationMustSumAndHaveLp() public {
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), 10_000, 5_000, 1_000, 3_000, 500);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, "", 10_000, 5_000, 1_000, 3_000, 500);
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), 10_000, 6_000, 1_000, 3_000, 0);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, "", 10_000, 6_000, 1_000, 3_000, 0);
     }
 
     function test_accumulateFromSinksAndManualSeed() public {
@@ -65,8 +104,8 @@ contract CoreTGETest is Test {
 
     function test_launch_seedsLockedPoolAndBuckets() public {
         tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
-        CoreToken t = CoreToken(tokenAddr);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        IERC20 t = IERC20(tokenAddr);
 
         // Buckets: 50/10/30 held here; 10% + rounding remainder into the pool.
         assertEq(tge.claimsRemaining(), SUPPLY / 2, "claims 50%");
@@ -85,18 +124,18 @@ contract CoreTGETest is Test {
 
     function test_launch_onceAndNeedsEth() public {
         vm.expectRevert(CoreTGE.NothingAccumulated.selector);
-        tge.launch("Fair Core", "FAIR", SUPPLY);
+        tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
 
         tge.seed{value: 1 ether}();
-        tge.launch("Fair Core", "FAIR", SUPPLY);
+        tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
         vm.deal(address(tge), 1 ether);
         vm.expectRevert(CoreTGE.AlreadyLaunched.selector);
-        tge.launch("Fair Core", "FAIR", SUPPLY);
+        tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
     }
 
     function test_fundClaims_adminSizedTranches() public {
         tge.seed{value: 1 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
 
         vm.expectRevert(CoreTGE.ZeroAddress.selector);
         tge.fundClaims(1 ether); // distributor unset
@@ -114,7 +153,7 @@ contract CoreTGETest is Test {
 
     function test_teamAndCommunityClaims_boundedAndOwnerOnly() public {
         tge.seed{value: 1 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
 
         tge.claimTeam(TEAM, 10_000_000 ether);
         assertEq(IERC20(tokenAddr).balanceOf(TEAM), 10_000_000 ether);
@@ -134,7 +173,7 @@ contract CoreTGETest is Test {
         tge.fundClaims(1 ether);
         vm.prank(address(0xbad));
         vm.expectRevert();
-        tge.launch("x", "x", 1);
+        tge.launch("x", "x", 1, _meta());
     }
 
     function test_devFeeConfig_capsAndRecipient() public {
@@ -157,7 +196,7 @@ contract CoreTGETest is Test {
 
     function test_collectPoolFees_devCarveAndCompound() public {
         tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
         tge.setDevFeeConfig(TEAM, 1_000, 1_000);
 
         // Pretend the locked position accrued 1%-pool fees: 1 WETH + 1000 tokens.
@@ -166,35 +205,35 @@ contract CoreTGETest is Test {
         uint256 fee1 = t0 == tokenAddr ? 1 ether : 1_000 ether;
         npm.setCollectable(tge.lpTokenId(), fee0, fee1);
 
-        uint256 tgeTokBefore = CoreToken(tokenAddr).balanceOf(address(tge));
-        uint256 npmTokBefore = CoreToken(tokenAddr).balanceOf(address(npm));
+        uint256 tgeTokBefore = IERC20(tokenAddr).balanceOf(address(tge));
+        uint256 npmTokBefore = IERC20(tokenAddr).balanceOf(address(npm));
         uint256 npmWethBefore = weth.balanceOf(address(npm));
         tge.collectPoolFees();
 
         // Dev gets 10% of each side; the ENTIRE remainder compounds back into the position.
-        assertEq(CoreToken(tokenAddr).balanceOf(TEAM), 100 ether, "10% of token-side fees to dev");
+        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 100 ether, "10% of token-side fees to dev");
         assertEq(weth.balanceOf(TEAM), 0.1 ether, "10% of WETH-side fees to dev");
-        assertEq(CoreToken(tokenAddr).balanceOf(address(npm)), npmTokBefore - 1_000 ether + 900 ether, "token remainder reinvested");
+        assertEq(IERC20(tokenAddr).balanceOf(address(npm)), npmTokBefore - 1_000 ether + 900 ether, "token remainder reinvested");
         assertEq(weth.balanceOf(address(npm)), npmWethBefore - 1 ether + 0.9 ether, "WETH remainder reinvested");
-        assertEq(CoreToken(tokenAddr).balanceOf(address(tge)), tgeTokBefore, "TGE retains nothing");
+        assertEq(IERC20(tokenAddr).balanceOf(address(tge)), tgeTokBefore, "TGE retains nothing");
         assertEq(weth.balanceOf(address(tge)), 0, "TGE retains no WETH");
     }
 
     function test_collectPoolFees_fullDevCut() public {
         tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
         tge.setDevFeeConfig(TEAM, 1_000, 10_000); // take the whole 1% fee
 
         (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
         npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 100 ether : 1 ether, t0 == tokenAddr ? 1 ether : 100 ether);
         tge.collectPoolFees();
-        assertEq(CoreToken(tokenAddr).balanceOf(TEAM), 100 ether, "whole token side to dev");
+        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 100 ether, "whole token side to dev");
         assertEq(weth.balanceOf(TEAM), 1 ether, "whole WETH side to dev");
     }
 
     function test_withdrawToken_respectsBuckets() public {
         tge.seed{value: 1 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY);
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
 
         // No surplus above the buckets → nothing withdrawable of the core token.
         vm.expectRevert(CoreTGE.InsufficientBucket.selector);
