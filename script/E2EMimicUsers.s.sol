@@ -30,7 +30,7 @@ contract E2EMimicUsers is Script {
     uint256 constant N = 6;
     // Tester-funded only (NEVER the deployer wallet) — keep the whole run cheap: each
     // wallet gets dust, trades 0.001-ETH clips, and gas on this L2 is near-zero.
-    uint256 constant FUND = 0.003 ether;
+    uint256 constant FUND = 0.0012 ether;
     uint256 constant ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
 
     function _mimicKey(uint256 i) internal pure returns (uint256) {
@@ -82,8 +82,8 @@ contract E2EMimicUsers is Script {
             PoolKey memory key = pad.getLaunch(modeTok).key;
 
             vm.startBroadcast(pk);
-            uint256 sGot = sr.buy{value: 0.001 ether}(stockTok, 0, me, block.timestamp + 3600);
-            uint256 mGot = v4r.buy{value: 0.001 ether}(key, 0, me, block.timestamp + 3600);
+            uint256 sGot = sr.buy{value: 0.0004 ether}(stockTok, 0, me, block.timestamp + 3600);
+            uint256 mGot = v4r.buy{value: 0.0004 ether}(key, 0, me, block.timestamp + 3600);
             if (i % 2 == 1) {
                 IERC20(stockTok).approve(address(sr), sGot / 3);
                 sr.sell(stockTok, sGot / 3, 0, me, block.timestamp + 3600);

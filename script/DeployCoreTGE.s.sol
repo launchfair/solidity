@@ -73,6 +73,10 @@ contract DeployCoreTGE is Script {
             lpBps
         );
 
+        // Launch-price floor: never list the core below a normal token's ~$2.5k starting
+        // FDV, however small the pot (MIN_LAUNCH_PRICE env, WETH wei per whole token).
+        tge.setMinLaunchPrice(vm.envOr("MIN_LAUNCH_PRICE", uint256(1_491_146_318)));
+
         // Point every flagship sink at the war chest — accumulation starts NOW.
         if (wireSinks) {
             address treasury = ISinkAdmin(stockRouter).treasury();

@@ -73,10 +73,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     int24 public immutable tickLower0; // single-sided range when token == currency0
     int24 public immutable tickUpper0;
     // Anti-snipe launch guard applied to each new token: a `maxBuyBps` wallet cap for
-    // the first `maxBuyBlocks` L1 blocks. Owner-settable so the window can be tuned
+    // the first `maxBuySecs` SECONDS after launch (time-based — exact regardless of the
+    // chain's block cadence). Owner-settable so the window can be tuned
     // without redeploying (affects tokens created after the change).
     uint16 public maxBuyBps;
-    uint32 public maxBuyBlocks;
+    uint32 public maxBuySecs;
 
     string public officialWebsite;
     uint256 public creationFeeWei = 0.000005 ether;
@@ -196,7 +197,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     event CreationFeePaid(address indexed creator, address indexed token, uint256 fee);
     event OfficialWebsiteSet(string website);
     event CreationFeeSet(uint256 weiAmount);
-    event AntiSnipeSet(uint16 maxBuyBps, uint32 maxBuyBlocks);
+    event AntiSnipeSet(uint16 maxBuyBps, uint32 maxBuySecs);
     event SwapRouterSet(address router);
 
     error ZeroAddress();
@@ -228,7 +229,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         int24 tickLower0_,
         int24 tickUpper0_,
         uint16 maxBuyBps_,
-        uint32 maxBuyBlocks_,
+        uint32 maxBuySecs_,
         string memory website_
     ) Ownable(owner_) {
         if (
@@ -247,7 +248,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         tickLower0 = tickLower0_;
         tickUpper0 = tickUpper0_;
         maxBuyBps = maxBuyBps_;
-        maxBuyBlocks = maxBuyBlocks_;
+        maxBuySecs = maxBuySecs_;
         officialWebsite = website_;
     }
 
@@ -434,7 +435,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 platformWebsite: officialWebsite,
                 metadata: p.metadata,
                 maxBuyBps: maxBuyBps,
-                maxBuyBlocks: maxBuyBlocks,
+                maxBuySecs: maxBuySecs,
                 mode: p.mode,
                 rewardTokens: rewardTokens,
                 rewardWeights: rewardWeights,
@@ -553,7 +554,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 platformWebsite: officialWebsite,
                 metadata: p.metadata,
                 maxBuyBps: maxBuyBps,
-                maxBuyBlocks: maxBuyBlocks,
+                maxBuySecs: maxBuySecs,
                 mode: LaunchTokenV2.Mode.Base,
                 rewardTokens: noRewards,
                 rewardWeights: noWeights,
@@ -715,11 +716,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
     /// @notice Tune the anti-snipe launch guard for FUTURE tokens: a `bps` wallet cap
     /// for the first `blocks` L1 blocks after launch (either 0 disables that part).
-    function setAntiSnipe(uint16 bps, uint32 blocks) external onlyOwner {
+    function setAntiSnipe(uint16 bps, uint32 secs) external onlyOwner {
         if (bps > 10_000) revert InvalidFee();
         maxBuyBps = bps;
-        maxBuyBlocks = blocks;
-        emit AntiSnipeSet(bps, blocks);
+        maxBuySecs = secs;
+        emit AntiSnipeSet(bps, secs);
     }
 
     // ── internals ──────────────────────────────────────────────────────────────

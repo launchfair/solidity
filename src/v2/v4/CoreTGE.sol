@@ -80,6 +80,23 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     address public devFeeRecipient;
     /// Skimmed off EVERY claims tranche before it reaches the distributor (default 10%).
     uint16 public seasonDevFeeBps = 1_000;
+
+    /// Launch-price FLOOR (WETH wei per whole token; 0 = off). The natural launch price is
+    /// pot ÷ LP-slice — with a small pot that can be an embarrassing "$7 mcap". At launch the
+    /// effective price is max(natural, floor); only pot ÷ price tokens of the LP slice get
+    /// paired (the pool still holds the ENTIRE pot), and the unpaired remainder stays here as
+    /// withdrawable surplus. Owner-settable until launch. Default set at deploy to the
+    /// launchpad's standard launch price (~$2.5k FDV) so the core NEVER lists below a normal
+    /// token's starting mcap.
+    uint256 public minLaunchPrice;
+    event MinLaunchPriceSet(uint256 wethWeiPerToken);
+
+    /// @notice Set the launch-price floor (0 disables). Pre-launch only.
+    function setMinLaunchPrice(uint256 wethWeiPerToken) external onlyOwner {
+        if (address(token) != address(0)) revert AlreadyLaunched();
+        minLaunchPrice = wethWeiPerToken;
+        emit MinLaunchPriceSet(wethWeiPerToken);
+    }
     /// Dev share of the locked position's collected 1% pool fees (default 10%; settable up
     /// to 100% — "the whole 1%"). Whatever ISN'T taken is compounded back into the locked
     /// liquidity, so the pool only ever deepens.
@@ -203,7 +220,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
                 platformWebsite: platformWebsite,
                 metadata: meta,
                 maxBuyBps: 0, // limits off ⇒ limitActive() is permanently false
-                maxBuyBlocks: 0,
+                maxBuySecs: 0,
                 mode: LaunchTokenV2.Mode.Base,
                 rewardTokens: noRewards,
                 rewardWeights: noWeights,
@@ -219,13 +236,26 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         communityRemaining = (supply * communityBps) / BPS;
         uint256 lpTokens = supply - claimsRemaining - teamRemaining - communityRemaining; // remainder → LP (no dust)
 
-        // Wrap the whole war chest and pair it with the LP slice, full range, locked here.
+        // Launch-price FLOOR: with a small pot the natural price (pot ÷ LP slice) would list
+        // the core at a joke mcap. Pair only what the pot affords at max(natural, floor) —
+        // the pool still takes the ENTIRE pot; the unpaired LP-slice remainder stays here as
+        // withdrawable surplus (add to the pool later, burn, whatever).
+        uint256 pairTokens = lpTokens;
+        if (minLaunchPrice != 0) {
+            uint256 natural = Math.mulDiv(eth, 1e18, lpTokens);
+            if (natural < minLaunchPrice) {
+                pairTokens = Math.mulDiv(eth, 1e18, minLaunchPrice);
+                if (pairTokens == 0) revert NothingAccumulated();
+            }
+        }
+
+        // Wrap the whole war chest and pair it with the (floor-clamped) LP slice, full range.
         weth.deposit{value: eth}();
         seededEth = eth;
 
         (address t0, address t1, uint256 a0, uint256 a1) = tokenAddr < address(weth)
-            ? (tokenAddr, address(weth), lpTokens, eth)
-            : (address(weth), tokenAddr, eth, lpTokens);
+            ? (tokenAddr, address(weth), pairTokens, eth)
+            : (address(weth), tokenAddr, eth, pairTokens);
 
         address pool = factory.getPool(t0, t1, poolFee);
         if (pool == address(0)) pool = factory.createPool(t0, t1, poolFee);
@@ -234,7 +264,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         uint160 sqrtPriceX96 = uint160((Math.sqrt(a1) << 96) / Math.sqrt(a0));
         IUniswapV3Pool(pool).initialize(sqrtPriceX96);
 
-        IERC20(tokenAddr).forceApprove(address(positionManager), lpTokens);
+        IERC20(tokenAddr).forceApprove(address(positionManager), pairTokens);
         IERC20(address(weth)).forceApprove(address(positionManager), eth);
         (uint256 tokenId,,,) = positionManager.mint(
             INonfungiblePositionManager.MintParams({
@@ -253,7 +283,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         );
         lpTokenId = tokenId;
 
-        emit Launched(tokenAddr, supply, eth, lpTokens, tokenId);
+        emit Launched(tokenAddr, supply, eth, pairTokens, tokenId);
     }
 
     // ── post-launch releases (all owner-gated, all bucket-bounded) ───────────

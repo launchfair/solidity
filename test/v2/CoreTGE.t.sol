@@ -118,6 +118,39 @@ contract CoreTGETest is Test {
         tge.setAllocation(5_000, 1_000, 3_000, 1_000);
     }
 
+    /// The launch-price floor: with a dust pot, only pot ÷ floor tokens get paired (whole pot
+    /// still in the pool ⇒ starting price = the floor, never a "$7 mcap"); the unpaired LP
+    /// remainder stays as withdrawable surplus.
+    function test_launch_priceFloor_smallPot() public {
+        uint256 floor = 1_491_146_318; // the launchpad's standard ~$2.5k-FDV launch price
+        tge.setMinLaunchPrice(floor);
+        tge.seed{value: 0.002 ether}(); // dust pot: natural price would be ~2.2e-12/token
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+
+        uint256 lpSlice = SUPPLY - tge.claimsRemaining() - tge.teamRemaining() - tge.communityRemaining();
+        uint256 expectedPaired = (0.002 ether * 1e18) / floor; // pot ÷ floor ≈ 1.34M tokens
+        assertEq(IERC20(tokenAddr).balanceOf(address(npm)), expectedPaired, "paired only what the pot affords");
+        assertEq(weth.balanceOf(address(npm)), 0.002 ether, "the ENTIRE pot is in the pool");
+
+        // Unpaired remainder is surplus above the buckets — withdrawable, not stuck.
+        uint256 surplus = lpSlice - expectedPaired;
+        tge.withdrawToken(tokenAddr, TEAM, surplus);
+        assertEq(IERC20(tokenAddr).balanceOf(TEAM), surplus, "unpaired LP remainder recoverable");
+
+        // Post-launch the floor is frozen with everything else.
+        vm.expectRevert(CoreTGE.AlreadyLaunched.selector);
+        tge.setMinLaunchPrice(0);
+    }
+
+    /// A big pot needs no clamp: natural price above the floor pairs the full LP slice.
+    function test_launch_priceFloor_bigPotUnclamped() public {
+        tge.setMinLaunchPrice(1_491_146_318);
+        tge.seed{value: 10 ether}(); // natural = 10e18*1e18/9e26 ≈ 1.1e10 > floor
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        uint256 lpSlice = SUPPLY - tge.claimsRemaining() - tge.teamRemaining() - tge.communityRemaining();
+        assertEq(IERC20(tokenAddr).balanceOf(address(npm)), lpSlice, "full LP slice paired");
+    }
+
     function test_accumulateFromSinksAndManualSeed() public {
         // Sinks push plain ETH (receive); the team can seed() on top.
         vm.deal(address(0xfee), 1 ether);

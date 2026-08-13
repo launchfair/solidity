@@ -18,7 +18,7 @@ contract TokenDeployerV2 {
         string platformWebsite;
         LaunchTokenV2.Metadata metadata;
         uint16 maxBuyBps;
-        uint32 maxBuyBlocks;
+        uint32 maxBuySecs;
         LaunchTokenV2.Mode mode;
         address[] rewardTokens; // Reward: 1..5 dividend assets
         uint16[] rewardWeights; // Reward: bps per asset (sum 10000)
@@ -38,7 +38,7 @@ contract TokenDeployerV2 {
                 p.platformWebsite,
                 p.metadata,
                 p.maxBuyBps,
-                p.maxBuyBlocks,
+                p.maxBuySecs,
                 p.mode,
                 p.rewardTokens,
                 p.rewardWeights,

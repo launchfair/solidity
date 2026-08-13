@@ -73,7 +73,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
 
     // ── launch guard (unchanged from V1) ─────────────────────────────────────
     uint256 public immutable maxWalletAmount;
-    uint256 public immutable limitEndBlock;
+    uint256 public immutable limitEndTime; // launch-guard window end (unix seconds)
     mapping(address => bool) public limitExempt;
     event LimitExemptSet(address indexed account, bool exempt);
 
@@ -152,7 +152,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         string memory platformWebsite_,
         Metadata memory meta,
         uint16 maxBuyBps_,
-        uint32 maxBuyBlocks_,
+        uint32 maxBuySecs_,
         Mode mode_,
         address[] memory rewardTokens_, // Reward: 1..MAX_REWARDS dividend assets
         uint16[] memory rewardWeights_, // Reward: bps per asset (sum == 10000)
@@ -168,7 +168,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         discord = meta.discord;
         twitter = meta.twitter;
         maxWalletAmount = maxBuyBps_ == 0 ? 0 : (supply_ * maxBuyBps_) / 10_000;
-        limitEndBlock = maxBuyBlocks_ == 0 ? 0 : block.number + maxBuyBlocks_;
+        limitEndTime = maxBuySecs_ == 0 ? 0 : block.timestamp + maxBuySecs_;
         mode = mode_;
         prizeToken = prizeToken_;
         minHoldForRewards = minHoldForRewards_;
@@ -234,7 +234,7 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
 
     // ── launch guard ─────────────────────────────────────────────────────────
     function limitActive() public view returns (bool) {
-        return maxWalletAmount != 0 && block.number < limitEndBlock;
+        return maxWalletAmount != 0 && block.timestamp < limitEndTime;
     }
 
     function setLimitExempt(address account, bool exempt) external {
