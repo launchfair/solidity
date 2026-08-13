@@ -164,12 +164,14 @@ the dashboard. In a single transaction it:
 
 **Phase 3 — Life after launch.**
 
-- **Season funding:** with the Genesis split, seasons are funded by the **buyback keeper** (fee
-  ETH → buy core on the pool → bought tokens into the Merkle pot), and the team's **10% season
-  cut is carved by the keeper** from each bought batch before funding. The on-chain
-  `fundClaims(amount)` tranche path (with its `seasonDevFeeBps` skim, hard-capped at 20%) still
-  exists but is dormant while the Claims bucket is 0 — it comes back into play if a future
-  redeploy allocates one.
+- **Season funding (Season 1 onward — separate economics from the Genesis launch split):**
+  seasons are funded by the **buyback keeper** (fee ETH → buy core on the pool → bought tokens
+  into the Merkle pot). Each season's batch is divided by **live, admin-editable knobs** in the
+  Seasons tab: the **team cut** (`seasonDevBps`, default 10%, hard-capped at 20%, carved first
+  and idempotently by the keeper) and the distribute / burn / trail-forward split of the rest.
+  Change them between seasons at will — the one-time Genesis 90/10 supply split has nothing to
+  do with these. The on-chain `fundClaims(amount)` tranche path (with its own 20%-capped skim)
+  still exists but is dormant while the Claims bucket is 0.
 - **Team / Community:** `claimTeam` / `claimCommunity` pay out to any address, strictly bounded by
   the remaining bucket balance. Purely admin functions, driven from the dashboard.
 - **Pool fees:** the locked position earns the 1% pool fee on every Core trade forever.
