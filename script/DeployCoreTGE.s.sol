@@ -32,6 +32,7 @@ contract DeployCoreTGE is Script {
     /// come from the SAME factory as every launchpad token so aggregators index it as ours.
     address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
     address constant DEFAULT_V3_ROUTER = 0xCaf681a66D020601342297493863E78C959E5cb2;
+    address constant DEFAULT_TREASURY = 0x82C8f63D0E578bA3d800BA5d48F8e9dD2a009Af3;
     string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
 
     function run() external {
@@ -67,6 +68,7 @@ contract DeployCoreTGE is Script {
             INonfungiblePositionManager(npm),
             TokenDeployerV2(tokenDeployer),
             IV3SwapRouter(vm.envOr("V3_ROUTER", DEFAULT_V3_ROUTER)),
+            vm.envOr("TREASURY", DEFAULT_TREASURY),
             PLATFORM_WEBSITE,
             10_000, // 1% pool fee tier for the seeded pool
             claimsBps,

@@ -37,6 +37,7 @@ contract CoreTGETest is Test {
     TgeMockV3Router v3router;
 
     address constant TEAM = address(0x7e40);
+    address constant TREASURY = address(0x7EEA);
     address constant COMMUNITY = address(0xc0);
     address constant DISTRIBUTOR = address(0xd157);
     uint256 constant SUPPLY = 1_000_000_000 ether;
@@ -54,6 +55,7 @@ contract CoreTGETest is Test {
             INonfungiblePositionManager(address(npm)),
             tokenDeployer,
             IV3SwapRouter(address(v3router)),
+            TREASURY,
             "https://hood.launchfair.app/",
             10_000,
             5_000, // claims 50%
@@ -99,10 +101,10 @@ contract CoreTGETest is Test {
     function test_allocationMustSumAndHaveLp() public {
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), "", 10_000, 5_000, 1_000, 3_000, 500);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_000, 5_000, 1_000, 3_000, 500);
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), "", 10_000, 6_000, 1_000, 3_000, 0);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_000, 6_000, 1_000, 3_000, 0);
     }
 
     /// The split is a live dashboard knob until launch; the values in force at launch freeze.
@@ -155,43 +157,57 @@ contract CoreTGETest is Test {
         tge.setMinLaunchPrice(0);
     }
 
-    /// Pool-fee remainder modes: BuybackBurn converts the WETH side to core and burns ALL of
-    /// it; BuybackReward sends it to the reward sink (the buyback vault → season pots).
-    function test_poolFeeMode_buybackBurn() public {
+    /// PURE REVENUE: collected pool fees split TEAM/TREASURY (default 50/50) — nothing
+    /// is reinvested, and the split is the only fee config.
+    function test_collectPoolFees_pureRevenueSplit() public {
         tge.seed{value: 10 ether}();
         address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
-        tge.claimTeam(address(v3router), 10 ether); // 1:1 mock router inventory
-        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackBurn, address(0));
+        tge.setFeeWallets(TEAM, TREASURY);
+        tge.setPoolFeeSplit(7_000, 3_000);
 
         (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
         npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 1_000 ether : 1 ether, t0 == tokenAddr ? 1 ether : 1_000 ether);
         tge.collectPoolFees();
 
-        // dev 10% off each side; remainder = 900 core + 0.9 WETH → 0.9 core bought (1:1) → burned.
-        address dead = tge.DEAD();
-        assertEq(IERC20(tokenAddr).balanceOf(dead), 900.9 ether, "core remainder + buyback burned");
-        assertEq(weth.balanceOf(TEAM), 0, "sanity");
-        assertEq(IERC20(tokenAddr).balanceOf(address(this)), 100 ether, "dev cut still paid (core side)");
-        assertEq(weth.balanceOf(address(this)), 0.1 ether, "dev cut still paid (WETH side)");
-    }
+        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 700 ether, "team 70% of the token side");
+        assertEq(weth.balanceOf(TEAM), 0.7 ether, "team 70% of the WETH side");
+        assertEq(IERC20(tokenAddr).balanceOf(TREASURY), 300 ether, "treasury takes the rest");
+        assertEq(weth.balanceOf(TREASURY), 0.3 ether);
+        assertEq(IERC20(tokenAddr).balanceOf(address(tge)) , SUPPLY - tge.claimsRemaining() - tge.teamRemaining() - tge.communityRemaining() - IERC20(tokenAddr).balanceOf(address(npm)) - 1_000 ether >= 0 ? IERC20(tokenAddr).balanceOf(address(tge)) : 0, "sanity");
+        assertEq(weth.balanceOf(address(tge)), 0, "nothing retained, nothing reinvested");
 
-    function test_poolFeeMode_buybackReward_andGuards() public {
-        tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
-        tge.claimTeam(address(v3router), 10 ether);
-
-        vm.expectRevert(CoreTGE.ZeroAddress.selector);
-        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackReward, address(0)); // sink required
+        vm.expectRevert(CoreTGE.BadAllocation.selector);
+        tge.setPoolFeeSplit(7_000, 2_000); // must sum to 100%
         vm.prank(address(0xbad));
         vm.expectRevert();
-        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackBurn, address(0)); // owner only
+        tge.setPoolFeeSplit(5_000, 5_000); // owner only
+    }
+
+    /// One-click reward funding: ETH in → core bought on the pool → straight to the sink.
+    function test_buybackAndFund() public {
+        tge.seed{value: 10 ether}();
+        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        tge.claimTeam(address(v3router), 10 ether); // 1:1 mock inventory
+
+        vm.expectRevert(CoreTGE.ZeroAddress.selector);
+        tge.buybackAndFund{value: 0.1 ether}(0); // sink required first
 
         address SINK = address(0x5111c);
-        tge.setPoolFeeMode(CoreTGE.PoolFeeMode.BuybackReward, SINK);
-        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
-        npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 1_000 ether : 1 ether, t0 == tokenAddr ? 1 ether : 1_000 ether);
-        tge.collectPoolFees();
-        assertEq(IERC20(tokenAddr).balanceOf(SINK), 900.9 ether, "remainder + buyback to the reward sink");
+        tge.setRewardSink(SINK);
+        uint256 out = tge.buybackAndFund{value: 0.5 ether}(0);
+        assertEq(out, 0.5 ether, "1:1 mock fill");
+        assertEq(IERC20(tokenAddr).balanceOf(SINK), 0.5 ether, "bought core delivered to the reward sink");
+
+        vm.prank(address(0xbad));
+        vm.expectRevert();
+        tge.buybackAndFund{value: 1}(0); // owner only
+    }
+
+    /// The core token's fee is HARD-CAPPED at 1% — a fatter tier can't even be deployed.
+    function test_poolFeeCappedAtOnePercent() public {
+        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
+        new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_001, 0, 1_000, 0, 9_000);
     }
 
     /// A big pot needs no clamp: natural price above the floor pairs the full LP slice.
@@ -253,7 +269,7 @@ contract CoreTGETest is Test {
 
         tge.setClaimsDistributor(DISTRIBUTOR);
         tge.fundClaims(100_000_000 ether); // season 1 tranche — purely the admin's call
-        // 10% season dev cut to devFeeRecipient (defaults to the owner), 90% to the distributor.
+        // 10% season skim to the teamWallet (defaults to the owner), 90% to the distributor.
         assertEq(IERC20(tokenAddr).balanceOf(DISTRIBUTOR), 90_000_000 ether, "90% to claims");
         assertEq(IERC20(tokenAddr).balanceOf(address(this)), 10_000_000 ether, "10% dev cut");
         assertEq(tge.claimsRemaining(), SUPPLY / 2 - 100_000_000 ether);
@@ -287,59 +303,19 @@ contract CoreTGETest is Test {
         tge.launch("x", "x", 1, _meta());
     }
 
-    function test_devFeeConfig_capsAndRecipient() public {
-        // Pool cut may be ANYTHING up to 100% ("the whole 1% fee"); season skim capped at 20%.
-        tge.setDevFeeConfig(TEAM, 500, 10_000);
-        assertEq(tge.devFeeRecipient(), TEAM);
+    function test_feeSetters_capsAndAuth() public {
+        tge.setSeasonDevFee(500);
         assertEq(tge.seasonDevFeeBps(), 500);
-        assertEq(tge.poolDevFeeBps(), 10_000);
+        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
+        tge.setSeasonDevFee(2_001); // skim above the 20% ceiling
 
-        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
-        tge.setDevFeeConfig(TEAM, 2_001, 0); // season skim above the 20% ceiling
-        vm.expectRevert(CoreTGE.FeeTooHigh.selector);
-        tge.setDevFeeConfig(TEAM, 0, 10_001); // pool cut above 100%
         vm.expectRevert(CoreTGE.ZeroAddress.selector);
-        tge.setDevFeeConfig(address(0), 0, 0);
+        tge.setFeeWallets(address(0), TREASURY);
+        vm.expectRevert(CoreTGE.ZeroAddress.selector);
+        tge.setRewardSink(address(0));
         vm.prank(address(0xbad));
         vm.expectRevert();
-        tge.setDevFeeConfig(address(0xbad), 0, 0);
-    }
-
-    function test_collectPoolFees_devCarveAndCompound() public {
-        tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
-        tge.setDevFeeConfig(TEAM, 1_000, 1_000);
-
-        // Pretend the locked position accrued 1%-pool fees: 1 WETH + 1000 tokens.
-        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
-        uint256 fee0 = t0 == tokenAddr ? 1_000 ether : 1 ether;
-        uint256 fee1 = t0 == tokenAddr ? 1 ether : 1_000 ether;
-        npm.setCollectable(tge.lpTokenId(), fee0, fee1);
-
-        uint256 tgeTokBefore = IERC20(tokenAddr).balanceOf(address(tge));
-        uint256 npmTokBefore = IERC20(tokenAddr).balanceOf(address(npm));
-        uint256 npmWethBefore = weth.balanceOf(address(npm));
-        tge.collectPoolFees();
-
-        // Dev gets 10% of each side; the ENTIRE remainder compounds back into the position.
-        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 100 ether, "10% of token-side fees to dev");
-        assertEq(weth.balanceOf(TEAM), 0.1 ether, "10% of WETH-side fees to dev");
-        assertEq(IERC20(tokenAddr).balanceOf(address(npm)), npmTokBefore - 1_000 ether + 900 ether, "token remainder reinvested");
-        assertEq(weth.balanceOf(address(npm)), npmWethBefore - 1 ether + 0.9 ether, "WETH remainder reinvested");
-        assertEq(IERC20(tokenAddr).balanceOf(address(tge)), tgeTokBefore, "TGE retains nothing");
-        assertEq(weth.balanceOf(address(tge)), 0, "TGE retains no WETH");
-    }
-
-    function test_collectPoolFees_fullDevCut() public {
-        tge.seed{value: 10 ether}();
-        address tokenAddr = tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
-        tge.setDevFeeConfig(TEAM, 1_000, 10_000); // take the whole 1% fee
-
-        (address t0,) = tokenAddr < address(weth) ? (tokenAddr, address(weth)) : (address(weth), tokenAddr);
-        npm.setCollectable(tge.lpTokenId(), t0 == tokenAddr ? 100 ether : 1 ether, t0 == tokenAddr ? 1 ether : 100 ether);
-        tge.collectPoolFees();
-        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 100 ether, "whole token side to dev");
-        assertEq(weth.balanceOf(TEAM), 1 ether, "whole WETH side to dev");
+        tge.setFeeWallets(address(0xbad), address(0xbad));
     }
 
     function test_withdrawToken_respectsBuckets() public {
