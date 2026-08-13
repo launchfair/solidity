@@ -53,11 +53,13 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     uint24 public immutable poolFee; // V3 fee tier of the seeded pool (default 10000 = 1%)
     string public platformWebsite; // baked into the token like every launchpad token
 
-    // ── allocation (bps of total supply, fixed at construction, sum == 10000) ──
-    uint16 public immutable claimsBps;
-    uint16 public immutable teamBps;
-    uint16 public immutable communityBps;
-    uint16 public immutable lpBps;
+    // ── allocation (bps of total supply, sum == 10000) ───────────────────────
+    // Owner-settable from the dashboard any time BEFORE launch (so a misconfig is never
+    // terminal); the values in force at `launch` are frozen into the buckets forever.
+    uint16 public claimsBps;
+    uint16 public teamBps;
+    uint16 public communityBps;
+    uint16 public lpBps;
 
     IERC20 public token; // zero until launch (a factory-deployed Base-mode LaunchTokenV2)
     uint256 public lpTokenId; // the locked full-range position NFT (held here forever)
@@ -83,6 +85,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     /// liquidity, so the pool only ever deepens.
     uint16 public poolDevFeeBps = 1_000;
 
+    event AllocationSet(uint16 claimsBps, uint16 teamBps, uint16 communityBps, uint16 lpBps);
     event Seeded(address indexed from, uint256 amount);
     event Launched(address token, uint256 supply, uint256 ethSeeded, uint256 lpTokens, uint256 lpTokenId);
     event ClaimsFunded(address indexed distributor, uint256 amount);
@@ -123,18 +126,34 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         ) {
             revert ZeroAddress();
         }
-        if (uint256(claimsBps_) + teamBps_ + communityBps_ + lpBps_ != BPS || lpBps_ == 0) revert BadAllocation();
         weth = weth_;
         factory = factory_;
         positionManager = positionManager_;
         tokenDeployer = tokenDeployer_;
         platformWebsite = platformWebsite_;
         poolFee = poolFee_;
+        _setAllocation(claimsBps_, teamBps_, communityBps_, lpBps_);
+        devFeeRecipient = owner_;
+    }
+
+    // ── allocation ───────────────────────────────────────────────────────────
+    /// @notice Retune the launch split (bps of supply, must sum to 100%, LP > 0) any time
+    /// BEFORE launch. The values in force at `launch` freeze into the buckets forever.
+    function setAllocation(uint16 claimsBps_, uint16 teamBps_, uint16 communityBps_, uint16 lpBps_)
+        external
+        onlyOwner
+    {
+        if (address(token) != address(0)) revert AlreadyLaunched();
+        _setAllocation(claimsBps_, teamBps_, communityBps_, lpBps_);
+    }
+
+    function _setAllocation(uint16 claimsBps_, uint16 teamBps_, uint16 communityBps_, uint16 lpBps_) internal {
+        if (uint256(claimsBps_) + teamBps_ + communityBps_ + lpBps_ != BPS || lpBps_ == 0) revert BadAllocation();
         claimsBps = claimsBps_;
         teamBps = teamBps_;
         communityBps = communityBps_;
         lpBps = lpBps_;
-        devFeeRecipient = owner_;
+        emit AllocationSet(claimsBps_, teamBps_, communityBps_, lpBps_);
     }
 
     // ── accumulate ───────────────────────────────────────────────────────────

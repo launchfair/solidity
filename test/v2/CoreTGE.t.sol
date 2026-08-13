@@ -92,6 +92,32 @@ contract CoreTGETest is Test {
             INonfungiblePositionManager(address(npm)), tokenDeployer, "", 10_000, 6_000, 1_000, 3_000, 0);
     }
 
+    /// The split is a live dashboard knob until launch; the values in force at launch freeze.
+    function test_setAllocation_dynamicUntilLaunch() public {
+        // Retune pre-launch (60/10/25/5) and launch on the NEW split.
+        tge.setAllocation(6_000, 1_000, 2_500, 500);
+        assertEq(tge.claimsBps(), 6_000);
+        assertEq(tge.lpBps(), 500);
+
+        vm.expectRevert(CoreTGE.BadAllocation.selector);
+        tge.setAllocation(6_000, 1_000, 2_500, 400); // must sum to 10000
+        vm.expectRevert(CoreTGE.BadAllocation.selector);
+        tge.setAllocation(7_000, 1_000, 2_000, 0); // LP slice can't be zero
+        vm.prank(address(0xbad));
+        vm.expectRevert();
+        tge.setAllocation(2_500, 2_500, 2_500, 2_500); // owner only
+
+        tge.seed{value: 1 ether}();
+        tge.launch("Fair Core", "FAIR", SUPPLY, _meta());
+        assertEq(tge.claimsRemaining(), (SUPPLY * 6_000) / 10_000, "launched on the retuned split");
+        assertEq(tge.teamRemaining(), (SUPPLY * 1_000) / 10_000);
+        assertEq(tge.communityRemaining(), (SUPPLY * 2_500) / 10_000);
+
+        // Post-launch the split is frozen forever (buckets are already accounted from it).
+        vm.expectRevert(CoreTGE.AlreadyLaunched.selector);
+        tge.setAllocation(5_000, 1_000, 3_000, 1_000);
+    }
+
     function test_accumulateFromSinksAndManualSeed() public {
         // Sinks push plain ETH (receive); the team can seed() on top.
         vm.deal(address(0xfee), 1 ether);

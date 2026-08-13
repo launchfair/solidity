@@ -24,8 +24,10 @@ contract DeployCoreTGE is Script {
     address constant DEFAULT_WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address constant DEFAULT_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
     address constant DEFAULT_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
-    address constant DEFAULT_FEE_LOCKER = 0x366d2dC5d7b600D582e553C1380cf0F45F684651;
-    address constant DEFAULT_STOCK_ROUTER = 0x502Bba6Bf09C430e63709335904dCE5AcA2b6cF6;
+    // Open-stock-pool stack (2026-08-13).
+    address constant DEFAULT_FEE_LOCKER = 0x9c7C88D8338b13B4D04ee43334dd02522757AAC6;
+    address constant DEFAULT_STOCK_ROUTER = 0xBb6f952a5fD28566b7f0d32Ac02F2aFc6bD782BC;
+    address constant DEFAULT_STOCK_FEE_HOOK = 0x37Db3428A84f72e0df3d786483eaa1d1558d80CC;
     /// The live launchpad's TokenDeployerV2 (LaunchFairV4.deployer()) — the core token must
     /// come from the SAME factory as every launchpad token so aggregators index it as ours.
     address constant DEFAULT_TOKEN_DEPLOYER = 0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6;
@@ -44,6 +46,7 @@ contract DeployCoreTGE is Script {
         address npm = vm.envOr("POSITION_MANAGER", DEFAULT_POSITION_MANAGER);
         address locker = vm.envOr("FEE_LOCKER", DEFAULT_FEE_LOCKER);
         address stockRouter = vm.envOr("STOCK_ROUTER", DEFAULT_STOCK_ROUTER);
+        address stockFeeHook = vm.envOr("STOCK_FEE_HOOK", DEFAULT_STOCK_FEE_HOOK);
         address tokenDeployer = vm.envOr("TOKEN_DEPLOYER", DEFAULT_TOKEN_DEPLOYER);
         uint16 claimsBps = uint16(vm.envOr("CLAIMS_BPS", uint256(5000)));
         uint16 teamBps = uint16(vm.envOr("TEAM_BPS", uint256(1000)));
@@ -66,10 +69,12 @@ contract DeployCoreTGE is Script {
             lpBps
         );
 
-        // Point both flagship sinks at the war chest — accumulation starts NOW.
+        // Point every flagship sink at the war chest — accumulation starts NOW.
         if (wireSinks) {
+            address treasury = ISinkAdmin(stockRouter).treasury();
             ISinkAdmin(locker).setFlagshipSink(address(tge));
-            ISinkAdmin(stockRouter).setDestinations(ISinkAdmin(stockRouter).treasury(), address(tge));
+            ISinkAdmin(stockRouter).setDestinations(treasury, address(tge));
+            if (stockFeeHook != address(0)) ISinkAdmin(stockFeeHook).setDestinations(treasury, address(tge));
         }
 
         vm.stopBroadcast();

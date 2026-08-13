@@ -128,7 +128,7 @@ snipers can farm. If organic accumulation is too slow, we can also **seed the ch
 ### The contract: CoreTGE
 
 One contract runs the whole lifecycle — `CoreTGE.sol`, live at
-`0xdD0074a76A092A05149FEF8aa463c48C2701777F` (v4).
+`0x8A91b039b1777F05b70665f8362589505505d6dc` (v5).
 
 **Phase 1 — Accumulate.** Both flagship sinks (V4 fee locker + stock router) point at the TGE, so
 it passively collects ETH from every trade on the platform. `withdrawEth` exists as an owner escape
@@ -142,14 +142,19 @@ the dashboard. In a single transaction it:
    same on-chain creator and verified bytecode and index it as one of ours). It launches in Base
    mode with the launch limits off, which makes it behave as a **plain fixed-supply ERC-20**: no
    reflection, no tax hook, exchange-friendly, 100% supply visible at birth, owner reads renounced.
-2. Splits the supply into four buckets (bps set at deploy, currently):
+2. Splits the supply into four buckets. The split is a **live dashboard knob right up until
+   launch** (`setAllocation`, must sum to 100%, LP > 0) — whatever is set at the moment of launch
+   freezes into the buckets forever. Current defaults:
    - **50% Claims** — season rewards, released in admin-sized tranches
    - **10% Team**
    - **30% Community** — initiatives, partnerships, listings
-   - **10% LP** — paired with the war chest
-3. Pairs the LP bucket with the **entire ETH war chest** into a **full-range Uniswap V3 position at
-   the 1% fee tier**. Starting price = pot ÷ LP tokens, so the launch market cap is directly
-   proportional to how much the chest accumulated.
+   - **10% LP** — the launch liquidity: the only slice that goes into the trading pool
+3. Deposits the LP bucket **together with the entire ETH war chest** into a **full-range Uniswap
+   V3 position at the 1% fee tier** — ETH on one side, the LP tokens on the other. That's what
+   "paired" means: the LP slice is the token half of the liquidity pair, and it's the only float
+   tradeable at birth (the other 90% sits in buckets until released). Starting price = pot ÷ LP
+   tokens — so the same pot with a smaller LP slice launches at a higher price, and the launch
+   market cap is directly proportional to how much the chest accumulated.
 4. **Locks that LP NFT in the contract forever.** There is *no function to withdraw the position* —
    not even for the owner. The liquidity cannot be pulled. This is the anti-rug guarantee, verifiable
    on-chain by anyone.
@@ -297,7 +302,7 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 | Contract | Address |
 |---|---|
-| CoreTGE v4 (war chest + factory launcher) | `0xdD0074a76A092A05149FEF8aa463c48C2701777F` |
+| CoreTGE v5 (war chest + factory launcher, dynamic split) | `0x8A91b039b1777F05b70665f8362589505505d6dc` |
 | LaunchFair V4 launchpad (open-stock-pool stack, 2026-08-13) | `0xAc6Cd88cc87F781BE1A820D8c00A146047A77957` |
 | TokenDeployerV2 (the one token factory, reused across stacks) | `0x87500DEedDb7C3F2a4c1Df435611a9b15590b2B6` |
 | V4 FeeLocker | `0x9c7C88D8338b13B4D04ee43334dd02522757AAC6` |
@@ -318,7 +323,7 @@ paired direct + USDG-routed), trading with live quotes on all of them, indexing 
 volume, 1-second live candles, groups/invites/chat, X linking + quests, season points with
 projections, and the TGE war chest **actually accumulating ETH from real trades** (the stock
 router's distribute() delivering to the sink was confirmed on-chain, and the pot survived the
-v3→v4 migration intact). The open-pool stock model was smoke-tested live on 2026-08-13: launch →
+v4→v5 migration intact). The open-pool stock model was smoke-tested live on 2026-08-13: launch →
 ETH buy/sell → in-pool fee accrual (in COIN) → convert + 4-way ETH split, with the war chest
 receiving exactly its 50%.
 
