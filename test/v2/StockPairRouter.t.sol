@@ -467,9 +467,22 @@ contract LaunchFairV4StockTest is Test, Deployers {
         pad.createStockToken{value: 0.000005 ether}(_baseParams(), address(notAllowed));
     }
 
-    function test_createStockToken_rejectsNonBaseMode() public {
+    /// Stock pairs take modes now (Base/Reward/Lottery) — only Redistribute (own-pool buyback is
+    /// unroutable for the WETH-spending distributor) and Perps (WETH-only) are refused.
+    function test_createStockToken_modePolicy() public {
         LaunchFairV4.CreateParams memory p = _baseParams();
         p.mode = LaunchTokenV2.Mode.Lottery;
+        p.salt = keccak256("stock-lottery");
+        address token = pad.createStockToken{value: 0.000005 ether}(p, address(stock));
+        assertEq(uint8(LaunchTokenV2(token).mode()), uint8(LaunchTokenV2.Mode.Lottery), "lottery stock pair launches");
+
+        p.mode = LaunchTokenV2.Mode.Increasing;
+        p.salt = keccak256("stock-redis");
+        vm.expectRevert(LaunchFairV4.InvalidMode.selector);
+        pad.createStockToken{value: 0.000005 ether}(p, address(stock));
+
+        p.mode = LaunchTokenV2.Mode.Perps;
+        p.salt = keccak256("stock-perps");
         vm.expectRevert(LaunchFairV4.InvalidMode.selector);
         pad.createStockToken{value: 0.000005 ether}(p, address(stock));
     }

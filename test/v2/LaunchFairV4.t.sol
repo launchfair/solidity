@@ -6,6 +6,8 @@ import {Deployers} from "v4-core/test/utils/Deployers.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -43,6 +45,17 @@ contract MockWethT is ERC20 {
     }
 }
 
+/// 6-decimal quote (USDG-style) for the down-shifted launch-price test.
+contract MockUsdg6 is ERC20 {
+    constructor() ERC20("USDG", "USDG") {}
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+    function mint(address to, uint256 a) external {
+        _mint(to, a);
+    }
+}
+
 /// @notice Minimal V3 factory stand-in: records which (tokenA, tokenB, fee) pools
 /// "exist" so the launchpad's reward-pool validation can pass.
 contract MockV3FactoryT {
@@ -77,6 +90,7 @@ contract MockV3RouterT {
 /// generate fees, claim, process, and confirm a holder is auto-rewarded — the
 /// whole V4 pipeline behind one entry point.
 contract LaunchFairV4Test is Test, Deployers {
+    using PoolIdLibrary for PoolKey;
     MockWethT weth;
     MockV3FactoryT v3factory;
     MockV3RouterT v3router;
@@ -219,6 +233,102 @@ contract LaunchFairV4Test is Test, Deployers {
         int24 bottomA = pa.tokenIsCurrency0 ? pa.tickLower : -pa.tickUpper;
         int24 bottomB = pb.tokenIsCurrency0 ? pb.tickLower : -pb.tickUpper;
         assertEq(bottomB - bottomA, 46_000, "range bottom lifted by the configured price ratio");
+    }
+
+    /// Wire a stub stock stack (router placeholder + gate hook) and allow `quote`. Unique salt
+    /// per test so deployCodeTo addresses never collide.
+    function _stockStack(bytes32 salt, address quote) internal {
+        address stubRouter = address(uint160(uint256(keccak256(abi.encode("router", salt)))));
+        address gateAddr =
+            address((uint160(uint256(keccak256(abi.encode("gate", salt)))) & ~uint160(0x3FFF)) | uint160(Hooks.BEFORE_SWAP_FLAG));
+        deployCodeTo("RouterGateHook.sol:RouterGateHook", abi.encode(address(manager), stubRouter), gateAddr);
+        pad.setStockPairRouter(stubRouter);
+        pad.setStockGateHook(gateAddr);
+        pad.setAllowedQuote(quote, true, 3000);
+    }
+
+    function _stockParams(string memory sym, LaunchTokenV2.Mode mode) internal pure returns (LaunchFairV4.CreateParams memory p) {
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+        p = LaunchFairV4.CreateParams({
+            name: sym, symbol: sym, metadata: meta, salt: keccak256(bytes(sym)),
+            mode: mode, fee: 30_000, rewards: _noRewards(), perps: _noPerps(),
+            prizeToken: address(0), prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none,
+            minHold: 0, payoutThreshold: 0, payoutIntervalBlocks: 0,
+            missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+        });
+    }
+
+    /// Stock pairs now take MODES: a Reward-mode stock token deploys with its reward config and
+    /// registers the mechanism, exactly like a WETH pair.
+    function test_stockLaunch_rewardMode_fullMechanismWiring() public {
+        MockWethT stockQ = new MockWethT();
+        _stockStack("reward", address(stockQ));
+        // A V3-venued reward asset (validated against the mock factory, like the WETH-pair tests).
+        MockWethT rewardAsset = new MockWethT();
+        v3factory.setPool(address(rewardAsset), address(weth), 3000, address(0xBEEF));
+
+        LaunchFairV4.CreateParams memory p = _stockParams("SRW", LaunchTokenV2.Mode.Reward);
+        p.rewards = _oneReward(address(rewardAsset), true, 3000);
+        address token = pad.createStockToken{value: 0.000005 ether}(p, address(stockQ));
+
+        assertEq(uint8(LaunchTokenV2(token).mode()), uint8(LaunchTokenV2.Mode.Reward), "mode survived the stock path");
+        address[] memory assets = LaunchTokenV2(token).rewardTokensList();
+        assertEq(assets.length, 1);
+        assertEq(assets[0], address(rewardAsset), "reward asset registered on the token");
+        assertEq(pad.getLaunch(token).quoteToken, address(stockQ), "stock-paired");
+    }
+
+    function test_stockLaunch_lotteryMode_operatorWired() public {
+        MockWethT stockQ = new MockWethT();
+        _stockStack("lottery", address(stockQ));
+        address token = pad.createStockToken{value: 0.000005 ether}(_stockParams("SLT", LaunchTokenV2.Mode.Lottery), address(stockQ));
+        assertEq(uint8(LaunchTokenV2(token).mode()), uint8(LaunchTokenV2.Mode.Lottery));
+        assertEq(LaunchTokenV2(token).lotteryOperator(), address(dist), "distributor runs the draws");
+    }
+
+    /// Redistribute buys back the token's OWN pool — stock-quoted here, unroutable for the
+    /// WETH-spending distributor — and Perps stays WETH-only. Both must refuse a stock quote.
+    function test_stockLaunch_redistributeAndPerps_revert() public {
+        MockWethT stockQ = new MockWethT();
+        _stockStack("reject", address(stockQ));
+        LaunchFairV4.CreateParams memory p = _stockParams("SRD", LaunchTokenV2.Mode.Increasing);
+        vm.expectRevert(LaunchFairV4.InvalidMode.selector);
+        pad.createStockToken{value: 0.000005 ether}(p, address(stockQ));
+        p = _stockParams("SPP", LaunchTokenV2.Mode.Perps);
+        vm.expectRevert(LaunchFairV4.InvalidMode.selector);
+        pad.createStockToken{value: 0.000005 ether}(p, address(stockQ));
+    }
+
+    /// USDG (6 decimals): its sane launch price in quote-wei (~3 wei/token for a ~$3k mcap) sits
+    /// ~9 orders BELOW the 18-dp default, so the price knob must shift the range (and the pool's
+    /// init price with it) DOWNWARD — the up-only knob would have listed at a $1.5T mcap.
+    function test_stockLaunch_usdg6Decimals_downShiftedLaunchPrice() public {
+        MockUsdg6 usdg = new MockUsdg6();
+        MockWethT plain = new MockWethT();
+        _stockStack("usdg", address(usdg));
+        pad.setAllowedQuote(address(plain), true, 3000);
+        pad.setAllowedQuotePrice(address(usdg), 3); // 3 USDG-wei per whole token ≈ $3k FDV
+
+        address a = pad.createStockToken{value: 0.000005 ether}(_stockParams("SPL", LaunchTokenV2.Mode.Base), address(plain));
+        address b = pad.createStockToken{value: 0.000005 ether}(_stockParams("SUS", LaunchTokenV2.Mode.Base), address(usdg));
+
+        LaunchFairV4FeeLocker.Position memory pa = locker.positionOf(a);
+        LaunchFairV4FeeLocker.Position memory pb = locker.positionOf(b);
+        int24 bottomA = pa.tokenIsCurrency0 ? pa.tickLower : -pa.tickUpper;
+        int24 bottomB = pb.tokenIsCurrency0 ? pb.tickLower : -pb.tickUpper;
+        int24 diff = bottomB - bottomA;
+        // ln(3 / 1491146318) / ln(1.0001) ≈ -200,297 → truncated to the 200 spacing = -200,200.
+        assertEq(diff, -200_200, "range dropped by the knob ratio, spacing-aligned");
+
+        // Init price followed the range down: the pool's current tick sits at/below the shifted
+        // range bottom (token-per-quote orientation), so the single-sided mint (which SUCCEEDED
+        // above — a wrong-side init would have needed quote-side funds and reverted in the
+        // locker) leaves the first buy walking price up into the range exactly as on WETH pairs.
+        PoolKey memory key = pad.getLaunch(b).key;
+        (, int24 tickNow,,) = StateLibrary.getSlot0(manager, key.toId());
+        int24 tickTokenPerQuote = pb.tokenIsCurrency0 ? tickNow : -tickNow;
+        assertLe(tickTokenPerQuote, bottomB, "pool initialized at/below the down-shifted range bottom");
     }
 
     // A single reward asset taking the full fee weight, on a V3 (or V4) venue.

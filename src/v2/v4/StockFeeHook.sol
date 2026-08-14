@@ -32,6 +32,17 @@ interface IWETHW {
     function withdraw(uint256) external;
 }
 
+interface IModeTokenView {
+    /// LaunchTokenV2.mode() — 0 = Base (no mechanism of its own).
+    function mode() external view returns (uint8);
+}
+
+interface IDistributorNotify {
+    /// LaunchFairV4Distributor.notify — credit `amount` of just-transferred WETH to `token`'s
+    /// mechanism (same call the V4 FeeLocker makes for WETH-paired mode tokens).
+    function notify(address token, uint256 amount) external;
+}
+
 /// @notice Fee hook for stock-paired (`TOKEN/<stock>`) launch pools — replaces the RouterGateHook
 /// so these pools are OPEN: any router, aggregator, or terminal can buy and sell them (no
 /// TradeRestriction flag), and the fee can't be bypassed because it is charged inside the pool.
@@ -82,15 +93,25 @@ contract StockFeeHook is IHooks, Ownable2Step {
     address public flagshipSink;
     uint16 public treasuryBps = 2_500; // 25%
     uint16 public devBps = 2_500; // 25%
-    uint16 public mechanismBps = 4_000; // 40% → folds to flagship (stock tokens are Base-only)
+    uint16 public mechanismBps = 4_000; // 40% → MODE tokens' distributor; folds to flagship for Base
     uint16 public flagshipBps = 1_000; // 10% — the four MUST sum to BPS
+    /// The V4 distributor (setDistributor). Mechanism slices for Reward/Lottery stock tokens go
+    /// here in WETH + a notify() credit, mirroring the V4 FeeLocker's WETH-pair flow.
+    address public distributor;
 
     event FeeTaken(address indexed token, address indexed quote, bool isBuy, uint256 quoteFee);
     event Distributed(
-        address indexed token, uint256 stockIn, uint256 wethOut, uint256 toTreasury, uint256 toDev, uint256 toFlagship
+        address indexed token,
+        uint256 stockIn,
+        uint256 wethOut,
+        uint256 toTreasury,
+        uint256 toDev,
+        uint256 toFlagship,
+        uint256 toMechanism
     );
     event FeeBpsSet(uint16 feeBps);
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
+    event DistributorSet(address distributor);
     event DestinationsSet(address treasury, address flagshipSink);
 
     error NotPoolManager();
@@ -168,6 +189,15 @@ contract StockFeeHook is IHooks, Ownable2Step {
         treasury = treasury_;
         flagshipSink = flagshipSink_;
         emit DestinationsSet(treasury_, flagshipSink_);
+    }
+
+    /// @notice The V4 distributor that funds Reward/Lottery mechanisms for stock-paired MODE
+    /// tokens (stock pairs were Base-only before this). Freely re-settable, same philosophy as
+    /// the other destinations — a misconfig is never terminal. While unset (or for Base tokens),
+    /// the mechanism slice folds to the flagship exactly as before.
+    function setDistributor(address distributor_) external onlyOwnerOrTreasury {
+        distributor = distributor_;
+        emit DistributorSet(distributor_);
     }
 
     /// @notice The StockPairRouter this hook shares route config with. Satisfies the launchpad's
@@ -307,19 +337,36 @@ contract StockFeeHook is IHooks, Ownable2Step {
     function _split(address token, uint256 stockIn, uint256 out) private {
         uint256 toTreasury = (out * treasuryBps) / BPS;
         uint256 toDev = (out * devBps) / BPS;
-        // Mechanism + flagship + rounding dust → the flagship sink: stock tokens are Base-mode
-        // only (no reward/lottery mechanism of their own), same fold the router performs.
-        uint256 toFlagship = out - toTreasury - toDev;
 
-        if (out > 0) IWETHW(weth).withdraw(out); // pay in native ETH, never WETH
+        // MODE stock tokens (Reward/Lottery — mode != 0) fund their mechanism through the
+        // distributor, exactly like the V4 FeeLocker does for WETH pairs: the slice stays WETH
+        // and is credited via notify(). Base tokens (and an unset distributor, and any token
+        // whose mode read fails) fold the slice into the flagship as before — fail-open to the
+        // old behavior, never a stuck distribute().
+        uint256 toMechanism;
+        address dist = distributor;
+        if (dist != address(0) && mechanismBps != 0) {
+            try IModeTokenView(token).mode() returns (uint8 m) {
+                if (m != 0) toMechanism = (out * mechanismBps) / BPS;
+            } catch {}
+        }
+        // Flagship takes the remainder (its own share + Base tokens' folded mechanism + dust).
+        uint256 toFlagship = out - toTreasury - toDev - toMechanism;
+
+        uint256 ethPortion = out - toMechanism; // mechanism stays WETH
+        if (ethPortion > 0) IWETHW(weth).withdraw(ethPortion); // pay in native ETH, never WETH
         if (toTreasury > 0) _payEth(treasury, toTreasury);
         if (toDev > 0) {
             address dev = launchpad.creatorOf(token);
             _payEth(dev == address(0) ? treasury : dev, toDev);
         }
         if (toFlagship > 0) _payEth(flagshipSink == address(0) ? treasury : flagshipSink, toFlagship);
+        if (toMechanism > 0) {
+            IERC20(weth).safeTransfer(dist, toMechanism);
+            IDistributorNotify(dist).notify(token, toMechanism);
+        }
 
-        emit Distributed(token, stockIn, out, toTreasury, toDev, toFlagship);
+        emit Distributed(token, stockIn, out, toTreasury, toDev, toFlagship, toMechanism);
     }
 
     /// @dev Reverts on rejection — `distribute` unwinds atomically, so nothing is lost.

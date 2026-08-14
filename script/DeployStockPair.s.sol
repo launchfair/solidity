@@ -16,6 +16,7 @@ interface ILaunchpadAdmin {
     function setStockGateHook(address hook) external;
     function setAllowedQuote(address stock, bool allowed, uint24 v3Fee) external;
     function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external;
+    function distributor() external view returns (address);
 }
 
 interface IV3FactoryMin {
@@ -86,6 +87,18 @@ contract DeployStockPair is Script {
     address constant PLTR = 0x894E1EC2D74FFE5AEF8Dc8A9e84686acCB964F2A; // $12k @ 0.3%
     address constant AMD = 0x86923f96303D656E4aa86D9d42D1e57ad2023fdC; // $9.3k @ 1%
     address constant AMZN = 0x12f190a9F9d7D37a250758b26824B97CE941bF54; // $8.9k @ 0.3%
+    // Batch 2 (chain-scanned 2026-08-14, USDG-side depth ≥ $2k) — all ROUTED via USDG.
+    address constant SLV = 0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f; // $145k @ 1%
+    address constant RDDT = 0x05b37Fb53A299a1b874A619e1c4C404D52C36F4C; // $61k @ 1%
+    address constant TSM = 0x58FfE4a942d3885bAa22D7520691F611EF09e7AA; // $34k @ 1%
+    address constant DELL = 0x941AE714EC6D8130c7B75d67160Ca08f1e7d11Dd; // $29k @ 1%
+    address constant SNDK = 0xB90A19fF0Af67f7779afF50A882A9CfF42446400; // $24k @ 1%
+    address constant ASML = 0x47F93d52cBeC7C6D2CfC080e154002370a60dAEA; // $15k @ 1%
+    address constant QUBT = 0x59818904ab4cE163b3cE4FfB64f2D6Ca02c434B4; // $8.5k @ 1%
+    address constant SGOV = 0x92FD66527192E3e61d4DDd13322Aa222DE86F9B5; // $6.9k @ 0.3%
+    address constant USAR = 0xd917B029C761D264c6A312BBbcDA868658eF86a6; // $6.2k @ 0.3%
+    address constant RBLX = 0xF0C4BF4C582cb3836e98394b1d4e7B7281101bE8; // $3.5k @ 1%
+    address constant NU = 0x408c14038a04f7bD235329E26d2bf569ee20e250; // $2.4k @ 1%
 
     function run() external {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
@@ -161,6 +174,33 @@ contract DeployStockPair is Script {
         _routed(pad, router, weth, PLTR, 3000);
         _routed(pad, router, weth, AMD, 10000);
         _routed(pad, router, weth, AMZN, 3000);
+        // Batch 2 (2026-08-14 scan).
+        _routed(pad, router, weth, SLV, 10000);
+        _routed(pad, router, weth, RDDT, 10000);
+        _routed(pad, router, weth, TSM, 10000);
+        _routed(pad, router, weth, DELL, 10000);
+        _routed(pad, router, weth, SNDK, 10000);
+        _routed(pad, router, weth, ASML, 10000);
+        _routed(pad, router, weth, QUBT, 10000);
+        _routed(pad, router, weth, SGOV, 3000);
+        _routed(pad, router, weth, USAR, 3000);
+        _routed(pad, router, weth, RBLX, 10000);
+        _routed(pad, router, weth, NU, 10000);
+
+        // USDG itself as a quote — the "dollar-paired" option. 6 DECIMALS: the launch-price knob
+        // must be its exact tiny wei figure (≈3 wei/token for ~$2.5-3k), which the launchpad's
+        // signed tick shift now supports (down-shift). Route is the single WETH<->USDG 0.01% hop.
+        pad.setAllowedQuote(USDG, true, USDG_BRIDGE_FEE);
+        router.setQuoteRoute(
+            USDG,
+            abi.encodePacked(weth, USDG_BRIDGE_FEE, USDG),
+            abi.encodePacked(USDG, USDG_BRIDGE_FEE, weth)
+        );
+        _priceQuoteDec(pad, USDG, 1e6, 6); // 1 whole USDG = 1e6 of itself
+
+        // MODE stock tokens (Reward/Lottery) fund their mechanism through the distributor —
+        // point the hook at the launchpad's one.
+        hook.setDistributor(pad.distributor());
 
         vm.stopBroadcast();
 
@@ -168,8 +208,7 @@ contract DeployStockPair is Script {
         console2.log("StockFeeHook:   ", address(hook));
         console2.log("  router feeBps:", feeBps);
         console2.log("  hook feeBps:  ", hookFeeBps);
-        console2.log("Quotes: 4 direct (COIN/SPY/MSTR/META) + 16 routed via USDG (NVDA/SPCX/USO/GME/");
-        console2.log("        QQQ/COST/TSLA/AAPL/INTC/MU/NFLX/GOOGL/MSFT/PLTR/AMD/AMZN)");
+        console2.log("Quotes: 4 direct (COIN/SPY/MSTR/META) + 27 routed via USDG + USDG itself = 32");
     }
 
     /// Allow the quote and install its WETH<->USDG<->stock route on the router. The recorded
@@ -195,10 +234,17 @@ contract DeployStockPair is Script {
     }
 
     /// Set the quote's launch price so launch mcap ≈ TARGET_MCAP_USD:
-    /// price(quote-wei per whole token) = TARGET × 1e6(USDG dp) × 1e18 / (usdgWeiPerStock × SUPPLY).
+    /// price(quote-wei per whole token) = TARGET × 1e6(USDG dp) × 10^quoteDec / (usdgWeiPerStock × SUPPLY).
     function _priceQuote(ILaunchpadAdmin pad, address stock, uint256 usdgWeiPerStock) internal {
+        _priceQuoteDec(pad, stock, usdgWeiPerStock, 18);
+    }
+
+    /// Decimals-aware variant (USDG is 6-dp: its whole-token price is single-digit WEI, where
+    /// flooring would round a $2.5k target to $2k — Ceil keeps the target the floor).
+    function _priceQuoteDec(ILaunchpadAdmin pad, address stock, uint256 usdgWeiPerStock, uint8 quoteDec) internal {
         if (usdgWeiPerStock == 0) return; // no live pool → leave the default (owner can set later)
-        uint256 p = Math.mulDiv(TARGET_MCAP_USD * 1e6, 1e18, usdgWeiPerStock * SUPPLY_TOKENS);
+        uint256 p =
+            Math.mulDiv(TARGET_MCAP_USD * 1e6, 10 ** quoteDec, usdgWeiPerStock * SUPPLY_TOKENS, Math.Rounding.Ceil);
         pad.setAllowedQuotePrice(stock, p);
         console2.log("  quote price set:", stock, p);
     }

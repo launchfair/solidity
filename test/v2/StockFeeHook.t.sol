@@ -272,4 +272,69 @@ contract StockFeeHookTest is Test, Deployers {
         vm.expectRevert(StockFeeHook.InvalidSplit.selector);
         hook.setSplit(3000, 3000, 3000, 3000);
     }
+
+    /// MODE stock tokens (Reward/Lottery): the mechanism slice must reach the DISTRIBUTOR in
+    /// WETH with a notify() credit (like the V4 locker's WETH-pair flow), NOT fold to flagship.
+    /// Base tokens (mode 0 / no mode getter) keep the fold — asserted by every test above, which
+    /// runs on a mode-less HookMockToken with the distributor unset.
+    function test_distribute_modeToken_mechanismToDistributor() public {
+        MockModeToken mtok = new MockModeToken("RWD", "RWD");
+        mtok.mint(address(this), 1_000_000_000 ether);
+        pad.setCreator(address(mtok), DEV);
+        MockDistNotify mdist = new MockDistNotify();
+        hook.setDistributor(address(mdist));
+
+        (Currency c0, Currency c1) = address(mtok) < address(stock)
+            ? (Currency.wrap(address(mtok)), Currency.wrap(address(stock)))
+            : (Currency.wrap(address(stock)), Currency.wrap(address(mtok)));
+        PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
+        manager.initialize(k, SQRT_PRICE_1_1);
+        mtok.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            k,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 100_000 ether, salt: bytes32(0)}),
+            ""
+        );
+
+        stock.approve(address(swapRouter), type(uint256).max);
+        bool stockIsC0 = Currency.unwrap(k.currency0) == address(stock);
+        swapRouter.swap(
+            k,
+            IPoolManager.SwapParams({
+                zeroForOne: stockIsC0,
+                amountSpecified: -int256(100 ether),
+                sqrtPriceLimitX96: stockIsC0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        uint256 acc = hook.accrued(address(mtok));
+        assertGt(acc, 0);
+
+        uint256 flagshipBefore = FLAGSHIP.balance;
+        uint256 out = hook.distribute(address(mtok), 0);
+        uint256 mech = (out * 4000) / 10_000;
+        assertEq(weth.balanceOf(address(mdist)), mech, "mechanism 40% arrived at the distributor IN WETH");
+        assertEq(mdist.notifiedToken(), address(mtok), "notify() credited the right token");
+        assertEq(mdist.notifiedAmount(), mech, "notify() amount matches the WETH sent");
+        assertEq(FLAGSHIP.balance - flagshipBefore, out - (out * 2500) / 10_000 * 2 - mech, "flagship keeps only its own 10% + dust");
+    }
+}
+
+/// A launch token that reports a non-Base mode (1 = Reward).
+contract MockModeToken is HookMockToken {
+    constructor(string memory n, string memory s) HookMockToken(n, s) {}
+    function mode() external pure returns (uint8) {
+        return 1;
+    }
+}
+
+/// Distributor stand-in: records the notify() credit; WETH arrives via plain transfer.
+contract MockDistNotify {
+    address public notifiedToken;
+    uint256 public notifiedAmount;
+    function notify(address token, uint256 amount) external {
+        notifiedToken = token;
+        notifiedAmount = amount;
+    }
 }

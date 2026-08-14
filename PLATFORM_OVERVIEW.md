@@ -1,7 +1,7 @@
 # LaunchFair — The Full Picture
 
 *What we're building, how the money flows, and where everything stands.*
-*Last updated: 2026-08-13 · Test stack live on Robinhood Chain*
+*Last updated: 2026-08-14 · Test stack live on Robinhood Chain*
 
 ---
 
@@ -309,19 +309,33 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 | Contract | Address |
 |---|---|
-| CoreTGE (war chest + factory launcher, LAUNCHED) | `0x4b797B3258f2412494254714c421A80cB49684d0` |
-| **FCORE core token** (factory-deployed, locked LP `682103`, launch-price FLOOR active) | `0xc9843e2ff8Cf6Cc74ef0EAA96EA9E2016772fDdf` |
-| **FlagshipBuyback vault** (contract-held buybacks, all sinks point here) | `0xedc336402D985B3FD7116E443d7C2c280CbCEa94` |
-| SeasonMerkleDistributor (rootPublisher = the vault) | `0x60F3c300C208c5bF26F6e722f6d5Aa4D37fC35B2` |
-| LaunchFair V4 launchpad (guarded stack: 1%/60s launch window, per-quote launch prices) | `0xbb872Eb5Fc3F10B45df627caBc6B7d8aD000185B` |
+| CoreTGE (pure-revenue fee model: settable team/treasury split, 1% cap, one-click buybackAndFund) | `0xD3A30a067BDeC72CD7454B99b48D7298B3007f71` |
+| **FCORE core token** (factory-deployed, locked LP `682766`, launch-price FLOOR active) | `0x1514710ea06835D48DFBa1995794fFFB0Ab27AD9` |
+| **FlagshipBuyback vault** (contract-held buybacks, all sinks point here) | `0xc513F3069bd1B8230182e4293225Db04a2949F70` |
+| SeasonMerkleDistributor (rootPublisher = the vault) | `0xDe47eda7F12efF209D29E050B63851b31689cCF1` |
+| LaunchFair V4 launchpad (stack #6: MODES ON STOCK PAIRS, signed launch-price shift, 1%/60s guard) | `0x910A2180218402baC4952F686D26744C5CC9d952` |
 | TokenDeployerV2 (token factory gen-2: time-based launch guard) | `0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7` |
-| V4 FeeLocker | `0xa67c2deDC1A84b5a190825d1c028E1F9c11e4861` |
-| V4 Distributor (modes engine) | `0x47F18ac5F59F89ff304C5728Fc20d2729189dCe7` |
-| VRF Coordinator (drand) | `0x6166d96AC6abDD5c57a5a7D746c2932202232F55` |
+| V4 FeeLocker (per-tier 3/5/10% splits, settable) | `0x5332C8560949a932C5811Cb6f51bb9cFBD145d56` |
+| V4 Distributor (modes engine; feeHook = the stock hook so stock-pair mechanisms fund) | `0xEbE02ef0F630EC098025109062d881B8a9FFd063` |
+| VRF Coordinator (drand) | `0x7b4c0e07ef6C848B73Fbc957C2839B3847806ad0` |
 | V4 SwapRouter (stateless, reused) | `0x0e6c53664388B68F6b41851D224248F391CC8947` |
-| StockPairRouter (20 quotes, LIVE-priced ~$2.5k launches, fee 0) | `0x6D39EA3819575DbeDAf926B3860B66A00E8DC578` |
-| StockFeeHook (in-pool 1% stock fee, open pools) | `0x40EDAa62C8593B32957FcbC21DDb600E876680CC` |
+| StockPairRouter (**32 quotes** incl. USDG + batch-2 stocks, LIVE-priced ~$2.5k launches, fee 0) | `0x7Ea8d522ec95012c9fe31D0eEDe019E446568041` |
+| StockFeeHook (in-pool 1% stock fee, open pools, mode-aware mechanism routing) | `0x82407BDab447000F6C9f82074Ba5dc2e6f29C0cc` |
 | V1/V3 FeeLocker (legacy, pre-fix) | `0x749f23a5616a473f4d43dafcce8a7214c986849b` |
+
+**Modes on stock pairs (2026-08-14, stack #6):** stock-paired launches are no longer Base-only —
+**Reward and Lottery tokens can pair with any allowed stock** (Redistribute stays ETH-only: its
+buyback venue is the token's own pool, unroutable for the WETH-spending distributor; Perps stays
+WETH-only). The StockFeeHook now routes its mechanism fee slice (default 40%) to the V4
+distributor in WETH with a notify() credit for mode tokens — Base tokens still fold it into the
+buyback. **USDG (the dollar token) is a pairing option** — its 6-decimal launch price needed the
+per-quote price shift to go DOWN as well as up (signed tick shift; the pool init price follows the
+range). Quote list grew to **32** (20 original + SLV/RDDT/TSM/DELL/SNDK/ASML/QUBT/SGOV/USAR/RBLX/NU
+by on-chain depth scan + USDG); the admin Fees tab can now **add new stock pairings from the
+dashboard** (probe pools → 2-3 owner txs, no redeploy) and sets every fee knob in plain percent —
+including the per-tier (3/5/10%) mode-token splits. Verified live: NBRW (Reward/NVDA, RDDT-paired)
+funded its mechanism through hook distribute (40% → distributor pendingWeth), DDOG (USDG-paired)
+launched ~$3k and trades, LSTK (Lottery, NVDA-paired) live.
 
 **Vault-mode flywheel (2026-08-13 night), verified live:** the flagship sink is now the
 **FlagshipBuyback CONTRACT** — fee ETH accumulates in the vault, `buyback()` (deployer-only,

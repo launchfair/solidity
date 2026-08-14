@@ -376,29 +376,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         uint16[] memory rewardWeights;
         address prizeToken;
 
-        if (p.mode == LaunchTokenV2.Mode.Reward) {
-            uint256 n = p.rewards.length;
-            if (n == 0 || n > MAX_REWARDS) revert BadRewardConfig();
-            rewardTokens = new address[](n);
-            rewardWeights = new uint16[](n);
-            uint256 weightSum;
-            for (uint256 i; i < n; i++) {
-                RewardVenue calldata rv = p.rewards[i];
-                address a = rv.token;
-                if (a == address(0) || a == weth) revert InvalidRewardToken();
-                // Reject duplicate assets — the token registers one dividend bucket per
-                // asset, and a repeat would double-register its venue / split weight twice.
-                for (uint256 j; j < i; j++) {
-                    if (rewardTokens[j] == a) revert BadRewardConfig();
-                }
-                if (rv.weightBps == 0) revert BadRewardConfig();
-                _validateVenue(a, rv.isV3, rv.v3Fee, rv.v4Key);
-                rewardTokens[i] = a;
-                rewardWeights[i] = rv.weightBps;
-                weightSum += rv.weightBps;
-            }
-            if (weightSum != 10_000) revert BadRewardConfig();
-        } else if (p.mode == LaunchTokenV2.Mode.Perps) {
+        if (p.mode == LaunchTokenV2.Mode.Perps) {
             // Perps: 1..5 leveraged stock legs. Each resolves to the venue's fungible position token,
             // which is registered as a reward asset and distributed exactly like a Reward token.
             if (perpsVenue == address(0)) revert InvalidMode();
@@ -421,10 +399,8 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 weightSum += leg.weightBps;
             }
             if (weightSum != 10_000) revert BadRewardConfig();
-        } else if (p.mode == LaunchTokenV2.Mode.Lottery && p.prizeToken != address(0)) {
-            if (p.prizeToken == weth) revert InvalidRewardToken();
-            _validateVenue(p.prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
-            prizeToken = p.prizeToken;
+        } else {
+            (rewardTokens, rewardWeights, prizeToken) = _modeAssets(p);
         }
 
         token = deployer.deploy(
@@ -491,12 +467,21 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
         locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);
 
+        _registerMode(token, key, p, prizeToken);
+
+        _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, quoteToken: address(0), exists: true});
+    }
+
+    /// @dev Wire a launched token's mode mechanism into the distributor. Shared by the WETH
+    /// (`_launchOnV4`) and stock (`_createStock`) paths — `key` is the token's own pool (only
+    /// Redistribute uses it, and the stock path never reaches that branch: see `_createStock`).
+    function _registerMode(address token, PoolKey memory key, CreateParams calldata p, address prizeToken) internal {
         if (p.mode == LaunchTokenV2.Mode.Lottery) {
             // Lottery: holdings-weighted. The token checkpoints every holder's balance,
             // and the distributor snapshots holdings at each draw's commit block to pick
             // a weighted-random winner. The pot is WETH; if the dev picked a prize token,
             // register its V3/V4 venue so the pot can be swapped to it.
-            t.setLotteryOperator(distributor);
+            LaunchTokenV2(token).setLotteryOperator(distributor);
             // Powerball-style three outcomes per draw. Defaults (dev leaves a field 0):
             // 10% miss, 2% jackpot, 88% regular paying the winner 70% (30% skims to jackpot).
             uint16 missB = p.missBps == 0 ? 1000 : p.missBps;
@@ -518,24 +503,70 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // perp venue in process(). Pin THIS launchpad's venue for the token so its payout-time
             // and launch-time venues can never diverge.
             IDistributorV4Register(distributor).registerPerps(token, perpsVenue);
-        } else {
+        } else if (p.mode == LaunchTokenV2.Mode.Increasing) {
             // Redistribute buys back the token's own V4 pool (asset == token).
             IDistributorV4Register(distributor).registerBuyback(token, token, key);
         }
+        // Base: no mechanism — nothing to register.
         if (p.payoutThreshold > 0) IDistributorV4Register(distributor).setPayoutThreshold(token, p.payoutThreshold);
         if (p.payoutIntervalBlocks > 0) {
             IDistributorV4Register(distributor).setPayoutInterval(token, p.payoutIntervalBlocks);
         }
-
-        _launches[token] = Launch({creator: msg.sender, key: key, fee: p.fee, quoteToken: address(0), exists: true});
     }
 
-    /// @dev Core stock-token creation: validate, deploy a Base-mode token, launch it into a
-    /// TOKEN/`quoteToken` pool. Kept separate from `_create` so the WETH-paired path is untouched.
+    /// @dev Reward/Lottery asset building shared by the WETH (`_create`) and stock
+    /// (`_createStock`) paths. Perps stays inline in `_create` (WETH-only mode); Base and
+    /// Redistribute have no external assets and fall through with empties.
+    function _modeAssets(CreateParams calldata p)
+        internal
+        returns (address[] memory rewardTokens, uint16[] memory rewardWeights, address prizeToken)
+    {
+        if (p.mode == LaunchTokenV2.Mode.Reward) {
+            uint256 n = p.rewards.length;
+            if (n == 0 || n > MAX_REWARDS) revert BadRewardConfig();
+            rewardTokens = new address[](n);
+            rewardWeights = new uint16[](n);
+            uint256 weightSum;
+            for (uint256 i; i < n; i++) {
+                RewardVenue calldata rv = p.rewards[i];
+                address a = rv.token;
+                if (a == address(0) || a == weth) revert InvalidRewardToken();
+                // Reject duplicate assets — the token registers one dividend bucket per
+                // asset, and a repeat would double-register its venue / split weight twice.
+                for (uint256 j; j < i; j++) {
+                    if (rewardTokens[j] == a) revert BadRewardConfig();
+                }
+                if (rv.weightBps == 0) revert BadRewardConfig();
+                _validateVenue(a, rv.isV3, rv.v3Fee, rv.v4Key);
+                rewardTokens[i] = a;
+                rewardWeights[i] = rv.weightBps;
+                weightSum += rv.weightBps;
+            }
+            if (weightSum != 10_000) revert BadRewardConfig();
+        } else if (p.mode == LaunchTokenV2.Mode.Lottery && p.prizeToken != address(0)) {
+            if (p.prizeToken == weth) revert InvalidRewardToken();
+            _validateVenue(p.prizeToken, p.prizeIsV3, p.prizeV3Fee, p.prizePoolKey);
+            prizeToken = p.prizeToken;
+        }
+    }
+
+    /// @dev Core stock-token creation: validate, deploy the token with its MODE intact, launch it
+    /// into a TOKEN/`quoteToken` pool. Kept separate from `_create` so the WETH path is untouched.
+    ///
+    /// Modes on stock pairs (v2 — was Base-only):
+    ///   • Base    — no mechanism; the hook folds its mechanism fee slice to the flagship.
+    ///   • Reward  — reward assets buy via THEIR OWN WETH venues, so the mechanism works exactly
+    ///               as on WETH pairs once the hook's distribute() forwards the mechanism slice
+    ///               (in WETH) to the distributor.
+    ///   • Lottery — the pot is WETH (prize venue optional), equally quote-agnostic.
+    ///   • Redistribute (Increasing) — REJECTED: its buyback venue is the token's own pool, which
+    ///     is stock-quoted here; the distributor can only spend WETH, so the buyback would be
+    ///     unroutable. Pair Redistribute tokens with ETH instead.
+    ///   • Perps — REJECTED (WETH-only mode, unchanged).
     function _createStock(CreateParams calldata p, address quoteToken) internal returns (address token) {
         if (!allowedQuote[quoteToken]) revert QuoteNotAllowed();
         if (stockPairRouter == address(0) || stockGateHook == address(0)) revert StockNotConfigured();
-        if (p.mode != LaunchTokenV2.Mode.Base) revert InvalidMode(); // v1: stock tokens are Base only
+        if (p.mode == LaunchTokenV2.Mode.Increasing || p.mode == LaunchTokenV2.Mode.Perps) revert InvalidMode();
         _validate(p.name);
         _validate(p.symbol);
         _validate(p.metadata.logoURI);
@@ -544,8 +575,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         _validate(p.metadata.discord);
         _validate(p.metadata.twitter);
 
-        address[] memory noRewards; // Base mode → no reward assets
-        uint16[] memory noWeights;
+        (address[] memory rewardTokens, uint16[] memory rewardWeights, address prizeToken) = _modeAssets(p);
         token = deployer.deploy(
             TokenDeployerV2.Params({
                 name: p.name,
@@ -555,16 +585,19 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
                 metadata: p.metadata,
                 maxBuyBps: maxBuyBps,
                 maxBuySecs: maxBuySecs,
-                mode: LaunchTokenV2.Mode.Base,
-                rewardTokens: noRewards,
-                rewardWeights: noWeights,
-                prizeToken: address(0),
-                minHoldForRewards: 0
+                mode: p.mode,
+                rewardTokens: rewardTokens,
+                rewardWeights: rewardWeights,
+                prizeToken: prizeToken,
+                minHoldForRewards: p.minHold
             }),
             keccak256(abi.encode(msg.sender, p.salt))
         );
 
         _launchStockOnV4(token, quoteToken);
+        // Mode mechanism (no-op for Base). The pool key passed is the token's stock pool purely
+        // for signature symmetry — the Redistribute branch that would use it is unreachable here.
+        _registerMode(token, _launches[token].key, p, prizeToken);
         emit StockTokenLaunched(token, msg.sender, quoteToken, p.name, p.symbol);
     }
 
@@ -586,13 +619,17 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             hooks: IHooks(stockGateHook)
         });
 
-        poolManager.initialize(key, _sqrtPriceX96For(initialPriceWethPerToken, tokenIsCurrency0));
-
-        // Shift the single-sided range by the quote's launch-price knob (the range BOTTOM is
-        // the effective launch price). The init price above stays at the WETH-calibrated
-        // default — at or below the (only ever raised) range in both orientations, so the
-        // first buy still walks the price up to the range edge exactly as on WETH pools.
+        // Shift the single-sided range by the quote's launch-price knob (the range BOTTOM is the
+        // effective launch price), and initialize the pool at the SAME shifted offset. Shifting
+        // the init price together with the range (rather than leaving it at the WETH-calibrated
+        // default) is what lets the knob go DOWN as well as up — a low-decimals quote like USDG
+        // (6-dp) needs a launch price ~9 decimal orders BELOW the 18-dp default, and the init
+        // price must follow the range there or the single-sided liquidity math breaks. The
+        // init-at-or-past-the-range-edge invariant holds identically in both orientations
+        // because init and range move by the same tick delta.
         int24 shift = _quoteTickShift(quoteToken);
+        int24 tInit = TickMath.getTickAtSqrtPrice(_sqrtPriceX96For(initialPriceWethPerToken, true)) + shift;
+        poolManager.initialize(key, TickMath.getSqrtPriceAtTick(tokenIsCurrency0 ? tInit : -tInit));
         (int24 tl, int24 tu) = tokenIsCurrency0
             ? (tickLower0 + shift, tickUpper0 + shift)
             : (-(tickUpper0 + shift), -(tickLower0 + shift));
@@ -601,10 +638,12 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             : LiquidityMath.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), tokenTotalSupply);
 
         // Plumbing: exclude from dividends + exempt from the launch guard. The stock router holds
-        // tokens transiently while executing a sell, so it must be limit-exempt too.
+        // tokens transiently while executing a sell, so it must be limit-exempt too. The
+        // distributor is excluded like on WETH pairs — stock tokens can be Reward/Lottery now.
         t.excludeFromDividends(address(poolManager), true);
         t.excludeFromDividends(address(locker), true);
         t.excludeFromDividends(stockPairRouter, true);
+        t.excludeFromDividends(distributor, true);
         t.setLimitExempt(address(poolManager), true);
         t.setLimitExempt(address(locker), true);
         t.setLimitExempt(stockPairRouter, true);
@@ -745,7 +784,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     /// range is only ever RAISED, so the default init price stays valid below it.
     function _quoteTickShift(address quoteToken) internal view returns (int24) {
         uint256 p = quoteInitialPrice[quoteToken];
-        if (p == 0 || p <= initialPriceWethPerToken) return 0;
+        // Signed both ways: a knob ABOVE the default raises the launch price (deep-priced stocks
+        // like NVDA), a knob BELOW lowers it (low-decimals quotes like 6-dp USDG, whose sane
+        // quote-wei price is ~9 orders under the 18-dp default). _launchStockOnV4 shifts the pool
+        // init price by the same delta, so both directions keep the single-sided invariant.
+        if (p == 0 || p == initialPriceWethPerToken) return 0;
         int24 tDefault = TickMath.getTickAtSqrtPrice(_sqrtPriceX96For(initialPriceWethPerToken, true));
         int24 tWanted = TickMath.getTickAtSqrtPrice(_sqrtPriceX96For(p, true));
         return ((tWanted - tDefault) / tickSpacing) * tickSpacing;
