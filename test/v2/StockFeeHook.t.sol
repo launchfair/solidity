@@ -12,7 +12,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {StockFeeHook} from "../../src/v2/v4/StockFeeHook.sol";
-import {IV3SwapRouter} from "../../src/interfaces/IUniswapV3.sol";
+import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
 import {HookMockToken} from "./WethFeeHook.t.sol";
 
 /// Launchpad view mock: one allowed stock quote, a direct-hop fee tier, a token creator.
@@ -40,15 +40,22 @@ contract MockStockRoutes {
     }
 }
 
-/// V3 SwapRouter02 mock: converts 1:1, honors amountOutMinimum, single- or multi-hop.
+/// V3 SwapRouter02 mock: converts at `rateBps` (default 1:1), honors amountOutMinimum.
 contract MockV3ConvRouter {
     error Slippage();
 
+    uint256 public rateBps = 10_000; // out = in × rateBps / 10000
+
+    function setRate(uint256 bps) external {
+        rateBps = bps;
+    }
+
     function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata p) external payable returns (uint256) {
         IERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
-        if (p.amountIn < p.amountOutMinimum) revert Slippage();
-        IERC20(p.tokenOut).transfer(p.recipient, p.amountIn);
-        return p.amountIn;
+        uint256 out = (p.amountIn * rateBps) / 10_000;
+        if (out < p.amountOutMinimum) revert Slippage();
+        IERC20(p.tokenOut).transfer(p.recipient, out);
+        return out;
     }
 
     function exactInput(IV3SwapRouter.ExactInputParams calldata p) external payable returns (uint256) {
@@ -56,9 +63,37 @@ contract MockV3ConvRouter {
         address tokenIn = address(bytes20(p.path[0:20]));
         address tokenOut = address(bytes20(p.path[p.path.length - 20:]));
         IERC20(tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
-        if (p.amountIn < p.amountOutMinimum) revert Slippage();
-        IERC20(tokenOut).transfer(p.recipient, p.amountIn);
-        return p.amountIn;
+        uint256 out = (p.amountIn * rateBps) / 10_000;
+        if (out < p.amountOutMinimum) revert Slippage();
+        IERC20(tokenOut).transfer(p.recipient, out);
+        return out;
+    }
+}
+
+/// Minimal V3 factory + pool pair for the claimFees floor: slot0 at a fixed sqrtPriceX96.
+contract MockSpotPool {
+    uint160 public sqrtP;
+
+    constructor(uint160 s) {
+        sqrtP = s;
+    }
+
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (sqrtP, 0, 0, 0, 0, 0, true);
+    }
+}
+
+contract MockSpotFactory {
+    mapping(bytes32 => address) internal _pools;
+
+    function set(address a, address b, uint24 fee, address pool) external {
+        (address x, address y) = a < b ? (a, b) : (b, a);
+        _pools[keccak256(abi.encode(x, y, fee))] = pool;
+    }
+
+    function getPool(address a, address b, uint24 fee) external view returns (address) {
+        (address x, address y) = a < b ? (a, b) : (b, a);
+        return _pools[keccak256(abi.encode(x, y, fee))];
     }
 }
 
@@ -271,6 +306,49 @@ contract StockFeeHookTest is Test, Deployers {
         hook.setFeeBps(cap + 1);
         vm.expectRevert(StockFeeHook.InvalidSplit.selector);
         hook.setSplit(3000, 3000, 3000, 3000);
+    }
+
+    /// The permissionless claim: ANYONE (the creator pressing the site's button) can trigger the
+    /// conversion + split — shares always land at their fixed recipients, and the on-chain floor
+    /// (chained pool spots × (1 − slippage)) makes the open access sandwich-proof.
+    function test_claimFees_permissionless_paysDevHisShare() public {
+        MockSpotFactory f = new MockSpotFactory();
+        f.set(address(stock), address(weth), 3000, address(new MockSpotPool(uint160(1) << 96))); // 1:1 raw spot
+        hook.setClaimConfig(IUniswapV3Factory(address(f)), 300);
+
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 100 ether);
+        uint256 acc = hook.accrued(address(token));
+        assertGt(acc, 0);
+
+        vm.prank(DEV); // the creator himself — no owner/treasury involved
+        uint256 out = hook.claimFees(address(token));
+        assertEq(out, acc, "1:1 conversion cleared the self-quoted floor");
+        assertEq(DEV.balance, (acc * 2500) / 10_000, "creator share PAID on his own claim");
+        assertEq(TREASURY.balance, (acc * 2500) / 10_000, "treasury share paid too");
+        assertEq(hook.accrued(address(token)), 0, "accrual cleared");
+    }
+
+    /// A rigged conversion (sandwich) must revert against the self-quoted floor.
+    function test_claimFees_floorBlocksRiggedConversion() public {
+        MockSpotFactory f = new MockSpotFactory();
+        f.set(address(stock), address(weth), 3000, address(new MockSpotPool(uint160(1) << 96)));
+        hook.setClaimConfig(IUniswapV3Factory(address(f)), 300);
+
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 10 ether);
+        conv.setRate(9_000); // conversion suddenly pays 10% under spot — sandwich territory
+        vm.prank(DEV);
+        vm.expectRevert(MockV3ConvRouter.Slippage.selector);
+        hook.claimFees(address(token));
+        assertGt(hook.accrued(address(token)), 0, "revert unwound, nothing lost");
+    }
+
+    function test_claimFees_disabledUntilConfigured() public {
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 1 ether);
+        vm.expectRevert(StockFeeHook.NotConfigured.selector);
+        hook.claimFees(address(token));
     }
 
     /// MODE stock tokens (Reward/Lottery): the mechanism slice must reach the DISTRIBUTOR in

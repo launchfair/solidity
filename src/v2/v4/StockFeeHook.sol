@@ -15,7 +15,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-import {IV3SwapRouter} from "../../interfaces/IUniswapV3.sol";
+import {IV3SwapRouter, IUniswapV3Factory, IUniswapV3Pool} from "../../interfaces/IUniswapV3.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 interface ILaunchpadStockView {
     function allowedQuote(address stock) external view returns (bool);
@@ -98,6 +99,12 @@ contract StockFeeHook is IHooks, Ownable2Step {
     /// The V4 distributor (setDistributor). Mechanism slices for Reward/Lottery stock tokens go
     /// here in WETH + a notify() credit, mirroring the V4 FeeLocker's WETH-pair flow.
     address public distributor;
+    /// V3 factory for the permissionless claim's self-quoted floor (setClaimConfig). While
+    /// unset, claimFees() is disabled and only the gated distribute() path runs.
+    IUniswapV3Factory public claimV3Factory;
+    /// Tolerance under the chained spot for claimFees' floor (≤ 2000). Covers per-block drift
+    /// + impact; per-hop pool fees are subtracted separately.
+    uint16 public claimSlippageBps = 300;
 
     event FeeTaken(address indexed token, address indexed quote, bool isBuy, uint256 quoteFee);
     event Distributed(
@@ -112,6 +119,7 @@ contract StockFeeHook is IHooks, Ownable2Step {
     event FeeBpsSet(uint16 feeBps);
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
     event DistributorSet(address distributor);
+    event ClaimConfigSet(address v3Factory, uint16 slippageBps);
     event DestinationsSet(address treasury, address flagshipSink);
 
     error NotPoolManager();
@@ -200,6 +208,15 @@ contract StockFeeHook is IHooks, Ownable2Step {
         emit DistributorSet(distributor_);
     }
 
+    /// @notice Enable/tune the permissionless claim: the V3 factory its floor quotes from and
+    /// the slippage tolerance. Freely re-settable — a misconfig is never terminal.
+    function setClaimConfig(IUniswapV3Factory factory_, uint16 slippageBps_) external onlyOwnerOrTreasury {
+        if (slippageBps_ > 2_000) revert InvalidSplit();
+        claimV3Factory = factory_;
+        claimSlippageBps = slippageBps_;
+        emit ClaimConfigSet(address(factory_), slippageBps_);
+    }
+
     /// @notice The StockPairRouter this hook shares route config with. Satisfies the launchpad's
     /// hook↔router consistency check in `setStockGateHook` (the RouterGateHook interface).
     function router() external view returns (address) {
@@ -284,11 +301,27 @@ contract StockFeeHook is IHooks, Ownable2Step {
     }
 
     // ── distribute: stock claims → real stock → WETH → 4-way ETH split ───────────
-    /// @notice Redeem a token's accrued stock fees, convert them to WETH, and split. STRICTLY
-    /// owner/treasury (platform policy: creators NEVER trigger or pull distributions — their
-    /// share is pushed to them when the platform distributes). `minWethOut` guards the V3
-    /// conversion against sandwiching.
+    /// @notice Redeem a token's accrued stock fees, convert them to WETH, and split. Owner/
+    /// treasury variant with an EXPLICIT min-out — the keeper's batching entry point.
     function distribute(address token, uint256 minWethOut) external onlyOwnerOrTreasury returns (uint256 wethOut) {
+        return _distribute(token, minWethOut);
+    }
+
+    /// @notice PERMISSIONLESS claim: anyone — most naturally the token's creator pressing the
+    /// site's "Claim fees" button — can trigger the conversion + split. Nobody can redirect a
+    /// wei of it (every share goes to its fixed recipient: treasury, creatorOf(token), the
+    /// distributor mechanism, the flagship sink), and the caller cannot rig the conversion:
+    /// the min-out is SELF-QUOTED on-chain from the sell route's pool spots × (1 −
+    /// `claimSlippageBps`), same defense as FlagshipBuyback.buyback(). Requires the claim
+    /// config (v3Factory) to be set; until then only the gated distribute() works.
+    function claimFees(address token) external returns (uint256 wethOut) {
+        if (address(claimV3Factory) == address(0)) revert NotConfigured();
+        uint256 amount = accrued[token];
+        if (amount == 0) return 0;
+        return _distribute(token, _claimFloor(quoteOf[token], amount));
+    }
+
+    function _distribute(address token, uint256 minWethOut) internal returns (uint256 wethOut) {
         uint256 amount = accrued[token];
         if (amount == 0) return 0;
         if (treasury == address(0)) revert NotConfigured();
@@ -296,6 +329,57 @@ contract StockFeeHook is IHooks, Ownable2Step {
         accrued[token] = 0;
         bytes memory res = poolManager.unlock(abi.encode(token, quote, amount, minWethOut));
         wethOut = abi.decode(res, (uint256));
+    }
+
+    /// @dev Expected WETH out for `amountIn` of `quote` along the router's sell route (or the
+    /// direct `quoteV3Fee` hop), chained from each hop pool's spot price in RAW wei terms
+    /// (decimals cancel across hops), minus each hop's pool fee and `claimSlippageBps` once.
+    function _claimFloor(address quote, uint256 amountIn) internal view returns (uint256) {
+        bytes memory path = stockRouter.sellPathOf(quote);
+        uint256 amt = amountIn;
+        uint256 feeSumBps = uint256(claimSlippageBps);
+        if (path.length == 0) {
+            uint24 fee = launchpad.quoteV3Fee(quote);
+            amt = _spotOut(quote, weth, fee, amt);
+            feeSumBps += uint256(fee) / 100;
+        } else {
+            // path = tokenIn(20) ++ [fee(3) ++ tokenOut(20)]…
+            address tokenIn = _addrAt(path, 0);
+            uint256 off = 20;
+            while (off + 23 <= path.length) {
+                uint24 fee = _feeAt(path, off);
+                address tokenOut = _addrAt(path, off + 3);
+                amt = _spotOut(tokenIn, tokenOut, fee, amt);
+                feeSumBps += uint256(fee) / 100;
+                tokenIn = tokenOut;
+                off += 23;
+            }
+        }
+        if (feeSumBps >= BPS) return 0;
+        return (amt * (BPS - feeSumBps)) / BPS;
+    }
+
+    /// @dev Raw-wei spot conversion through one V3 pool (two mulDivs against sqrtPriceX96²).
+    function _spotOut(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn) internal view returns (uint256) {
+        address pool = claimV3Factory.getPool(tokenIn, tokenOut, fee);
+        if (pool == address(0)) revert NotConfigured();
+        (uint160 sqrtP,,,,,,) = IUniswapV3Pool(pool).slot0();
+        bool inIsToken0 = tokenIn < tokenOut;
+        return inIsToken0
+            ? Math.mulDiv(Math.mulDiv(amountIn, sqrtP, 1 << 96), sqrtP, 1 << 96)
+            : Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sqrtP), 1 << 96, sqrtP);
+    }
+
+    function _addrAt(bytes memory path, uint256 pos) private pure returns (address a) {
+        assembly {
+            a := shr(96, mload(add(add(path, 32), pos)))
+        }
+    }
+
+    function _feeAt(bytes memory path, uint256 pos) private pure returns (uint24 f) {
+        assembly {
+            f := shr(232, mload(add(add(path, 32), pos)))
+        }
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
