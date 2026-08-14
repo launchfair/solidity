@@ -15,9 +15,24 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {FeeSplitConfig} from "./FeeSplitConfig.sol";
 
 interface ICreatorRegistryV4 {
     function creatorOf(address token) external view returns (address);
+}
+
+/// The launchpad's per-token launch record — the AUTHORITATIVE source of a token's fee tier.
+/// Field order must match LaunchFairV4.Launch exactly.
+struct LaunchTierView {
+    address creator;
+    PoolKey key;
+    uint24 fee; // the creator-chosen tier (30000/50000/100000), or 0 for legacy/foreign
+    address quoteToken;
+    bool exists;
+}
+
+interface ILaunchpadTierView {
+    function getLaunch(address token) external view returns (LaunchTierView memory);
 }
 
 interface IDistributorV4 {
@@ -56,13 +71,14 @@ interface IWETH {
 /// Audited pre-deployment (see AUDIT_V4_HOOK.md): the shared ERC-6909 WETH claim pool is
 /// non-drainable (Σ accrued == claims == redeemable WETH), delta accounting is correct in all four
 /// cases, and reentrancy is guarded. Still recommended: its own on-chain fork test pass before use.
-contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
+contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step, FeeSplitConfig {
     using SafeERC20 for IERC20;
     using BalanceDeltaLibrary for BalanceDelta;
 
-    uint16 public constant BPS = 10_000;
     /// @notice Hard cap on the fee (of the WETH leg) — prevents an owner fat-finger from setting a
-    /// fee ≥ the swap amount, which would revert every swap and brick the pool. 1000 = 10%.
+    /// fee ≥ the swap amount, which would revert every swap and brick the pool. 1000 = 10%. The
+    /// per-tier rates (3/5/10% of the trade) are charged in bps of the WETH leg, and 10% == 1000
+    /// is exactly this cap, so the 10% tier is the ceiling by construction.
     uint16 public constant MAX_FEE_BPS = 1_000;
 
     IPoolManager public immutable poolManager;
@@ -83,8 +99,10 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
     uint16 public mechanismBps = 4_000; // 40% (reward/lottery)
     uint16 public flagshipBps = 1_000; // 10% (flagship buyback) — the four MUST sum to BPS
 
+    /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
+    mapping(address => uint256) public owed;
+
     error NotPoolManager();
-    error InvalidSplit();
     error InvalidFeeBps();
     error NotConfigured();
     error NotAuthorized();
@@ -98,6 +116,9 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
 
     event FeeTaken(address indexed token, bool isBuy, uint256 wethFee);
     event Distributed(address indexed token, uint256 toTreasury, uint256 toDev, uint256 toMechanism, uint256 toFlagship);
+    /// @notice A push to the creator failed; the value is claimable with `withdrawOwed`.
+    event PayoutOwed(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
     event FeeBpsSet(uint16 feeBps);
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
     event DestinationsSet(address treasury, address distributor, address flagshipSink, address launchpad);
@@ -161,6 +182,27 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         emit SplitSet(t, d, m, f);
     }
 
+    // ── per-tier fee rate (creator's 3/5/10% choice, charged in-pool) ─────────────
+    /// @dev The token's fee tier, read from the launchpad's AUTHORITATIVE launch record — never
+    /// from the pool key. V4 `initialize` is permissionless, so trusting the key's fee field would
+    /// let anyone open a pool at a tier of their choosing; the launch record is the one the creator
+    /// actually chose. 0 for a foreign/legacy token (no record) → the global `feeBps` fallback.
+    function _launchFee(address token) internal view returns (uint24) {
+        if (launchpad == address(0)) return 0;
+        try ILaunchpadTierView(launchpad).getLaunch(token) returns (LaunchTierView memory L) {
+            if (L.exists) return L.fee;
+        } catch {}
+        return 0;
+    }
+
+    /// @notice The WETH-leg fee rate applied to `token`'s swaps: its chosen tier (3/5/10% of the
+    /// trade) if the launchpad launched it at a supported tier, else the global `feeBps`.
+    function feeBpsFor(address token) public view returns (uint16) {
+        uint24 f = _launchFee(token);
+        if (isSupportedFee(f)) return uint16(f / 100); // 30000→300, 50000→500, 100000→1000
+        return feeBps;
+    }
+
     // ── the fee: WETH on both sides, all four swap cases ──────────────────────────
     /// @dev Charges when the WETH leg is the SPECIFIED currency (exact-input buy: WETH is the
     /// specified input; exact-output sell: WETH is the specified output). A positive specified
@@ -170,17 +212,18 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (feeBps != 0 && params.amountSpecified != 0) {
+        if (params.amountSpecified != 0) {
             bool exactIn = params.amountSpecified < 0;
             address c0 = Currency.unwrap(key.currency0);
             address c1 = Currency.unwrap(key.currency1);
             // "specified" currency = input on exact-in, output on exact-out.
             address specified = (params.zeroForOne == exactIn) ? c0 : c1;
             if (specified == weth) {
+                address tk = c0 == weth ? c1 : c0;
+                uint16 bps = feeBpsFor(tk); // the token's chosen tier, or the global default
                 uint256 amt = exactIn ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-                uint256 fee = (amt * feeBps) / BPS;
+                uint256 fee = bps == 0 ? 0 : (amt * bps) / BPS;
                 if (fee > 0) {
-                    address tk = c0 == weth ? c1 : c0;
                     poolManager.mint(address(this), uint256(uint160(weth)), fee); // claim, not a physical take
                     accrued[tk] += fee;
                     emit FeeTaken(tk, exactIn, fee); // exactIn ⇒ buy (WETH in); exactOut ⇒ sell (WETH out)
@@ -202,18 +245,19 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         BalanceDelta delta,
         bytes calldata
     ) external onlyPoolManager returns (bytes4, int128) {
-        if (feeBps != 0 && params.amountSpecified != 0) {
+        if (params.amountSpecified != 0) {
             bool exactIn = params.amountSpecified < 0;
             address c0 = Currency.unwrap(key.currency0);
             address c1 = Currency.unwrap(key.currency1);
             // "unspecified" currency = output on exact-in, input on exact-out (complement of `specified`).
             address unspecified = (params.zeroForOne == exactIn) ? c1 : c0;
             if (unspecified == weth) {
+                address tk = c0 == weth ? c1 : c0;
+                uint16 bps = feeBpsFor(tk); // the token's chosen tier, or the global default
                 int256 d = int256(weth == c0 ? delta.amount0() : delta.amount1());
                 uint256 mag = uint256(d >= 0 ? d : -d);
-                uint256 fee = (mag * feeBps) / BPS;
+                uint256 fee = bps == 0 ? 0 : (mag * bps) / BPS;
                 if (fee > 0) {
-                    address tk = c0 == weth ? c1 : c0;
                     poolManager.mint(address(this), uint256(uint160(weth)), fee); // claim, not a physical take
                     accrued[tk] += fee;
                     emit FeeTaken(tk, !exactIn, fee); // exactIn ⇒ sell (WETH out); exactOut ⇒ buy (WETH in)
@@ -248,10 +292,26 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
     function _split(address token, uint256 amount) private {
         address t = treasury;
         IERC20 w = IERC20(weth);
-        uint256 toTreasury = (amount * treasuryBps) / BPS;
-        uint256 toDev = (amount * devBps) / BPS;
-        uint256 toFlagship = (amount * flagshipBps) / BPS;
-        uint256 toMechanism = amount - toTreasury - toDev - toFlagship; // remainder (mechanism + dust)
+        uint256 toTreasury;
+        uint256 toDev;
+        uint256 toMechanism;
+        uint256 toFlagship;
+
+        uint24 tier = _launchFee(token);
+        if (isSupportedFee(tier)) {
+            // PER-TIER split (the creator's 3/5/10% choice). treasury == dev == sideBps[tier];
+            // the remainder is the mechanism slice. There is no explicit flagship % in the tier
+            // table by design: a Base token's mechanism folds into the flagship below (so plain
+            // tokens still feed the flywheel), and a mode token's mechanism funds its own
+            // reward/lottery. This is exactly the FeeSplitConfig model the team defined.
+            (toTreasury, toDev, toMechanism) = splitOf(tier, amount);
+        } else {
+            // Foreign/legacy token (no launch record): the global 4-way split, unchanged.
+            toTreasury = (amount * treasuryBps) / BPS;
+            toDev = (amount * devBps) / BPS;
+            toFlagship = (amount * flagshipBps) / BPS;
+            toMechanism = amount - toTreasury - toDev - toFlagship;
+        }
 
         // Mechanism slice stays in WETH — it feeds the on-chain buyback engine (the distributor swaps
         // WETH→reward). Plain (Base) tokens have no mechanism → the slice folds into the flagship.
@@ -271,18 +331,47 @@ contract WethFeeHook is IHooks, IUnlockCallback, Ownable2Step {
         if (toTreasury > 0) _payEth(t, toTreasury);
         if (toDev > 0) {
             address dev = launchpad != address(0) ? ICreatorRegistryV4(launchpad).creatorOf(token) : address(0);
-            _payEth(dev == address(0) ? t : dev, toDev);
+            // CREDIT the creator on failure, never freeze the whole distribution or forfeit the
+            // share to the treasury. `creatorOf` is arbitrary (a splitter, a 7702 delegate, a Safe
+            // that does work on receipt), and it is fixed at launch with no setter — so a reverting
+            // creator used to brick treasury + flagship + mechanism for that token forever. The
+            // twin fix already lives in LaunchFairV4FeeLocker and StockFeeHook; this is the file
+            // that serves the main product and never got it.
+            _payEthOrCredit(dev == address(0) ? t : dev, toDev);
         }
         if (flagshipTotal > 0) _payEth(flagshipSink == address(0) ? t : flagshipSink, flagshipTotal);
 
         emit Distributed(token, toTreasury, toDev, notified ? toMechanism : 0, toFlagship);
     }
 
-    /// @dev Send native ETH; reverts if the recipient rejects it (retryable — `accrued` was already
-    /// zeroed in `distribute`, but a revert unwinds that too). Recipients should accept ETH.
+    /// @dev Send native ETH; reverts if the recipient rejects it. Used only for treasury and the
+    /// flagship sink — both platform-controlled addresses that accept ETH; a revert here is a
+    /// misconfiguration to fix, and unwinds the (already-zeroed) `accrued` for a clean retry.
     function _payEth(address to, uint256 value) private {
         (bool ok,) = to.call{value: value}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Pay the creator, whose address is arbitrary. On failure CREDIT the value (pull via
+    /// `withdrawOwed`) instead of reverting the whole distribution or confiscating it to treasury.
+    function _payEthOrCredit(address to, uint256 value) private {
+        if (value == 0) return;
+        (bool ok,) = to.call{value: value, gas: 100_000}("");
+        if (!ok) {
+            owed[to] += value;
+            emit PayoutOwed(to, value);
+        }
+    }
+
+    /// @notice Withdraw fee shares that could not be pushed. Permissionless; the ETH only ever
+    /// goes to the address that is owed it.
+    function withdrawOwed(address to) external returns (uint256 amount) {
+        amount = owed[to];
+        if (amount == 0) return 0;
+        owed[to] = 0; // zeroed before the send: a reentrant call sees nothing left
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
+        emit OwedWithdrawn(to, amount);
     }
 
     /// @dev Accept ETH only from unwrapping WETH (during `distribute`).

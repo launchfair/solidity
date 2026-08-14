@@ -12,6 +12,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {WethFeeHook} from "../../src/v2/v4/WethFeeHook.sol";
+import {FeeSplitConfig} from "../../src/v2/v4/FeeSplitConfig.sol";
 import {HookMiner} from "../../script/HookMiner.sol";
 
 contract HookMockToken is ERC20 {
@@ -118,7 +119,7 @@ contract WethFeeHookTest is Test, Deployers {
     }
 
     function test_setSplit_mustSumToBps() public {
-        vm.expectRevert(WethFeeHook.InvalidSplit.selector);
+        vm.expectRevert(FeeSplitConfig.InvalidSplit.selector);
         hook.setSplit(3000, 3000, 3000, 3000); // sums to 12000
     }
 
@@ -193,4 +194,86 @@ contract WethFeeHookTest is Test, Deployers {
         uint256 second = hook.accrued(address(token)) - firstFee;
         assertEq(second, (1 ether * 300) / 10_000, "the new global 3% took effect on the live pool");
     }
+
+    // ── PER-TIER fees: the creator's 3/5/10% choice is charged in-pool and split per tier ──
+    //
+    // With a launchpad wired, the hook reads each token's chosen tier from the launch record and
+    // charges THAT rate (not the flat global fee), then splits it through FeeSplitConfig.
+    function test_perTier_chargesTheChosenRate_andSplits() public {
+        // Wire a launchpad that reports this token was launched at the 10% tier.
+        MockTierLaunchpad pad = new MockTierLaunchpad();
+        pad.setLaunch(address(token), address(0xDEF), 100_000); // FEE_10PCT, creator 0xDEF
+        hook.setDestinations(TREASURY, address(0), FLAGSHIP, address(pad));
+
+        // A 1 ETH buy now pays the 10% tier (1000 bps), not the global 1%.
+        weth.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 1 ether);
+        uint256 acc = hook.accrued(address(token));
+        assertEq(acc, (1 ether * 1000) / 10_000, "10% tier charged, not the global 1%");
+
+        // Split for the 10% tier: sideBps = 1000, so treasury == dev == 10% of the fee each,
+        // mechanism (this Base token → folds to flagship) = the remaining 80%.
+        uint256 side = (acc * 1000) / 10_000;
+        hook.distribute(address(token));
+        // dev is a plain address that accepts ETH → it is PAID, not folded to treasury.
+        assertEq(TREASURY.balance, side, "treasury = sideBps of the fee");
+        assertEq(address(0xDEF).balance, side, "creator PAID his tier share directly");
+        assertEq(FLAGSHIP.balance, acc - side - side, "mechanism folded to flagship (Base token)");
+    }
+
+    // A creator whose wallet reverts on ETH must not freeze the whole distribution, and must not
+    // forfeit its share to the treasury — it is credited and pullable (B-4 twin fix).
+    function test_perTier_revertingCreator_isCredited_notFrozen() public {
+        MockTierLaunchpad pad = new MockTierLaunchpad();
+        RejectEth bad = new RejectEth();
+        pad.setLaunch(address(token), address(bad), 50_000); // 5% tier
+        hook.setDestinations(TREASURY, address(0), FLAGSHIP, address(pad));
+
+        weth.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 1 ether);
+        uint256 acc = hook.accrued(address(token));
+        uint256 side = (acc * hook.sideBps(50_000)) / 10_000;
+
+        hook.distribute(address(token)); // must NOT revert
+        assertEq(hook.accrued(address(token)), 0, "distribution completed");
+        assertEq(TREASURY.balance, side, "treasury got ONLY its own share, not the creator's");
+        assertEq(hook.owed(address(bad)), side, "creator share credited, not confiscated");
+
+        bad.setAccept(true);
+        hook.withdrawOwed(address(bad));
+        assertEq(address(bad).balance, side, "creator pulled his share once his wallet accepts ETH");
+    }
+}
+
+/// Minimal launchpad exposing getLaunch so the hook can read a token's chosen tier + creator.
+contract MockTierLaunchpad {
+    struct L {
+        address creator;
+        PoolKey key;
+        uint24 fee;
+        address quoteToken;
+        bool exists;
+    }
+
+    mapping(address => L) internal _l;
+
+    function setLaunch(address token, address creator, uint24 fee) external {
+        _l[token].creator = creator;
+        _l[token].fee = fee;
+        _l[token].exists = true;
+    }
+
+    function getLaunch(address token) external view returns (L memory) {
+        return _l[token];
+    }
+
+    function creatorOf(address token) external view returns (address) {
+        return _l[token].creator;
+    }
+}
+
+contract RejectEth {
+    bool public accept;
+    function setAccept(bool a) external { accept = a; }
+    receive() external payable { if (!accept) revert("no"); }
 }
