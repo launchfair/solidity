@@ -29,8 +29,10 @@ contract LaunchFairTokenFactoryTest is Test {
         implA = new TokenDeployerV2();
         implB = new TokenDeployerV2Alt();
         factory = new LaunchFairTokenFactory(OWNER, TREASURY);
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         factory.setImplementation(address(implA));
+        factory.setLauncher(LAUNCHPAD, true); // the launchpad is the only caller allowed to deploy
+        vm.stopPrank();
     }
 
     function _params(string memory sym) internal pure returns (TokenDeployerV2.Params memory p) {
@@ -193,9 +195,32 @@ contract LaunchFairTokenFactoryTest is Test {
 
     function test_deployRevertsUntilImplementationIsSet() public {
         LaunchFairTokenFactory bare = new LaunchFairTokenFactory(OWNER, TREASURY);
+        vm.prank(OWNER);
+        bare.setLauncher(LAUNCHPAD, true); // past the launcher gate, so we reach the impl check
         vm.prank(LAUNCHPAD);
         vm.expectRevert(LaunchFairTokenFactory.NotAContract.selector);
         TokenDeployerV2(address(bare)).deploy(_params("AAA"), keccak256("a"));
+    }
+
+    // The fallback is gated: a caller that is NOT an allow-listed launcher cannot deploy through
+    // the factory, so nobody can mint a token carrying our canonical creator address.
+    function test_nonLauncherCannotDeploy() public {
+        vm.prank(RANDO);
+        vm.expectRevert(LaunchFairTokenFactory.NotAuthorized.selector);
+        TokenDeployerV2(address(factory)).deploy(_params("EVIL"), keccak256("x"));
+    }
+
+    function test_renounceOwnershipDisabled() public {
+        vm.prank(OWNER);
+        vm.expectRevert(LaunchFairTokenFactory.NotAuthorized.selector);
+        factory.renounceOwnership();
+    }
+
+    function test_freezeBeforeSetImplementationReverts() public {
+        LaunchFairTokenFactory bare = new LaunchFairTokenFactory(OWNER, TREASURY);
+        vm.prank(OWNER);
+        vm.expectRevert(LaunchFairTokenFactory.NotAContract.selector);
+        bare.freezeImplementation(); // would otherwise brick the permanent address forever
     }
 
     // ── the silent-failure guard ─────────────────────────────────────────────

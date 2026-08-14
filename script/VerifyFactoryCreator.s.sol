@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 
 import {TokenDeployerV2} from "../src/v2/TokenDeployerV2.sol";
 import {LaunchTokenV2} from "../src/v2/LaunchTokenV2.sol";
+import {LaunchFairTokenFactory} from "../src/v2/LaunchFairTokenFactory.sol";
 
 /// Deploys one throwaway token THROUGH the permanent factory and proves on-chain that:
 ///   1. the token's CREATE2 creator is the FACTORY address, not the TokenDeployerV2
@@ -43,6 +44,9 @@ contract VerifyFactoryCreator is Script {
         bytes32 salt = keccak256(abi.encodePacked("creator-proof", block.number));
 
         vm.startBroadcast(pk);
+        // The fallback is launcher-gated; the broadcaster is the factory owner here, so allow it
+        // to deploy for the proof (in production the launchpad + CoreTGE are the allow-listed ones).
+        LaunchFairTokenFactory(payable(factory)).setLauncher(caller, true);
         address token = TokenDeployerV2(factory).deploy(p, salt);
         vm.stopBroadcast();
 

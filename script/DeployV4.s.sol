@@ -9,6 +9,7 @@ import {LaunchFairVRFCoordinator} from "../src/v2/v4/LaunchFairVRFCoordinator.so
 import {LaunchFairV4FeeLocker} from "../src/v2/v4/LaunchFairV4FeeLocker.sol";
 import {LaunchFairV4Distributor} from "../src/v2/v4/LaunchFairV4Distributor.sol";
 import {TokenDeployerV2} from "../src/v2/TokenDeployerV2.sol";
+import {LaunchFairTokenFactory} from "../src/v2/LaunchFairTokenFactory.sol";
 import {LaunchFairV4} from "../src/v2/v4/LaunchFairV4.sol";
 import {IUniswapV3Factory, IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol";
 
@@ -133,6 +134,13 @@ contract DeployV4 is Script {
         dist.setDrawOperator(keeper); // keeper commits/settles lottery draws
         dist.setProcessor(keeper, true); // keeper may fire buybacks with a quoted minOut (M-02)
         pad.setSwapRouter(vm.envOr("V4_SWAP_ROUTER", DEFAULT_V4_SWAP_ROUTER)); // atomic dev buy
+
+        // The permanent factory only lets ALLOW-LISTED callers deploy through it (so nobody can
+        // mint a token carrying our canonical creator address). Authorize this launchpad. A
+        // freshly-deployed raw TokenDeployerV2 (td == 0 path) has no such gate, so skip it there.
+        if (td != address(0)) {
+            LaunchFairTokenFactory(payable(td)).setLauncher(address(pad), true);
+        }
 
         vm.stopBroadcast();
 

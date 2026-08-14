@@ -44,6 +44,9 @@ contract DeployFlagshipBuyback is Script {
         // flywheel never stalls on an empty keeper. Off unless KEEPER is provided.
         address keeper = vm.envOr("KEEPER", address(0));
         if (keeper != address(0)) {
+            // Authorize the cron for buyback + publishSeason ONLY (never the withdrawals), so the
+            // hot key can move value along the on-chain flow but can't drain the vault.
+            vault.setKeeper(keeper, true);
             vault.setGasPolicy(
                 keeper,
                 vm.envOr("GAS_FLOOR_WEI", uint256(0.03 ether)),

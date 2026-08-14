@@ -343,14 +343,22 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         return uint8(_buyback[token][asset].venue);
     }
 
-    /// @notice Recover a token's pending mechanism WETH when its venue is permanently
-    /// unroutable — an uninitialized pool accepted before `_validateVenue` checked, or a reward
-    /// pool whose liquidity was later pulled (`process` then reverts on slippage forever).
+    /// @notice Recover a token's pending mechanism WETH when its venue is permanently unroutable —
+    /// a reward pool whose liquidity was later pulled (`process` then reverts on slippage forever).
     /// Venues are registered once at launch, so without this the WETH is dead: this contract has
-    /// no withdrawal of any kind, unlike FlagshipBuyback and SeasonMerkleDistributor.
-    /// Bounded by that token's own `pendingWeth`, so it can never touch another token's pot.
+    /// no other withdrawal, unlike FlagshipBuyback and SeasonMerkleDistributor.
+    ///
+    /// GUARDED so a single owner key cannot sweep live user rewards or an in-flight lottery pot:
+    ///   - refuses while a draw is committed (`!pendingDraw.active`), so it can't be used to make
+    ///     `settleDraw` pay the winner 0 after the fact;
+    ///   - only after the payout timer has been stuck for a full interval, so it targets genuinely
+    ///     dead funds, never rewards that are actively accruing and payable;
+    ///   - bounded by that token's own `pendingWeth`, so it can never touch another token's pot.
     function rescuePendingWeth(address token, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (pendingDraw[token].active) revert DrawActive();
+        // "Stuck" = no successful payout for at least one full max interval (~7 days of L1 blocks).
+        if (block.number <= lastPayoutBlock[token] + MAX_PAYOUT_INTERVAL_BLOCKS) revert TimerNotElapsed();
         uint256 pend = pendingWeth[token];
         if (amount > pend) amount = pend;
         if (amount == 0) return;

@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {FlagshipBuyback, IWETH9B} from "../../src/flywheel/FlagshipBuyback.sol";
 import {IUniswapV3Factory, IV3SwapRouter} from "../../src/interfaces/IUniswapV3.sol";
 import {MockV3Factory, MockV3Pool} from "../mocks/MockUniswapV3.sol";
@@ -246,5 +247,44 @@ contract FlagshipBuybackTest is Test {
         vault.setParams(2_001, 1 ether);
         vm.expectRevert(FlagshipBuyback.BadParams.selector);
         vault.setParams(300, 0);
+    }
+
+    // ── keeper role: buyback/publish yes, withdrawals never (B-5) ──────────────
+    function test_keeper_canBuyback_butCannotWithdraw() public {
+        vault.setKeeper(KEEPER, true);
+        vm.deal(address(vault), 0.3 ether);
+
+        // The keeper CAN fire a buyback (value moves along the on-chain flow only).
+        vm.prank(KEEPER);
+        vault.buyback();
+        assertEq(core.balanceOf(address(vault)), 0.3 ether, "keeper bought core into the vault");
+
+        // The keeper CANNOT withdraw to itself — that stays owner-only (Ownable rejects it).
+        vm.deal(address(vault), 1 ether);
+        vm.prank(KEEPER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, KEEPER));
+        vault.withdrawEth(KEEPER, 1 ether);
+
+        vm.prank(KEEPER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, KEEPER));
+        vault.withdrawToken(address(core), KEEPER, 1);
+    }
+
+    function test_nonKeeperNonOwnerCannotBuyback() public {
+        vm.deal(address(vault), 0.3 ether);
+        vm.prank(address(0xBAD));
+        vm.expectRevert(FlagshipBuyback.NotAuthorized.selector);
+        vault.buyback();
+    }
+
+    // The off-chain quote is the real MEV guard: a minOut above the self-floor is enforced.
+    function test_buyback_enforcesCallerMinOutOverFloor() public {
+        vm.deal(address(vault), 0.3 ether);
+        // Mock fills 1:1, so 0.3 out. Demand more than that and the swap must revert.
+        vm.expectRevert(); // SwapRouter "Too little received"
+        vault.buyback(0.31 ether);
+        // A satisfiable minOut goes through.
+        uint256 out = vault.buyback(0.29 ether);
+        assertEq(out, 0.3 ether, "filled with the caller minOut satisfied");
     }
 }

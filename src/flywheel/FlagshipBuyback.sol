@@ -49,6 +49,12 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
 
     /// The season Merkle distributor this vault funds (its rootPublisher must be THIS contract).
     address public distributor;
+    /// @notice The cron wallets allowed to fire buybacks + publish seasons — but NOT to withdraw.
+    /// This is what keeps the rule ("the keeper never custodies fee funds") true: the keeper key
+    /// can move value only along the on-chain flow (buy core, fund a season), never out to an
+    /// arbitrary address. `withdrawEth`/`withdrawToken` stay owner-only, so the owner should be a
+    /// cold key or multisig, distinct from the hot keeper.
+    mapping(address => bool) public isKeeper;
     /// Slippage tolerance on top of the pool fee for the self-quoted min-out (default 3%).
     uint16 public slippageBps = 300;
     /// Per-call swap cap — a large pot is averaged in across cron cycles (default 0.5 ETH).
@@ -77,11 +83,14 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
     event EthWithdrawn(address indexed to, uint256 amount);
     event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
 
+    event KeeperSet(address indexed keeper, bool allowed);
+
     error NothingToBuy();
     error NoPool();
     error ZeroAddress();
     error BadParams();
     error EthTransferFailed();
+    error NotAuthorized();
 
     constructor(
         address owner_,
@@ -178,12 +187,37 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
         emit GasToppedUp(r, need, r.balance);
     }
 
+    /// @notice Authorize (or revoke) a keeper wallet for `buyback`/`publishSeason`. Owner-only.
+    function setKeeper(address keeper, bool ok) external onlyOwner {
+        if (keeper == address(0)) revert ZeroAddress();
+        isKeeper[keeper] = ok;
+        emit KeeperSet(keeper, ok);
+    }
+
+    /// @dev Owner (cold) OR an authorized keeper (hot cron). The keeper can only move value along
+    /// the on-chain flow — it can never reach the owner-only withdrawals.
+    modifier onlyOwnerOrKeeper() {
+        if (msg.sender != owner() && !isKeeper[msg.sender]) revert NotAuthorized();
+        _;
+    }
+
     // ── the cron call ────────────────────────────────────────────────────────
-    /// @notice Buy core with the accumulated fee ETH (capped per call). Owner-only; the
-    /// min-out floor is self-quoted from the pool spot minus fee+slippage, so the cron
-    /// needs no arguments and a mid-flight price move just reverts (retry next cycle).
-    /// Tops the keeper's gas up FIRST, so the wallet paying for this call is refilled by it.
-    function buyback() external onlyOwner nonReentrant returns (uint256 coreOut) {
+    /// @notice Argumentless convenience form: buy with only the self-quoted spot floor. Prefer
+    /// `buyback(minOut)` from the cron, passing an off-chain quote from a PRIOR block — the spot
+    /// floor alone is read from the same pool the swap hits, so it can't resist a price someone
+    /// moved just before this call.
+    function buyback() external onlyOwnerOrKeeper nonReentrant returns (uint256 coreOut) {
+        return _buyback(0);
+    }
+
+    /// @notice Buy core with the accumulated fee ETH (capped per call), enforcing the LARGER of the
+    /// caller's `minOut` (quoted off-chain a block earlier — the real MEV protection) and the
+    /// on-chain spot floor. Passing 0 falls back to the spot floor only.
+    function buyback(uint256 minOut) external onlyOwnerOrKeeper nonReentrant returns (uint256 coreOut) {
+        return _buyback(minOut);
+    }
+
+    function _buyback(uint256 callerMinOut) private returns (uint256 coreOut) {
         // BEST-EFFORT: topUpGas reverts if the recipient rejects ETH, and it runs first — so a
         // misconfigured recipient would brick every buyback. The buyback matters more than the
         // refuel; swallow a failed top-up and carry on.
@@ -199,7 +233,8 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
             revert NothingToBuy();
         }
 
-        uint256 minOut = _floor(amountIn);
+        uint256 floor_ = _floor(amountIn);
+        uint256 minOut = callerMinOut > floor_ ? callerMinOut : floor_; // max: the off-chain quote wins
         weth.deposit{value: amountIn}();
         IERC20(address(weth)).forceApprove(address(v3Router), amountIn);
         coreOut = v3Router.exactInputSingle(
@@ -236,7 +271,7 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
     /// The distributor's `rootPublisher` must be THIS contract.
     function publishSeason(uint256 season, uint256 amount, bytes32 root, uint256 total)
         external
-        onlyOwner
+        onlyOwnerOrKeeper
         nonReentrant
     {
         if (distributor == address(0)) revert ZeroAddress();

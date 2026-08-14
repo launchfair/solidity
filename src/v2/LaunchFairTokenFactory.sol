@@ -43,10 +43,15 @@ contract LaunchFairTokenFactory is Ownable2Step {
     address public treasury;
     /// @notice Once true, `implementation` can never change again. One-way.
     bool public implementationFrozen;
+    /// @notice Addresses allowed to deploy through this factory (the launchpad + CoreTGE).
+    /// Declared AFTER the mined-address state so implementation (slot 2) and treasury (slot 3)
+    /// keep their slots, and this mapping lands in a fresh slot the stateless impl never touches.
+    mapping(address => bool) public isLauncher;
 
     event ImplementationSet(address indexed previous, address indexed current);
     event TreasurySet(address indexed previous, address indexed current);
     event ImplementationFrozen(address indexed implementation);
+    event LauncherSet(address indexed launcher, bool allowed);
 
     error ZeroAddress();
     error NotAContract();
@@ -90,13 +95,33 @@ contract LaunchFairTokenFactory is Ownable2Step {
         treasury = t;
     }
 
+    /// @notice Allow (or revoke) an address to deploy through this factory. The launchpad and
+    /// CoreTGE are allow-listed at deploy time; nothing else can mint a token that carries this
+    /// canonical creator address. Without this the fallback was open, so ANYONE could deploy a
+    /// LaunchTokenV2 through the proxy and have the scam token indexed as "created by LaunchFair"
+    /// — the one thing the permanent address exists to make trustworthy.
+    function setLauncher(address launcher, bool allowed) external onlyOwnerOrTreasury {
+        if (launcher == address(0)) revert ZeroAddress();
+        isLauncher[launcher] = allowed;
+        emit LauncherSet(launcher, allowed);
+    }
+
     /// @notice Permanently give up the ability to change the implementation. Do this once the
     /// token contract is final: the creator address stays exactly the same, and the upgrade
     /// surface this contract introduces disappears for good.
     function freezeImplementation() external onlyOwner {
         if (implementationFrozen) revert AlreadyFrozen();
+        // Never freeze with no implementation set — the fallback would then revert forever and
+        // the permanent address (and every immutable `deployer` wired to it) would be dead.
+        if (implementation == address(0)) revert NotAContract();
         implementationFrozen = true;
         emit ImplementationFrozen(implementation);
+    }
+
+    /// @notice Renouncing would leave the treasury as the sole, un-freezable upgrader (setTreasury
+    /// and freezeImplementation are owner-only). Disabled so ownership can only be transferred.
+    function renounceOwnership() public override onlyOwner {
+        revert NotAuthorized();
     }
 
     /// @dev Everything else (today: `deploy`) runs as this address via delegatecall, which is what
@@ -108,6 +133,9 @@ contract LaunchFairTokenFactory is Ownable2Step {
     /// would be shadowed by this contract and unreachable through it. We control the
     /// implementation, so this is a review checklist item, not an open risk.
     fallback() external {
+        // Only the allow-listed launchers (launchpad + CoreTGE) may deploy through the factory —
+        // otherwise anyone could mint a token that indexes as "created by LaunchFair".
+        if (!isLauncher[msg.sender]) revert NotAuthorized();
         address impl = implementation;
         // A delegatecall to an address with no code SUCCEEDS and returns empty — `deploy` would
         // hand the launchpad address(0) as a "token". Fail loudly instead.
