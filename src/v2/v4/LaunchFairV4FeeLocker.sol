@@ -169,11 +169,48 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     }
 
     // ── claim fees ─────────────────────────────────────────────────────────────
+    /// @notice Permissionless batch claim: same payouts as `claim`, for many tokens in one
+    /// transaction. TOLERANT by design — a token this locker doesn't hold, isn't WETH-paired,
+    /// or simply has nothing pending is SKIPPED rather than reverting the whole batch, so one
+    /// dud can't block a creator claiming the rest. Returns how many actually paid out.
+    /// (`claim` is `nonReentrant`, so this cannot call it internally; the guard is taken once
+    /// here and the shared body runs unguarded per token.)
+    function claimMany(address[] calldata tokens) external nonReentrant returns (uint256 claimed) {
+        for (uint256 i; i < tokens.length; i++) {
+            if (_claimable(tokens[i])) {
+                _claim(tokens[i]);
+                claimed++;
+            }
+        }
+    }
+
+    /// @dev Whether `_claim` would succeed for `token` (position exists + WETH-paired).
+    function _claimable(address token) internal view returns (bool) {
+        Position memory p = _positions[token];
+        if (!p.exists) return false;
+        address w = address(weth);
+        return Currency.unwrap(p.key.currency0) == w || Currency.unwrap(p.key.currency1) == w;
+    }
+
     /// @notice Permissionless. Collects fees, burns the token (sell) side, splits
     /// the WETH (buy) side by the pool's fee tier, funds the mechanism.
     function claim(address token)
         external
         nonReentrant
+        returns (
+            uint256 tokensBurned,
+            uint256 wethToTreasury,
+            uint256 wethToDev,
+            uint256 wethToMechanism,
+            uint256 wethToFlagship
+        )
+    {
+        return _claim(token);
+    }
+
+    /// @dev The claim body, unguarded so `claimMany` can loop it under a single guard.
+    function _claim(address token)
+        internal
         returns (
             uint256 tokensBurned,
             uint256 wethToTreasury,

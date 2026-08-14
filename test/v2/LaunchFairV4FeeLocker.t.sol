@@ -133,6 +133,29 @@ contract V4FeeLockerTest is Test, Deployers {
         assertEq(token.totalSupply(), supplyBefore - burned, "supply reduced by the burn");
     }
 
+    /// Batch claim: pays exactly like `claim`, and a dud token in the list is SKIPPED rather
+    /// than reverting the batch (so one bad entry can't block a creator claiming the rest).
+    function test_claimMany_paysAndSkipsDuds() public {
+        _buy(50_000 ether);
+        _sell(500 ether);
+
+        address[] memory list = new address[](3);
+        list[0] = address(0xDEAD);   // never locked here
+        list[1] = address(token);    // the real one
+        list[2] = address(0xBEEF);   // never locked here
+
+        uint256 claimed = locker.claimMany(list);
+        assertEq(claimed, 1, "only the real token paid out");
+        assertGt(TREASURY.balance, 0, "treasury paid through the batch");
+        assertGt(DEV.balance, 0, "creator paid through the batch");
+        assertEq(TREASURY.balance, DEV.balance, "same split as a single claim");
+
+        // Nothing left pending: a second batch pays nobody and still doesn't revert.
+        uint256 devBefore = DEV.balance;
+        assertEq(locker.claimMany(list), 1, "position still claimable, just empty");
+        assertEq(DEV.balance, devBefore, "no double pay");
+    }
+
     /// The flat flagship-buyback cut is carved from the DEV slice only (0.1% of the trade),
     /// leaving treasury + mechanism untouched. Off by default (no sink) — on once a sink is set.
     function test_claim_flagshipCutCarvedFromDevSlice() public {
