@@ -8,7 +8,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {StockPairRouter, IWETH, ILaunchpadV4} from "../src/v2/v4/StockPairRouter.sol";
 import {StockFeeHook, ILaunchpadStockView, IStockRoutesView} from "../src/v2/v4/StockFeeHook.sol";
-import {IV3SwapRouter} from "../src/interfaces/IUniswapV3.sol";
+import {IV3SwapRouter, IUniswapV3Factory} from "../src/interfaces/IUniswapV3.sol";
 import {HookMiner} from "./HookMiner.sol";
 
 interface ILaunchpadAdmin {
@@ -17,6 +17,10 @@ interface ILaunchpadAdmin {
     function setAllowedQuote(address stock, bool allowed, uint24 v3Fee) external;
     function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external;
     function distributor() external view returns (address);
+}
+
+interface IDistributorAdmin {
+    function setFeeSource(address source, bool allowed) external;
 }
 
 interface IV3FactoryMin {
@@ -100,6 +104,9 @@ contract DeployStockPair is Script {
     address constant RBLX = 0xF0C4BF4C582cb3836e98394b1d4e7B7281101bE8; // $3.5k @ 1%
     address constant NU = 0x408c14038a04f7bD235329E26d2bf569ee20e250; // $2.4k @ 1%
 
+    /// Slippage the hook allows below its own chained-spot/TWAP quote when converting fees.
+    uint16 constant CLAIM_SLIPPAGE_BPS = 300;
+
     function run() external {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
         // secret plumbing is needed to run this script.
@@ -109,6 +116,8 @@ contract DeployStockPair is Script {
         IPoolManager pm = IPoolManager(vm.envAddress("POOL_MANAGER"));
         address weth = vm.envAddress("WETH");
         address v3Router = vm.envAddress("V3_ROUTER");
+        // Needed for the hook's self-quoted claim floor (see setClaimConfig below).
+        address v3Factory = vm.envOr("V3_FACTORY", address(0x1f7d7550B1b028f7571E69A784071F0205FD2EfA));
         address launchpad = vm.envAddress("LAUNCHPAD");
         address treasury = vm.envAddress("TREASURY");
         address flagshipSink = vm.envOr("FLAGSHIP_SINK", address(0));
@@ -146,6 +155,20 @@ contract DeployStockPair is Script {
         ILaunchpadAdmin pad = ILaunchpadAdmin(launchpad);
         pad.setStockPairRouter(address(router));
         pad.setStockGateHook(address(hook)); // hook.router() satisfies the consistency check
+
+        // Two wirings that used to be manual post-deploy steps, and were MISSED on the first
+        // stack #9 attempt — both fail quietly rather than loudly, which is exactly why they
+        // belong in the script:
+        //   1. The hook must be an authorized fee source or its notify() reverts, which would
+        //      leave every mode stock token's mechanism unfunded.
+        //   2. Without the claim config, the permissionless `claimFees` (the site's creator
+        //      claim button) reverts NotConfigured and only the gated distribute() works.
+        address dist = pad.distributor();
+        if (dist != address(0)) {
+            hook.setDistributor(dist);
+            IDistributorAdmin(dist).setFeeSource(address(hook), true);
+        }
+        hook.setClaimConfig(IUniswapV3Factory(v3Factory), CLAIM_SLIPPAGE_BPS);
 
         // DIRECT quotes: the stock's own <stock>/WETH pool carries the trade.
         pad.setAllowedQuote(COIN, true, 3000);

@@ -57,10 +57,14 @@ contract DeployV4 is Script {
     // The standalone LaunchFairV4SwapRouter (stateless, reused across redeploys) — used by
     // createAndBuy for the atomic dev buy.
     address constant DEFAULT_V4_SWAP_ROUTER = 0x0e6c53664388B68F6b41851D224248F391CC8947;
-    // The live TokenDeployerV2 (stateless CREATE2 factory, reused across redeploys so every
-    // token generation — including the CoreTGE's core token — shares ONE on-chain creator,
-    // which is what external indexers key on). Zero => deploy a fresh one.
-    address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
+    // TokenDeployerV2 is a stateless CREATE2 factory, but it BAKES IN the LaunchTokenV2
+    // bytecode — so reusing an old one silently launches tokens built from old token code.
+    // That is exactly what happened on the first stack #9 attempt: this constant still pointed
+    // at a factory that predates `trustedSpender`, so every launch reverted at
+    // setTrustedSpender and, had it not reverted, would have shipped tokens without the
+    // one-transaction sell. Default to deploying a FRESH one; pin it via the TOKEN_DEPLOYER env
+    // only after checking that factory's token bytecode is current.
+    address constant DEFAULT_TOKEN_DEPLOYER = address(0);
 
     function run() external {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
