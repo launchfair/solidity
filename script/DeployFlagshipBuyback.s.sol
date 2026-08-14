@@ -39,11 +39,24 @@ contract DeployFlagshipBuyback is Script {
         SeasonMerkleDistributor dist =
             new SeasonMerkleDistributor(owner, IERC20(core), treasury, address(vault));
         vault.setDistributor(address(dist));
+
+        // Keeper gas auto-top-up: the vault keeps the cron wallet funded from fee ETH, so the
+        // flywheel never stalls on an empty keeper. Off unless KEEPER is provided.
+        address keeper = vm.envOr("KEEPER", address(0));
+        if (keeper != address(0)) {
+            vault.setGasPolicy(
+                keeper,
+                vm.envOr("GAS_FLOOR_WEI", uint256(0.03 ether)),
+                vm.envOr("GAS_MAX_PER_TOPUP_WEI", uint256(0.02 ether)),
+                vm.envOr("GAS_DAILY_CAP_WEI", uint256(0.1 ether))
+            );
+        }
         vm.stopBroadcast();
 
         console2.log("FlagshipBuyback vault:  ", address(vault));
         console2.log("SeasonMerkleDistributor:", address(dist));
         console2.log("  rootPublisher = the vault; owner =", owner);
+        console2.log("  keeper gas top-up:", keeper);
         console2.log("Next: repoint locker/router/hook flagship sinks -> the vault");
     }
 }

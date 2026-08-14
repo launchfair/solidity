@@ -106,6 +106,94 @@ contract FlagshipBuybackTest is Test {
         assertEq(address(vault).balance, 0, "fee ETH fully deployed");
     }
 
+    address constant KEEPER = address(0xCEE9);
+
+    // ── keeper gas auto-top-up ───────────────────────────────────────────────
+    function test_gasTopUp_refillsOnlyBelowFloor() public {
+        address keeper = KEEPER;
+        vm.deal(address(vault), 1 ether);
+        vault.setGasPolicy(keeper, 0.03 ether, 0.02 ether, 0.1 ether);
+
+        // Below the floor -> topped up toward it, but never more than maxPerTopUp in one go.
+        vm.deal(keeper, 0.005 ether);
+        assertEq(vault.topUpGas(), 0.02 ether, "first top-up is capped at maxPerTopUp");
+        assertEq(keeper.balance, 0.025 ether, "keeper rose by the capped amount");
+        // A second call finishes the job (0.005 short of the floor).
+        assertEq(vault.topUpGas(), 0.005 ether, "sends only the remaining shortfall");
+        assertEq(keeper.balance, 0.03 ether, "keeper is back at the floor");
+
+        // At the floor -> nothing sent, however often it is called.
+        assertEq(vault.topUpGas(), 0, "no top-up while funded");
+        assertEq(vault.topUpGas(), 0, "still nothing");
+        assertEq(keeper.balance, 0.03 ether, "balance untouched");
+
+        // Above the floor -> nothing sent.
+        vm.deal(keeper, 0.5 ether);
+        assertEq(vault.topUpGas(), 0, "never tops up an already-rich keeper");
+    }
+
+    /// PERMISSIONLESS by design: a keeper with no gas can't send the tx that refills itself.
+    /// Anyone may poke it, and the money can still only reach the owner-set recipient.
+    function test_gasTopUp_isPermissionless_butOnlyPaysTheSetRecipient() public {
+        address keeper = KEEPER;
+        vm.deal(address(vault), 1 ether);
+        vault.setGasPolicy(keeper, 0.03 ether, 0.02 ether, 0.1 ether);
+        vm.deal(keeper, 0);
+
+        vm.prank(address(0xBAD)); // a stranger triggers it
+        uint256 sent = vault.topUpGas();
+        assertEq(sent, 0.02 ether, "capped by maxPerTopUp");
+        assertEq(keeper.balance, 0.02 ether, "funds went to the KEEPER, not the caller");
+        assertEq(address(0xBAD).balance, 0, "caller got nothing");
+    }
+
+    function test_gasTopUp_dailyCapBoundsACompromisedKeeper() public {
+        address keeper = KEEPER;
+        vm.deal(address(vault), 5 ether);
+        // Cap the day at 0.05 with a 0.02 per-call ceiling.
+        vault.setGasPolicy(keeper, 0.03 ether, 0.02 ether, 0.05 ether);
+
+        uint256 drained;
+        for (uint256 i; i < 10; i++) {
+            vm.deal(keeper, 0); // keeper burns everything, repeatedly
+            drained += vault.topUpGas();
+        }
+        assertEq(drained, 0.05 ether, "a whole day of abuse is bounded by the daily cap");
+
+        // The window rolls after 24h and the budget returns.
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.deal(keeper, 0);
+        assertEq(vault.topUpGas(), 0.02 ether, "fresh window, fresh budget");
+    }
+
+    function test_buyback_topsUpKeeperFirst() public {
+        address keeper = KEEPER;
+        vm.deal(address(vault), 1 ether);
+        vault.setGasPolicy(keeper, 0.03 ether, 0.02 ether, 0.1 ether);
+        vm.deal(keeper, 0.01 ether);
+
+        vault.buyback();
+        assertEq(keeper.balance, 0.03 ether, "the cron call refilled the wallet that paid for it");
+    }
+
+    function test_gasTopUp_offByDefaultAndWhenDisabled() public {
+        vm.deal(address(vault), 1 ether);
+        assertEq(vault.gasRecipient(), address(0), "off until configured");
+        assertEq(vault.topUpGas(), 0, "no recipient, no spend");
+
+        address keeper = KEEPER;
+        vault.setGasPolicy(keeper, 0.03 ether, 0.02 ether, 0.1 ether);
+        vault.setGasPolicy(address(0), 0, 0, 0); // switched back off
+        vm.deal(keeper, 0);
+        assertEq(vault.topUpGas(), 0, "disabled means disabled");
+    }
+
+    function test_setGasPolicy_ownerOnly() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert();
+        vault.setGasPolicy(address(0xBAD), 1 ether, 1 ether, 1 ether);
+    }
+
     function test_buyback_capsPerSwap() public {
         vm.deal(address(vault), 2 ether);
         vault.setParams(300, 0.5 ether);

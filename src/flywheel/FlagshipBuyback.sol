@@ -54,8 +54,23 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
     /// Per-call swap cap — a large pot is averaged in across cron cycles (default 0.5 ETH).
     uint256 public maxWethPerSwap = 0.5 ether;
 
+    // ── keeper gas auto-top-up ───────────────────────────────────────────────
+    /// @notice The cron wallet whose gas this vault keeps topped up. 0 disables the feature.
+    address public gasRecipient;
+    /// @notice Top up only while the recipient is BELOW this balance (and only up to it).
+    uint256 public gasFloorWei = 0.03 ether;
+    /// @notice Never send more than this in one top-up.
+    uint256 public gasMaxPerTopUpWei = 0.02 ether;
+    /// @notice Never send more than this per rolling 24h — bounds the bleed if the keeper key
+    /// is ever compromised and burns gas on purpose, leaving time to repoint it.
+    uint256 public gasDailyCapWei = 0.1 ether;
+    uint256 public gasSpentInWindow;
+    uint256 public gasWindowStart;
+
     event FeeReceived(address indexed from, uint256 amount);
     event Buyback(uint256 wethIn, uint256 coreOut);
+    event GasPolicySet(address recipient, uint256 floorWei, uint256 maxPerTopUpWei, uint256 dailyCapWei);
+    event GasToppedUp(address indexed recipient, uint256 amount, uint256 newBalance);
     event SeasonPublished(uint256 indexed season, uint256 amount, bytes32 root, uint256 total);
     event DistributorSet(address distributor);
     event ParamsSet(uint16 slippageBps, uint256 maxWethPerSwap);
@@ -108,11 +123,64 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
         emit ParamsSet(slippageBps_, maxWethPerSwap_);
     }
 
+    // ── keeper gas ───────────────────────────────────────────────────────────
+    /// @notice Configure the keeper gas top-up. `recipient` 0 turns it off. Owner-only.
+    function setGasPolicy(address recipient, uint256 floorWei, uint256 maxPerTopUpWei, uint256 dailyCapWei)
+        external
+        onlyOwner
+    {
+        gasRecipient = recipient;
+        gasFloorWei = floorWei;
+        gasMaxPerTopUpWei = maxPerTopUpWei;
+        gasDailyCapWei = dailyCapWei;
+        emit GasPolicySet(recipient, floorWei, maxPerTopUpWei, dailyCapWei);
+    }
+
+    /// @notice Top the keeper back up to `gasFloorWei` if it has fallen below it.
+    ///
+    /// PERMISSIONLESS on purpose: a keeper that has run out of gas cannot send the very
+    /// transaction that would refill it, so gating this on the keeper (or the owner) would
+    /// reintroduce exactly the stall it exists to prevent. There is nothing to steal — funds
+    /// can only ever go to the owner-set `gasRecipient`, only while it is under the floor, only
+    /// up to the floor, and never more than the per-call and per-day caps. Also runs
+    /// automatically inside `buyback()`, so the normal cron self-replenishes.
+    function topUpGas() public returns (uint256 sent) {
+        address r = gasRecipient;
+        if (r == address(0) || gasFloorWei == 0) return 0;
+
+        uint256 bal = r.balance;
+        if (bal >= gasFloorWei) return 0; // still funded — send nothing
+        uint256 need = gasFloorWei - bal;
+        if (need > gasMaxPerTopUpWei) need = gasMaxPerTopUpWei;
+
+        // Rolling 24h budget.
+        if (block.timestamp >= gasWindowStart + 1 days) {
+            gasWindowStart = block.timestamp;
+            gasSpentInWindow = 0;
+        }
+        if (gasDailyCapWei != 0) {
+            uint256 left = gasSpentInWindow >= gasDailyCapWei ? 0 : gasDailyCapWei - gasSpentInWindow;
+            if (need > left) need = left;
+        }
+
+        uint256 avail = address(this).balance;
+        if (need > avail) need = avail;
+        if (need == 0) return 0;
+
+        gasSpentInWindow += need;
+        (bool ok,) = r.call{value: need}("");
+        if (!ok) revert EthTransferFailed();
+        sent = need;
+        emit GasToppedUp(r, need, r.balance);
+    }
+
     // ── the cron call ────────────────────────────────────────────────────────
     /// @notice Buy core with the accumulated fee ETH (capped per call). Owner-only; the
     /// min-out floor is self-quoted from the pool spot minus fee+slippage, so the cron
     /// needs no arguments and a mid-flight price move just reverts (retry next cycle).
+    /// Tops the keeper's gas up FIRST, so the wallet paying for this call is refilled by it.
     function buyback() external onlyOwner nonReentrant returns (uint256 coreOut) {
+        topUpGas();
         uint256 amountIn = address(this).balance;
         if (amountIn > maxWethPerSwap) amountIn = maxWethPerSwap;
         if (amountIn == 0) revert NothingToBuy();
