@@ -58,10 +58,34 @@ contract MockUsdg6 is ERC20 {
 
 /// @notice Minimal V3 factory stand-in: records which (tokenA, tokenB, fee) pools
 /// "exist" so the launchpad's reward-pool validation can pass.
+/// @notice Minimal stand-in for a V3 pool. The launchpad now reads `slot0` to prove a reward
+/// venue is actually INITIALIZED (a `createPool` without `initialize` leaves a deployed pool at
+/// price 0 that reverts on every swap, which would strand the token's mechanism WETH forever),
+/// so venue pools in tests have to be real contracts with a real price.
+contract MockV3PoolT {
+    uint160 public sqrtPriceX96;
+
+    constructor(uint160 p) {
+        sqrtPriceX96 = p;
+    }
+
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (sqrtPriceX96, int24(0), uint16(0), uint16(0), uint16(0), uint8(0), true);
+    }
+}
+
 contract MockV3FactoryT {
     mapping(bytes32 => address) internal _pools;
 
-    function setPool(address a, address b, uint24 fee, address pool) external {
+    /// Registers a REAL initialized stub pool. The `pool` argument is only a label now — the
+    /// launchpad checks the pool's price, so a bare placeholder address can no longer stand in.
+    function setPool(address a, address b, uint24 fee, address) external {
+        _pools[_k(a, b, fee)] = address(new MockV3PoolT(uint160(1) << 96));
+    }
+
+    /// Register an address verbatim — for testing that an UNINITIALIZED or non-pool venue is
+    /// rejected at launch rather than accepted and stranded.
+    function setPoolRaw(address a, address b, uint24 fee, address pool) external {
         _pools[_k(a, b, fee)] = pool;
     }
 
@@ -866,6 +890,8 @@ contract LaunchFairV4Test is Test, Deployers {
         // Commit snapshots holdings at this block. The pot is NOT reserved (it rolls) and
         // the cycle advances only when a draw actually wins.
         uint256 round = 9_999_999;
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(token, round);
         assertEq(LaunchTokenV2(token).lotteryEpoch(), epoch, "session unchanged at commit");
         assertEq(dist.pendingWeth(token), pot, "pot live at commit (not reserved)");
@@ -939,6 +965,8 @@ contract LaunchFairV4Test is Test, Deployers {
         locker.claim(token);
         assertGt(dist.pendingWeth(token), 0, "pot funded");
 
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(token, 42);
         vrf.deliver(42, keccak256("beacon"));
         dist.settleDraw(token, _self(), 0);

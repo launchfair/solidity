@@ -18,12 +18,14 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 import {LaunchTokenV2} from "../LaunchTokenV2.sol";
 import {TokenDeployerV2} from "../TokenDeployerV2.sol";
 import {LaunchFairV4FeeLocker} from "./LaunchFairV4FeeLocker.sol";
 import {LiquidityMath} from "./LiquidityMath.sol";
-import {IUniswapV3Factory} from "../../interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, IUniswapV3Pool} from "../../interfaces/IUniswapV3.sol";
 import {IPerpsVenue} from "./IPerpsVenue.sol";
 
 interface IDistributorV4Register {
@@ -58,6 +60,9 @@ interface IRouterGate {
 }
 
 contract LaunchFairV4 is Ownable, ReentrancyGuard {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     using SafeERC20 for IERC20;
 
     IPoolManager public immutable poolManager;
@@ -119,12 +124,25 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     mapping(address stock => uint256) public quoteInitialPrice;
     event QuoteInitialPriceSet(address indexed stock, uint256 quoteWeiPerToken);
 
-    /// @notice KILL SWITCH for the no-approve sell: un-trust (or re-trust) a router on a token.
+    /// @notice KILL SWITCH for the no-approve sell: un-trust a router on a token.
     /// `trustedSpender` makes the routers read as infinitely approved, and a holder cannot revoke
     /// that with approve(0) — so without this, a router found exploitable later would leave every
     /// holder of every launched token exposed with nothing on-chain able to stop it.
-    function setTokenTrustedSpender(address token, address spender, bool trusted) external onlyOwner {
-        LaunchTokenV2(token).setTrustedSpender(spender, trusted);
+    ///
+    /// REVOKE-ONLY on purpose. It used to take a bool, which made the same switch a way to GRANT
+    /// infinite allowance over every holder of any launched token to an arbitrary address: one
+    /// call plus `transferFrom` drains them all, and holders have no on-chain defence because
+    /// `approve(0)` cannot revoke a trusted spender. Owner power here is now strictly subtractive.
+    function untrustTokenSpender(address token, address spender) external onlyOwner {
+        LaunchTokenV2(token).setTrustedSpender(spender, false);
+    }
+
+    /// @notice Restore trust after a revoke — ONLY for this platform's own routers, which are the
+    /// only addresses the launch flow ever trusted in the first place. A false alarm is
+    /// recoverable; granting a fresh address is not possible.
+    function retrustTokenRouter(address token, address spender) external onlyOwner {
+        if (spender != swapRouter && spender != stockPairRouter) revert QuoteNotAllowed();
+        LaunchTokenV2(token).setTrustedSpender(spender, true);
     }
 
     /// @notice Set a quote's launch price (quote-wei per whole token; 0 restores the default).
@@ -673,7 +691,19 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     /// an unsettleable non-WETH debt / route to a rigged pool (V4, audit L-02).
     function _validateVenue(address asset, bool isV3, uint24 v3Fee, PoolKey calldata key) internal view {
         if (isV3) {
-            if (v3Factory.getPool(weth, asset, v3Fee) == address(0)) revert InvalidRewardPool();
+            address pool = v3Factory.getPool(weth, asset, v3Fee);
+            if (pool == address(0)) revert InvalidRewardPool();
+            // Existing is not the same as tradeable: `createPool` without `initialize` leaves a
+            // deployed pool at price 0 that reverts on every swap. Venues are set once at launch,
+            // so accepting one would send this token's mechanism WETH into a permanent dead end.
+            // Low-level, so an address that is not a V3 pool at all (no code, or a different
+            // ABI) fails as InvalidRewardPool rather than as a bare revert the caller can't
+            // interpret. try/catch is not enough here: it does not catch return-data decode
+            // failures, which is exactly what a call to a codeless address produces.
+            (bool ok, bytes memory data) = pool.staticcall(abi.encodeWithSelector(IUniswapV3Pool.slot0.selector));
+            if (!ok || data.length < 224) revert InvalidRewardPool();
+            (uint160 sqrtP,,,,,,) = abi.decode(data, (uint160, int24, uint16, uint16, uint16, uint8, bool));
+            if (sqrtP == 0) revert InvalidRewardPool();
         } else {
             address c0 = Currency.unwrap(key.currency0);
             address c1 = Currency.unwrap(key.currency1);
@@ -683,6 +713,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             // holders' reward WETH could be routed into a pool the creator rigs. Only plain,
             // hookless pools qualify as a reward venue.
             if (address(key.hooks) != address(0)) revert InvalidRewardPool();
+            // Same as the V3 branch: the key must name a pool that is actually initialized.
+            (uint160 sqrtP,,,) = poolManager.getSlot0(key.toId());
+            if (sqrtP == 0) revert InvalidRewardPool();
         }
     }
 

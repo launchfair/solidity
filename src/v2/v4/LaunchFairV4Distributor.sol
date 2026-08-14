@@ -63,9 +63,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     address public feeHook;
     /// @notice Every contract authorized to call `notify` (both fee hooks + anything future).
     mapping(address => bool) public isFeeSource;
-    /// @notice Ceilings so a creator can't park a payout out of reach. ~1 week of L1 blocks.
+    /// @notice Ceilings so a creator can't park a payout out of reach.
     uint256 public constant MAX_PAYOUT_THRESHOLD = 100 ether;
-    uint256 public constant MAX_PAYOUT_INTERVAL_BLOCKS = 50_400; // the WethFeeHook (an alternate fee source that may notify() the pot)
+    /// ~7 days: `block.number` here tracks L1 (~12s), not the ~100ms L2 block.
+    uint256 public constant MAX_PAYOUT_INTERVAL_BLOCKS = 50_400;
     // Mode.Perps: the venue is PINNED per token at launch (via registerPerps) — so a later global
     // change can never brick an existing token, and the launch-time and payout-time venues can't diverge.
     mapping(address token => address) public perpsVenueOf;
@@ -170,6 +171,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event LockerSet(address locker);
     event FeeHookSet(address feeHook);
     event FeeSourceSet(address indexed source, bool allowed);
+    event PendingWethRescued(address indexed token, address indexed to, uint256 amount);
     event PerpsVenueSet(address indexed token, address venue);
     event RegistrarSet(address registrar);
     event ProcessorSet(address indexed processor, bool allowed);
@@ -258,7 +260,16 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// @notice Authorize the WethFeeHook as an additional fee source that may `notify()` the pot
     /// (alongside the locker) — so a mode token launched through the hook funds its own mechanism.
     /// Owner-settable (re-settable, since the hook can be re-mined/redeployed); 0 disables it.
+    /// Setting a new hook (or 0) REVOKES the previous one: `notify` credits a token's pot without
+    /// the WETH having to arrive, and the pot is a single pool shared across all tokens, so a
+    /// retired hook the operator believed disabled could otherwise still inflate any token's
+    /// balance and drain WETH belonging to others.
     function setFeeHook(address feeHook_) external onlyOwner {
+        address prev = feeHook;
+        if (prev != address(0) && prev != feeHook_) {
+            isFeeSource[prev] = false;
+            emit FeeSourceSet(prev, false);
+        }
         feeHook = feeHook_;
         if (feeHook_ != address(0)) isFeeSource[feeHook_] = true; // keep the legacy setter working
         emit FeeHookSet(feeHook_);
@@ -330,6 +341,22 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// @notice The venue (0 = V4, 1 = V3) a token's reward `asset` is bought on.
     function buybackVenue(address token, address asset) external view returns (uint8) {
         return uint8(_buyback[token][asset].venue);
+    }
+
+    /// @notice Recover a token's pending mechanism WETH when its venue is permanently
+    /// unroutable — an uninitialized pool accepted before `_validateVenue` checked, or a reward
+    /// pool whose liquidity was later pulled (`process` then reverts on slippage forever).
+    /// Venues are registered once at launch, so without this the WETH is dead: this contract has
+    /// no withdrawal of any kind, unlike FlagshipBuyback and SeasonMerkleDistributor.
+    /// Bounded by that token's own `pendingWeth`, so it can never touch another token's pot.
+    function rescuePendingWeth(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 pend = pendingWeth[token];
+        if (amount > pend) amount = pend;
+        if (amount == 0) return;
+        pendingWeth[token] = pend - amount;
+        IERC20(weth).safeTransfer(to, amount);
+        emit PendingWethRescued(token, to, amount);
     }
 
     /// @notice Called by the V4 FeeLocker after forwarding `amount` WETH here.
@@ -535,9 +562,10 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// `drandRound`. The future-round requirement is enforced ON-CHAIN (audit C-01): a
     /// round whose beacon is already produced could be ground by the operator to choose
     /// the winner, so `drandRound` must exceed the round currently being produced (bound
-    /// to `block.timestamp` via drand's genesis+period). Ticket sales for this draw end
-    /// here: the epoch is advanced so later buys count toward the next session, and the
-    /// current pot is reserved as the prize. Reverts on an empty session.
+    /// to `block.timestamp` via drand's genesis+period). Eligibility for this draw is frozen
+    /// at `block.number - 1` (see below); the epoch is NOT advanced here (it advances only when
+    /// a jackpot is actually won) and the pot is NOT reserved (a miss rolls it over, and the
+    /// winner takes the live pot at settle). Reverts on an empty session.
     function commitDraw(address token, uint256 drandRound) external returns (uint256 drawId) {
         if (msg.sender != drawOperator) revert OnlyDrawOperator();
         LaunchTokenV2 t = LaunchTokenV2(token);
@@ -550,11 +578,22 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
         if (drandRound <= _currentDrandRound()) revert RoundNotFuture();
 
         uint256 epoch = t.lotteryEpoch();
-        // Holdings-weighted: the odds pool is every holder's current balance. Snapshot
-        // THIS block — the winner is drawn from holdings frozen here, before the future
-        // round's beacon exists, so nobody can buy to steer a known result.
-        if (t.totalEligibleSupply() == 0) revert NoTickets();
-        uint256 snapshotBlock = block.number;
+        // Holdings-weighted: the odds pool is every holder's balance at the snapshot.
+        //
+        // Snapshot the PREVIOUS block, not this one. On this Nitro chain `block.number` is the
+        // L1 block number: it advances roughly every 12 seconds while ~120 L2 blocks fit inside
+        // one value, and the balance checkpoints are keyed by it, with a repeated key
+        // OVERWRITING. Snapshotting `block.number` therefore captures balances at the END of the
+        // current 12-second window, not at commit — so anyone watching for `commitDraw` could
+        // buy a large multiple of the float in the same window, be recorded at the inflated
+        // balance, and sell the moment it ticks over, winning the pot near-arbitrarily for the
+        // cost of a round trip. `block.number - 1` is already sealed when this executes.
+        if (block.number == 0) revert TimerNotElapsed();
+        uint256 snapshotBlock = block.number - 1;
+        // Check the SNAPSHOT's supply, not the live one: they differ now that the snapshot is
+        // the previous block, and an empty snapshot would otherwise divide by zero at settle
+        // (with the draw already committed and the timer reset) instead of failing here.
+        if (t.totalEligibleAt(snapshotBlock) == 0) revert NoTickets();
 
         lastPayoutBlock[token] = block.number;  // reset the timer that paces draw attempts
         // The pot is NOT reserved or zeroed here: on a miss it rolls over and keeps

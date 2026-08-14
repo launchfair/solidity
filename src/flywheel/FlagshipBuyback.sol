@@ -95,6 +95,9 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
             address(weth_) == address(0) || address(factory_) == address(0) || address(v3Router_) == address(0)
                 || address(core_) == address(0)
         ) revert ZeroAddress();
+        // `poolFee` is immutable with no setter: a tier at or above (100% - slippage) makes the
+        // min-out floor underflow and bricks `buyback` permanently.
+        if (uint256(poolFee_) / 100 + 2_000 >= BPS) revert BadParams();
         weth = weth_;
         factory = factory_;
         v3Router = v3Router_;
@@ -184,10 +187,17 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
         // BEST-EFFORT: topUpGas reverts if the recipient rejects ETH, and it runs first — so a
         // misconfigured recipient would brick every buyback. The buyback matters more than the
         // refuel; swallow a failed top-up and carry on.
-        try this.topUpGas() returns (uint256) {} catch {}
+        uint256 refuelled;
+        try this.topUpGas() returns (uint256 sent) { refuelled = sent; } catch {}
         uint256 amountIn = address(this).balance;
         if (amountIn > maxWethPerSwap) amountIn = maxWethPerSwap;
-        if (amountIn == 0) revert NothingToBuy();
+        // If the top-up consumed the whole balance, reverting here would ROLL THE REFUEL BACK —
+        // the one case where the keeper most needs it to stick. Return quietly instead; the
+        // refuel is the useful work this call did.
+        if (amountIn == 0) {
+            if (refuelled != 0) return 0;
+            revert NothingToBuy();
+        }
 
         uint256 minOut = _floor(amountIn);
         weth.deposit{value: amountIn}();

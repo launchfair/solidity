@@ -61,6 +61,13 @@ interface IUniswapV3Pool {
             uint8 feeProtocol,
             bool unlocked
         );
+    /// Cumulative ticks at each `secondsAgos` offset — the basis for a TWAP.
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+    /// Grow the observation ring so a TWAP over `next` slots becomes readable. Permissionless.
+    function increaseObservationCardinalityNext(uint16 next) external;
 }
 
 interface INonfungiblePositionManager {

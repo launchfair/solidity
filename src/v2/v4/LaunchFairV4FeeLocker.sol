@@ -61,6 +61,8 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     }
 
     mapping(address token => Position) internal _positions;
+    /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
+    mapping(address => uint256) public owed;
 
     uint8 private constant ACTION_LOCK = 1;
     uint8 private constant ACTION_CLAIM = 2;
@@ -80,7 +82,11 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     event TreasurySet(address treasury);
     event FlagshipSinkSet(address flagshipSink);
     event FlagshipTradeBpsSet(uint16 tradeBps);
-    event PayoutRerouted(address indexed intended, address indexed fallbackTo, uint256 amount);
+    /// @notice A push to the creator failed; the value is claimable with `withdrawOwed`.
+    event PayoutOwed(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
+    /// @notice One token in a `claimMany` batch reverted and was skipped (the rest still paid).
+    event ClaimSkipped(address indexed token);
 
     error OnlyLaunchpad();
     error OnlyPoolManager();
@@ -178,11 +184,21 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     /// here and the shared body runs unguarded per token.)
     function claimMany(address[] calldata tokens) external nonReentrant returns (uint256 claimed) {
         for (uint256 i; i < tokens.length; i++) {
-            if (_claimable(tokens[i])) {
-                _claim(tokens[i]);
-                claimed++;
-            }
+            if (!_claimable(tokens[i])) continue;
+            // FULLY tolerant: `_claimable` only screens "not ours" and "not WETH-paired", but a
+            // claim can still revert for reasons that have nothing to do with the caller — a
+            // reverting treasury or flagship sink, a distributor that rejects the notify. Those
+            // used to take the whole batch down, which is exactly what this function exists to
+            // prevent, so each token is isolated in its own self-call.
+            try this.claimOne(tokens[i]) { claimed++; } catch { emit ClaimSkipped(tokens[i]); }
         }
+    }
+
+    /// @dev One token's claim, isolated for `claimMany`. Self-call only — the reentrancy guard is
+    /// already held by `claimMany`, so this must not (and does not) take it again.
+    function claimOne(address token) external {
+        if (msg.sender != address(this)) revert OnlyLaunchpad();
+        _claim(token);
     }
 
     /// @dev Whether `_claim` would succeed for `token` (position exists + WETH-paired).
@@ -266,7 +282,7 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
                 if (wethToTreasury > 0) _payEth(treasury, wethToTreasury);
                 if (wethToDev > 0) {
                     address dev = ICreatorRegistryV4(launchpad).creatorOf(token);
-                    _payEthOrTreasury(dev == address(0) ? treasury : dev, wethToDev);
+                    _payEthOrCredit(dev == address(0) ? treasury : dev, wethToDev);
                 }
                 if (wethToFlagship > 0) _payEth(sink, wethToFlagship);
                 if (wethToMechanism > 0) {
@@ -289,16 +305,30 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     /// @dev Pay a recipient that might reject ETH (a creator address is arbitrary — a contract
     /// with no receive(), a Safe variant, a self-destructed address). Reverting here would strand
     /// the WHOLE distribution forever: treasury's and the flagship's slices are in the same call,
-    /// and `creatorOf` is fixed at launch with no way to change it. Fall back to the treasury so
-    /// one bad address can never freeze a token's fees.
-    function _payEthOrTreasury(address to, uint256 value) private {
+    /// and `creatorOf` is fixed at launch with no way to change it.
+    ///
+    /// On failure the value is CREDITED, never handed to the treasury: the old fallback silently
+    /// and permanently confiscated the fee share of any creator whose wallet does real work on
+    /// receipt (a revenue splitter, a forwarder, a 7702 delegate), with no debt recorded and no
+    /// way to recover it. The stipend covers normal wallets and multisigs; the rest pulls.
+    function _payEthOrCredit(address to, uint256 value) private {
         if (value == 0) return;
-        (bool ok,) = to.call{value: value, gas: 30_000}("");
+        (bool ok,) = to.call{value: value, gas: 100_000}("");
         if (!ok) {
-            (bool ok2,) = treasury.call{value: value}("");
-            if (!ok2) revert EthTransferFailed();
-            emit PayoutRerouted(to, treasury, value);
+            owed[to] += value;
+            emit PayoutOwed(to, value);
         }
+    }
+
+    /// @notice Withdraw fee shares that could not be pushed. Anyone may trigger it for any
+    /// address; the ETH only ever goes to the address that is owed it.
+    function withdrawOwed(address to) external nonReentrant returns (uint256 amount) {
+        amount = owed[to];
+        if (amount == 0) return 0;
+        owed[to] = 0;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
+        emit OwedWithdrawn(to, amount);
     }
 
     /// @dev Accept ETH only from unwrapping WETH during a claim.

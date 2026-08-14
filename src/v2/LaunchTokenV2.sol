@@ -415,10 +415,23 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         // could brick a launch for the price of one dust buy. Require a real float first; the
         // funder simply retries once the token has holders.
         if (shares < MIN_SHARES_FOR_FUNDING) revert NoShares();
+        // The share floor bounds the wrong quantity. What actually has to stay in range is
+        // `magnifiedDividendPerShare * (a holder's balance)`: that product is cast to int256 in
+        // _syncShare/accumulativeDividendOf, so past 2**255 corrections wrap negative and every
+        // withdrawable figure turns to garbage, and past 2**256 the multiply reverts and the
+        // token is bricked forever with its liquidity locked. WETH can never get there, but a
+        // Reward token may name ANY creator-chosen asset with a WETH pool, and a high-supply
+        // low-value 18-decimal asset reaches it just above the share floor. Bound the growth
+        // itself: keep the product below 2**255 against the largest balance that can exist.
+        uint256 delta = (received * MAGNITUDE) / shares;
+        uint256 supply = totalSupply() + _reflectionHeld;
+        if (supply != 0 && magnifiedDividendPerShare[asset] + delta > type(uint256).max / 2 / supply) {
+            revert NoShares();
+        }
         // Increasing: the pulled THIS-token is the reflection pool (netted out of
         // balanceOf(this)); holders' balances grow immediately, no push needed.
         if (asset == address(this)) _reflectionHeld += received;
-        magnifiedDividendPerShare[asset] += (received * MAGNITUDE) / shares;
+        magnifiedDividendPerShare[asset] += delta;
         totalDistributedOf[asset] += received;
         emit DividendsDistributed(asset, received);
     }

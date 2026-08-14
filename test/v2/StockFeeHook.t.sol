@@ -15,11 +15,24 @@ import {StockFeeHook} from "../../src/v2/v4/StockFeeHook.sol";
 import {IV3SwapRouter, IUniswapV3Factory} from "../../src/interfaces/IUniswapV3.sol";
 import {HookMockToken} from "./WethFeeHook.t.sol";
 
-/// Launchpad view mock: one allowed stock quote, a direct-hop fee tier, a token creator.
+/// Launchpad view mock: one allowed stock quote, a direct-hop fee tier, and the LAUNCH RECORD
+/// the hook now resolves the quote from (`getLaunch`). The hook no longer trusts the pool key,
+/// because V4 `initialize` is permissionless: anyone could otherwise open TOKEN/<other stock>
+/// naming the hook, swap 1 wei to squat the token's quote slot, and permanently kill every fee
+/// on the real pool. So the mock has to record which pool is actually the launch pool.
 contract MockStockLaunchpad {
+    struct LaunchRec {
+        address creator;
+        PoolKey key;
+        uint24 fee;
+        address quoteToken;
+        bool exists;
+    }
+
     mapping(address => bool) public allowedQuote;
     mapping(address => uint24) public quoteV3Fee;
     mapping(address => address) public creatorOf;
+    mapping(address => LaunchRec) internal _launches;
 
     function setQuote(address stock, bool ok, uint24 fee) external {
         allowedQuote[stock] = ok;
@@ -28,6 +41,22 @@ contract MockStockLaunchpad {
 
     function setCreator(address token, address dev) external {
         creatorOf[token] = dev;
+        _launches[token].creator = dev;
+        _launches[token].exists = dev != address(0);
+    }
+
+    /// Record the pool the launchpad "created" for `token` — the only one that may charge fees.
+    function setLaunchPool(address token, PoolKey memory key, address quoteToken) external {
+        _launches[token].key = key;
+        _launches[token].quoteToken = quoteToken;
+        _launches[token].exists = true;
+        if (_launches[token].creator == address(0)) {
+            _launches[token].creator = creatorOf[token];
+        }
+    }
+
+    function getLaunch(address token) external view returns (LaunchRec memory) {
+        return _launches[token];
     }
 }
 
@@ -148,6 +177,7 @@ contract StockFeeHookTest is Test, Deployers {
             : (Currency.wrap(address(stock)), Currency.wrap(address(token)));
         poolKey = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(hookAddr)});
         manager.initialize(poolKey, SQRT_PRICE_1_1);
+        pad.setLaunchPool(address(token), poolKey, address(stock));
 
         token.approve(address(modifyLiquidityRouter), type(uint256).max);
         stock.approve(address(modifyLiquidityRouter), type(uint256).max);
@@ -373,8 +403,11 @@ contract StockFeeHookTest is Test, Deployers {
         assertEq(hook.quoteOf(address(foreign)), address(0), "no quote recorded");
     }
 
-    /// A creator that rejects ETH must not freeze the treasury's and flagship's shares too.
-    function test_creatorRejectingEth_reroutesInsteadOfStranding() public {
+    /// A creator that rejects ETH must not freeze the treasury's and flagship's shares too —
+    /// and must not FORFEIT its own share either. The push fails, the value is credited, and the
+    /// creator can pull it later; handing it to the treasury silently and permanently
+    /// confiscated the fee share of any creator whose wallet does real work on receipt.
+    function test_creatorRejectingEth_creditsInsteadOfStranding() public {
         RejectsEth badDev = new RejectsEth();
         HookMockToken t2 = new HookMockToken("BAD", "BAD");
         t2.mint(address(this), 1_000_000_000 ether);
@@ -384,6 +417,7 @@ contract StockFeeHookTest is Test, Deployers {
             : (Currency.wrap(address(stock)), Currency.wrap(address(t2)));
         PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
         manager.initialize(k, SQRT_PRICE_1_1);
+        pad.setLaunchPool(address(t2), k, address(stock));
         t2.approve(address(modifyLiquidityRouter), type(uint256).max);
         modifyLiquidityRouter.modifyLiquidity(
             k,
@@ -406,7 +440,60 @@ contract StockFeeHookTest is Test, Deployers {
         uint256 treasBefore = TREASURY.balance;
         uint256 out = hook.distribute(address(t2), 0); // must NOT revert
         assertGt(out, 0, "distribution completed despite the creator rejecting ETH");
-        assertGt(TREASURY.balance - treasBefore, (out * 2500) / 10_000, "dev share rerouted to treasury");
+        assertEq(TREASURY.balance - treasBefore, (out * 2500) / 10_000, "treasury got ONLY its own share");
+        uint256 devShare = (out * 2500) / 10_000;
+        assertEq(hook.owed(address(badDev)), devShare, "the creator's share is owed to him, not confiscated");
+
+        // And it is genuinely recoverable once the creator can accept ETH.
+        badDev.setAccept(true);
+        hook.withdrawOwed(address(badDev)); // permissionless: only ever pays the owed address
+        assertEq(address(badDev).balance, devShare, "creator pulled his share");
+        assertEq(hook.owed(address(badDev)), 0, "owed cleared");
+    }
+
+    /// REGRESSION (audit HIGH): the quote used to be whatever the FIRST swap presented, so
+    /// anyone could open TOKEN/<another allowed stock> naming this hook, swap 1 wei to squat the
+    /// token's quote slot, and leave the REAL pool mismatching forever — every fee on that token
+    /// permanently dead (treasury, creator, mechanism and flagship alike) with no setter to
+    /// recover it. The quote now comes from the launchpad's own launch record, so a squatted
+    /// pool is simply not ours and the real pool keeps charging.
+    function test_squattedPool_cannotKillTheRealPoolsFees() public {
+        // A second allowed stock the attacker pairs the SAME token against.
+        HookMockToken stock2 = new HookMockToken("NVDA", "NVDA");
+        stock2.mint(address(this), 1_000_000_000 ether);
+        pad.setQuote(address(stock2), true, 3000);
+
+        (Currency a0, Currency a1) = address(token) < address(stock2)
+            ? (Currency.wrap(address(token)), Currency.wrap(address(stock2)))
+            : (Currency.wrap(address(stock2)), Currency.wrap(address(token)));
+        PoolKey memory squat = PoolKey({currency0: a0, currency1: a1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
+        manager.initialize(squat, SQRT_PRICE_1_1); // permissionless — no beforeInitialize gate
+        token.approve(address(modifyLiquidityRouter), type(uint256).max);
+        stock2.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            squat,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 100_000 ether, salt: bytes32(0)}),
+            ""
+        );
+        bool s2IsC0 = Currency.unwrap(squat.currency0) == address(stock2);
+        stock2.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            squat,
+            IPoolManager.SwapParams({
+                zeroForOne: s2IsC0,
+                amountSpecified: -int256(1 ether),
+                sqrtPriceLimitX96: s2IsC0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(hook.quoteOf(address(token)), address(0), "the squatter never claimed the quote slot");
+
+        // The real pool still charges, in the real quote.
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 100 ether);
+        assertGt(hook.accrued(address(token)), 0, "real pool still earns its fee");
+        assertEq(hook.quoteOf(address(token)), address(stock), "quote is the launch record's, not the squatter's");
     }
 
     function test_feeCap_andSplitSum() public {
@@ -476,6 +563,7 @@ contract StockFeeHookTest is Test, Deployers {
             : (Currency.wrap(address(stock)), Currency.wrap(address(mtok)));
         PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
         manager.initialize(k, SQRT_PRICE_1_1);
+        pad.setLaunchPool(address(mtok), k, address(stock));
         mtok.approve(address(modifyLiquidityRouter), type(uint256).max);
         modifyLiquidityRouter.modifyLiquidity(
             k,
@@ -510,8 +598,14 @@ contract StockFeeHookTest is Test, Deployers {
 
 /// Refuses every incoming ETH transfer — stands in for a creator address that can't receive.
 contract RejectsEth {
+    bool public accept;
+
+    function setAccept(bool a) external {
+        accept = a;
+    }
+
     receive() external payable {
-        revert("nope");
+        if (!accept) revert("nope");
     }
 }
 

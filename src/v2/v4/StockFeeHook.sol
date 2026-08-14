@@ -17,11 +17,23 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 
 import {IV3SwapRouter, IUniswapV3Factory, IUniswapV3Pool} from "../../interfaces/IUniswapV3.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+
+/// The launchpad's per-token launch record. Field order must match LaunchFairV4.Launch exactly.
+struct LaunchView {
+    address creator;
+    PoolKey key;
+    uint24 fee;
+    address quoteToken; // 0 for WETH-paired; the stock for stock-paired launches
+    bool exists;
+}
 
 interface ILaunchpadStockView {
     function allowedQuote(address stock) external view returns (bool);
     function quoteV3Fee(address stock) external view returns (uint24);
     function creatorOf(address token) external view returns (address);
+    /// The AUTHORITATIVE record of the pool this launchpad created for `token`.
+    function getLaunch(address token) external view returns (LaunchView memory);
 }
 
 interface IStockRoutesView {
@@ -87,7 +99,14 @@ contract StockFeeHook is IHooks, Ownable2Step {
 
     mapping(PoolId => PoolInfo) public poolInfo;
     mapping(address token => uint256) public accrued; // in the token's quote stock
+    /// @dev TWAP window for the claim floor (30 min) — long enough that moving it costs far
+    /// more than the fee batch being converted.
+    uint32 internal constant TWAP_WINDOW = 1800;
     mapping(address token => address) public quoteOf;
+    /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
+    mapping(address => uint256) public owed;
+    /// @dev Pools resolved once as not-ours (foreign or quote-squatted) — skip re-resolving.
+    mapping(PoolId => bool) internal _foreignPool;
 
     // ── split & destinations (all settable — a misconfig is never terminal) ──
     address public treasury; // fallback for every unset destination
@@ -120,7 +139,11 @@ contract StockFeeHook is IHooks, Ownable2Step {
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
     event DistributorSet(address distributor);
     event ClaimConfigSet(address v3Factory, uint16 slippageBps);
-    event PayoutRerouted(address indexed intended, address indexed fallbackTo, uint256 amount);
+    /// @notice A push to the creator failed and the value is now claimable with `withdrawOwed`.
+    event PayoutOwed(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
+    /// @notice The distributor rejected the mechanism credit, so it went to the flagship instead.
+    event MechanismFoldedToFlagship(address indexed token, uint256 toFlagship);
     event DestinationsSet(address treasury, address flagshipSink);
 
     error NotPoolManager();
@@ -224,36 +247,46 @@ contract StockFeeHook is IHooks, Ownable2Step {
         return address(stockRouter);
     }
 
-    /// @dev Resolve (and cache) which side of the pool is the stock quote. Resolution uses the
-    /// launchpad's quote allow-list ONCE per pool; after that the cache is authoritative, so
-    /// un-allowing a stock later never makes its live pools trade fee-free. Returns a zero quote
-    /// for pools where neither side is an allowed stock (fee is skipped, swap proceeds).
+    /// @dev Resolve (and cache) which side of the pool is the stock quote.
+    ///
+    /// The quote is taken from the LAUNCHPAD'S OWN LAUNCH RECORD, and this pool must BE the pool
+    /// the launchpad created. Deriving it from the key instead is not safe: `PoolManager.initialize`
+    /// is permissionless and this hook has no `beforeInitialize` gate, so anyone can open
+    /// `TOKEN/<some other allowed stock>` naming this hook and swap 1 wei through it. With a
+    /// first-swap-wins cache that squats the token's quote slot forever, and the REAL pool then
+    /// mismatches on every swap and trades fee-free permanently — a free, unrecoverable kill on
+    /// every fee for that token (treasury, creator, mechanism and flagship alike). Matching the
+    /// pool id against the launch record makes a squatted pool simply not ours.
+    ///
+    /// `accrued[token]` is a bare scalar while the fees behind it are ERC-6909 claims of this
+    /// pool's quote, so a token must never be seen with two different quotes; anchoring to the
+    /// launch record gives exactly one pool per token by construction.
     function _pool(PoolKey calldata key) internal returns (address token, address quote) {
         PoolId id = key.toId();
         PoolInfo memory p = poolInfo[id];
         if (p.quote != address(0)) return (p.token, p.quote);
+        // Negative cache: foreign/squatted pools resolve once, then short-circuit (gas only).
+        if (_foreignPool[id]) return (address(0), address(0));
+
         address c0 = Currency.unwrap(key.currency0);
         address c1 = Currency.unwrap(key.currency1);
         if (launchpad.allowedQuote(c0)) (token, quote) = (c1, c0);
         else if (launchpad.allowedQuote(c1)) (token, quote) = (c0, c1);
-        else return (address(0), address(0));
+        else return _reject(id);
 
-        // Only ever charge for pools of tokens THIS launchpad created. V4 initialize is
-        // permissionless and anyone can name this hook in a key, so without this an outsider
-        // could open pools that write into our accrual bookkeeping.
-        if (launchpad.creatorOf(token) == address(0)) return (address(0), address(0));
+        LaunchView memory L = launchpad.getLaunch(token);
+        // Ours, stock-paired, same quote, and THE launch pool — all four, or we charge nothing.
+        if (!L.exists || L.creator == address(0) || L.quoteToken != quote) return _reject(id);
+        if (PoolId.unwrap(L.key.toId()) != PoolId.unwrap(id)) return _reject(id);
 
-        // `accrued[token]` is a bare scalar but the fees behind it are ERC-6909 claims of THIS
-        // pool's quote. If a token could be seen with two different quotes, `quoteOf` would be
-        // overwritten and `distribute` would burn claims of the wrong currency — stranding that
-        // token's fees, or redeeming claims belonging to other tokens. So the quote is
-        // WRITE-ONCE per token: a second pool pairing the same token against a different stock
-        // simply trades fee-free rather than corrupting the first pool's accounting.
-        address known = quoteOf[token];
-        if (known == address(0)) quoteOf[token] = quote;
-        else if (known != quote) return (address(0), address(0));
-
+        quoteOf[token] = quote;
         poolInfo[id] = PoolInfo({token: token, quote: quote});
+    }
+
+    /// @dev Mark a pool as none of ours so later swaps skip the three external reads.
+    function _reject(PoolId id) private returns (address, address) {
+        _foreignPool[id] = true;
+        return (address(0), address(0));
     }
 
     // ── the fee: the quote (stock) leg, all four swap cases ──────────────────────
@@ -334,12 +367,16 @@ contract StockFeeHook is IHooks, Ownable2Step {
         return claimFeesWithMin(token, 0);
     }
 
-    /// @notice `claimFees` with an explicit floor. The self-quoted floor is read from the SAME
-    /// pools the conversion then swaps through, in the SAME transaction — so a caller who moves
-    /// the price first has that manipulated price baked into their own floor, and it constrains
-    /// nothing. Passing `minWethOut` (quoted off-chain, a block earlier) is the real protection;
-    /// the on-chain floor is only a backstop for callers who pass 0. The larger of the two wins,
-    /// so this can never be used to LOWER the guard.
+    /// @notice `claimFees` with an explicit floor. The larger of the caller's value and the
+    /// self-quote wins, so this can never be used to LOWER the guard.
+    ///
+    /// The self-quote takes the HIGHER of each hop's spot price and its 30-minute TWAP. Spot
+    /// alone was read from the same pools the conversion then swaps through, in the same
+    /// transaction, so a caller who pushed the price down first had that manipulated price baked
+    /// into their own floor and it constrained nothing: push, claim, back-run. A TWAP cannot be
+    /// moved inside one transaction, and taking the higher of the two means a manipulated-low
+    /// spot is simply ignored. If a pool is too young to serve a TWAP the floor falls back to
+    /// spot (the deploy script grows the cardinality of the stock pools for this reason).
     function claimFeesWithMin(address token, uint256 minWethOut) public returns (uint256 wethOut) {
         if (address(claimV3Factory) == address(0)) revert NotConfigured();
         uint256 amount = accrued[token];
@@ -389,12 +426,38 @@ contract StockFeeHook is IHooks, Ownable2Step {
         return (amt * (BPS - feeSumBps)) / BPS;
     }
 
-    /// @dev Raw-wei spot conversion through one V3 pool (two mulDivs against sqrtPriceX96²).
+    /// @dev Raw-wei conversion through one V3 pool at the HIGHER of spot and the 30-minute TWAP,
+    /// so a price pushed down inside this transaction cannot lower the floor (see claimFeesWithMin).
     function _spotOut(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn) internal view returns (uint256) {
         address pool = claimV3Factory.getPool(tokenIn, tokenOut, fee);
         if (pool == address(0)) revert NotConfigured();
         (uint160 sqrtP,,,,,,) = IUniswapV3Pool(pool).slot0();
         bool inIsToken0 = tokenIn < tokenOut;
+        uint256 spot = _atSqrt(sqrtP, amountIn, inIsToken0);
+        uint256 twap = _twapOut(pool, amountIn, inIsToken0);
+        return twap > spot ? twap : spot;
+    }
+
+    /// @dev The same conversion at the pool's `TWAP_WINDOW` average tick; 0 if unavailable
+    /// (young pool, cardinality 1) so the caller falls back to spot.
+    function _twapOut(address pool, uint256 amountIn, bool inIsToken0) internal view returns (uint256) {
+        uint32[] memory ago = new uint32[](2);
+        ago[0] = TWAP_WINDOW;
+        ago[1] = 0;
+        try IUniswapV3Pool(pool).observe(ago) returns (int56[] memory cum, uint160[] memory) {
+            int56 diff = cum[1] - cum[0];
+            int24 tick = int24(diff / int56(uint56(TWAP_WINDOW)));
+            // Round toward negative infinity, matching Uniswap's OracleLibrary.
+            if (diff < 0 && (diff % int56(uint56(TWAP_WINDOW)) != 0)) tick--;
+            return _atSqrt(TickMath.getSqrtPriceAtTick(tick), amountIn, inIsToken0);
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @dev amountIn × (sqrtP/2**96)^±2, as two mulDivs so nothing overflows.
+    function _atSqrt(uint160 sqrtP, uint256 amountIn, bool inIsToken0) private pure returns (uint256) {
+        if (sqrtP == 0) return 0;
         return inIsToken0
             ? Math.mulDiv(Math.mulDiv(amountIn, sqrtP, 1 << 96), sqrtP, 1 << 96)
             : Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sqrtP), 1 << 96, sqrtP);
@@ -467,18 +530,27 @@ contract StockFeeHook is IHooks, Ownable2Step {
         // Flagship takes the remainder (its own share + Base tokens' folded mechanism + dust).
         uint256 toFlagship = out - toTreasury - toDev - toMechanism;
 
+        // BEST-EFFORT, exactly like WethFeeHook: a distributor that reverts (revoked fee source,
+        // repointed address, a paused mechanism) must not take the treasury's, the creator's and
+        // the flagship's slices down with it. Transfer + notify go together in one self-call so a
+        // failed credit can never leave the WETH stranded at the distributor uncredited.
+        if (toMechanism > 0) {
+            try this.pushMechanism(dist, token, toMechanism) {}
+            catch {
+                toFlagship += toMechanism;
+                toMechanism = 0;
+                emit MechanismFoldedToFlagship(token, toFlagship);
+            }
+        }
+
         uint256 ethPortion = out - toMechanism; // mechanism stays WETH
         if (ethPortion > 0) IWETHW(weth).withdraw(ethPortion); // pay in native ETH, never WETH
         if (toTreasury > 0) _payEth(treasury, toTreasury);
         if (toDev > 0) {
             address dev = launchpad.creatorOf(token);
-            _payEthOrTreasury(dev == address(0) ? treasury : dev, toDev);
+            _payEthOrCredit(dev == address(0) ? treasury : dev, toDev);
         }
         if (toFlagship > 0) _payEth(flagshipSink == address(0) ? treasury : flagshipSink, toFlagship);
-        if (toMechanism > 0) {
-            IERC20(weth).safeTransfer(dist, toMechanism);
-            IDistributorNotify(dist).notify(token, toMechanism);
-        }
 
         emit Distributed(token, stockIn, out, toTreasury, toDev, toFlagship, toMechanism);
     }
@@ -492,16 +564,39 @@ contract StockFeeHook is IHooks, Ownable2Step {
     /// @dev Pay a recipient that might reject ETH (a creator address is arbitrary — a contract
     /// with no receive(), a Safe variant, a self-destructed address). Reverting here would strand
     /// the WHOLE distribution forever: treasury's and the flagship's slices are in the same call,
-    /// and `creatorOf` is fixed at launch with no way to change it. Fall back to the treasury so
-    /// one bad address can never freeze a token's fees.
-    function _payEthOrTreasury(address to, uint256 value) private {
+    /// and `creatorOf` is fixed at launch with no way to change it.
+    ///
+    /// On failure the value is CREDITED to the recipient, never handed to the treasury. The old
+    /// treasury fallback silently and permanently confiscated the fee share of any creator whose
+    /// wallet does real work on receipt — a revenue splitter, a forwarding contract, a 7702
+    /// delegate — with no record of a debt and no way to recover it. The push stipend is generous
+    /// enough for normal wallets and multisigs; anything beyond that pulls with `withdrawOwed`.
+    function _payEthOrCredit(address to, uint256 value) private {
         if (value == 0) return;
-        (bool ok,) = to.call{value: value, gas: 30_000}("");
+        (bool ok,) = to.call{value: value, gas: 100_000}("");
         if (!ok) {
-            (bool ok2,) = treasury.call{value: value}("");
-            if (!ok2) revert EthTransferFailed();
-            emit PayoutRerouted(to, treasury, value);
+            owed[to] += value;
+            emit PayoutOwed(to, value);
         }
+    }
+
+    /// @notice Withdraw fee shares that could not be pushed (see `_payEthOrCredit`). Anyone may
+    /// trigger it for any address; the ETH only ever goes to the address that is owed it.
+    function withdrawOwed(address to) external returns (uint256 amount) {
+        amount = owed[to];
+        if (amount == 0) return 0;
+        owed[to] = 0; // zeroed before the send: a reentrant call sees nothing left
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
+        emit OwedWithdrawn(to, amount);
+    }
+
+    /// @dev Transfer + credit the mechanism slice atomically. Self-call only, so `_distribute`
+    /// can wrap BOTH halves in one try/catch (see there).
+    function pushMechanism(address dist, address token, uint256 amount) external {
+        if (msg.sender != address(this)) revert NotConfigured();
+        IERC20(weth).safeTransfer(dist, amount);
+        IDistributorNotify(dist).notify(token, amount);
     }
 
     /// @dev Accept ETH only from unwrapping WETH (during `distribute`).

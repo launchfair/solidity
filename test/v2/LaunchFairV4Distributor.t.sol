@@ -397,6 +397,8 @@ contract V4DistributorTest is Test, Deployers {
 
         // Commit leaves the pot live and the session open — nothing resets until a WIN.
         uint256 round = 4_000_123; // a future drand round (committed before it exists)
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), round);
         assertEq(token.lotteryEpoch(), 0, "epoch unchanged at commit (advances on a win)");
         assertEq(dist.pendingWeth(address(token)), pot, "pot not reserved at commit (rolls until a win)");
@@ -450,6 +452,8 @@ contract V4DistributorTest is Test, Deployers {
         assertLt(roll, 9998, "pick a beacon with headroom for the jackpot band");
         dist.setLotteryOdds(address(token), uint16(roll + 1), 1, 7000); // miss band covers this roll
 
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), round);
         uint256 aBefore = weth.balanceOf(A);
         _settle(token, round, rnd, new address[](0)); // EMPTY set — a miss needs no holders (keeper's exact call)
@@ -478,6 +482,8 @@ contract V4DistributorTest is Test, Deployers {
         assertLt(roll, 9000, "pick a beacon below the jackpot band");
         dist.setLotteryOdds(address(token), 0, 1000, 7000); // 0 miss, 10% jackpot, 70% to the winner
 
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), round);
         uint256 aBefore = weth.balanceOf(A);
         _settle(token, round, rnd, _set1(A));
@@ -516,6 +522,8 @@ contract V4DistributorTest is Test, Deployers {
         // Draw 1 — a REGULAR win skims 30% of a 10-ETH pot → 3 ETH into the jackpot pool.
         weth.mint(address(dist), 10 ether);
         dist.notify(tk, 10 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, round1);
         _settle(token, round1, rndR, _set1(A));
         assertEq(dist.jackpotWeth(tk), 3 ether, "regular win skimmed 30% to the pool");
@@ -526,6 +534,8 @@ contract V4DistributorTest is Test, Deployers {
         // Draw 2 — a JACKPOT pays the new 2-ETH pot + the 3-ETH pool = 5 ETH.
         weth.mint(address(dist), 2 ether);
         dist.notify(tk, 2 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, round2);
         uint256 aBefore = weth.balanceOf(A);
         _settle(token, round2, rndJ, _set1(A));
@@ -552,6 +562,8 @@ contract V4DistributorTest is Test, Deployers {
         dist.notify(tk, 10 ether);
         bytes32 rnd1 = keccak256("cd-1");
         assertLt(_roll(rnd1, tk, 41), 9999, "beacon below the jackpot band");
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, 41);
         uint256 a0 = weth.balanceOf(A);
         _settle(token, 41, rnd1, _set1(A));
@@ -563,6 +575,8 @@ contract V4DistributorTest is Test, Deployers {
         uint256 potBefore = dist.pendingWeth(tk);
         bytes32 rnd2 = keccak256("cd-2");
         assertLt(_roll(rnd2, tk, 42), 9999, "beacon below the jackpot band");
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, 42);
         uint256 a1 = weth.balanceOf(A);
         _settle(token, 42, rnd2, _set1(A));
@@ -573,6 +587,8 @@ contract V4DistributorTest is Test, Deployers {
         vm.warp(block.timestamp + dist.winCooldownSecs() + 1);
         bytes32 rnd3 = keccak256("cd-3");
         assertLt(_roll(rnd3, tk, 43), 9999, "beacon below the jackpot band");
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, 43);
         uint256 a2 = weth.balanceOf(A);
         _settle(token, 43, rnd3, _set1(A));
@@ -595,6 +611,8 @@ contract V4DistributorTest is Test, Deployers {
         bytes32 rnd1 = keccak256("rd-1");
         assertLt(_ticketFor(tk, rnd1, 41, total), 399_999 ether, "draw-1 ticket in A's range");
         assertLt(_roll(rnd1, tk, 41), 9999, "regular-win band");
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, 41);
         uint256 a0 = weth.balanceOf(A);
         _settle(token, 41, rnd1, _set2(A, B));
@@ -607,6 +625,8 @@ contract V4DistributorTest is Test, Deployers {
         bytes32 rnd2 = keccak256("rd-2");
         assertLt(_ticketFor(tk, rnd2, 42, total), 399_999 ether, "draw-2 ticket in A's (cooling) range");
         assertLt(_roll(rnd2, tk, 42), 9999, "regular-win band");
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(tk, 42);
         uint256 a1 = weth.balanceOf(A);
         uint256 b0 = weth.balanceOf(B);
@@ -639,6 +659,8 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(B, 100_000 ether);
         weth.mint(address(dist), 5 ether);
         dist.notify(address(token), 5 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         vrf.deliver(1, keccak256("x"));
 
@@ -661,6 +683,8 @@ contract V4DistributorTest is Test, Deployers {
         dist.notify(address(token), pot);
 
         uint256 round = 123;
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), round);
         bytes32 rnd = keccak256("beacon");
         vrf.deliver(round, rnd);
@@ -690,6 +714,8 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(B, 100_000 ether);
         weth.mint(address(dist), 4 ether);
         dist.notify(address(token), 4 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         vrf.deliver(1, keccak256("r"));
 
@@ -713,6 +739,8 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(A, 400_000 ether); // A owns EVERY ticket
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 7);
         vrf.deliver(7, keccak256("y"));
 
@@ -739,6 +767,7 @@ contract V4DistributorTest is Test, Deployers {
     function test_lottery_onlyOperator() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
+        vm.roll(block.number + 1); // holdings must predate the commit block
         vm.prank(A);
         vm.expectRevert(LaunchFairV4Distributor.OnlyDrawOperator.selector);
         dist.commitDraw(address(token), 1);
@@ -752,6 +781,8 @@ contract V4DistributorTest is Test, Deployers {
     function test_lottery_doubleCommitReverts() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         vm.expectRevert(LaunchFairV4Distributor.DrawActive.selector);
         dist.commitDraw(address(token), 2);
@@ -789,6 +820,8 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(A, 100_000 ether);
         weth.mint(address(dist), 3 ether);
         dist.notify(address(token), 3 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         assertEq(dist.pendingWeth(address(token)), 3 ether, "pot untouched at commit (rolls, not reserved)");
 
@@ -812,6 +845,8 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), 4 ether);
         dist.notify(address(token), 4 ether);
 
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1); // draws from epoch 0; nothing resets at commit
         assertEq(token.lotteryEpoch(), 0, "session unchanged at commit");
         assertEq(dist.pendingWeth(address(token)), 4 ether, "pot live at commit (not reserved)");
@@ -834,6 +869,8 @@ contract V4DistributorTest is Test, Deployers {
         dist.notify(address(token), pot2);
         assertEq(dist.pendingWeth(address(token)), pot2, "next pot restarts from new fees only");
 
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 2); // draws from epoch 1; advances only when it wins
         assertEq(token.lotteryEpoch(), 1, "session unchanged until the second draw wins");
 
@@ -855,6 +892,28 @@ contract V4DistributorTest is Test, Deployers {
     // commit (even before the beacon is public) can't dodge or steer the draw. A dumps its
     // whole balance post-commit, yet the draw still counts A at its pre-sell (snapshot)
     // balance and settles off the original total.
+    /// REGRESSION (audit HIGH): buying inside the commit's own L1-block window must not enter
+    /// the draw. Nitro's `block.number` advances ~every 12s while ~120 L2 blocks share a value,
+    /// so a snapshot taken at the commit block captured end-of-window balances.
+    function test_lottery_buyAfterCommitInSameL1Block_getsNoTickets() public {
+        LaunchTokenV2 token = _setupLottery();
+        vm.roll(100);
+        token.transfer(A, 300_000 ether);
+        weth.mint(address(dist), 5 ether);
+        dist.notify(address(token), 5 ether);
+
+        vm.roll(101);
+        dist.commitDraw(address(token), 3);
+        (, , , uint256 snapBlk, , , ) = dist.pendingDraw(address(token));
+
+        // The attacker piles in DURING the commit's block, exactly as they would after seeing
+        // the commitDraw transaction, then reads what the draw will actually count.
+        token.transfer(B, 500_000 ether);
+        assertEq(token.balanceOfAt(B, snapBlk), 0, "same-window buyer holds no tickets");
+        assertEq(token.balanceOfAt(A, snapBlk), 300_000 ether, "the pre-commit holder is unaffected");
+        assertEq(token.totalEligibleAt(snapBlk), 300_000 ether, "denominator excludes the late buy");
+    }
+
     function test_lottery_snapshotFrozenAtCommit() public {
         LaunchTokenV2 token = _setupLottery();
         // Use literal block numbers (via_ir re-reads `block.number` across vm.roll, so
@@ -869,12 +928,16 @@ contract V4DistributorTest is Test, Deployers {
         weth.mint(address(dist), pot);
         dist.notify(address(token), pot);
 
-        // Advance to a distinct block, then commit — records snapshotBlock = commit block.
-        vm.roll(200);
+        // Advance to a distinct block, then commit. The snapshot is the block BEFORE the
+        // commit: `block.number` here is the L1 block, ~12s and ~120 L2 blocks wide, and the
+        // balance checkpoints are keyed by it with a repeated key overwriting — so freezing at
+        // the commit block would really mean freezing at the END of that 12s window, letting
+        // anyone who saw the commit buy in, be recorded, and sell once it ticked over.
+        vm.roll(201);
         uint256 round = 3;
         dist.commitDraw(address(token), round);
         (, , , uint256 snapBlk, , , ) = dist.pendingDraw(address(token));
-        assertEq(snapBlk, 200, "snapshot frozen at the commit block");
+        assertEq(snapBlk, 200, "snapshot frozen BEFORE the commit block");
 
         // Roll forward again and have A DUMP its entire balance after the commit.
         // (Read A's balance BEFORE vm.prank — an inner view call would consume the prank.)
@@ -919,6 +982,8 @@ contract V4DistributorTest is Test, Deployers {
         uint256 pot = 3 ether;
         weth.mint(address(dist), pot);
         dist.notify(address(token), pot);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         // settleDraw returns the amount paid — the keeper eth_calls this with
         // minPrizeOut=0 to quote the prize swap, then re-sends with a real bound (M-03).
@@ -945,6 +1010,8 @@ contract V4DistributorTest is Test, Deployers {
         uint256 pot = 2 ether;
         weth.mint(address(dist), pot);
         dist.notify(address(token), pot);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1);
         vrf.deliver(1, keccak256("r"));
 
@@ -963,6 +1030,8 @@ contract V4DistributorTest is Test, Deployers {
         token.transfer(A, 100_000 ether);
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 5); // committed, but the beacon isn't posted
         vm.expectRevert(LaunchFairV4Distributor.RandomnessNotReady.selector);
         dist.settleDraw(address(token), _set1(A), 0);
@@ -991,6 +1060,8 @@ contract V4DistributorTest is Test, Deployers {
         dist.commitDraw(address(token), 1);
 
         vm.roll(block.number + 50);
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), 1); // now allowed
         assertEq(dist.lastPayoutBlock(address(token)), block.number, "timer reset on commit");
     }
@@ -1003,6 +1074,7 @@ contract V4DistributorTest is Test, Deployers {
     function test_lottery_commitRejectsPastRound() public {
         LaunchTokenV2 token = _setupLottery();
         token.transfer(A, 100_000 ether);
+        vm.roll(block.number + 1); // holdings must predate the commit block
         weth.mint(address(dist), 1 ether);
         dist.notify(address(token), 1 ether);
         vm.warp(DRAND_GENESIS + 1000 * 3); // round ~1001 is being produced now
@@ -1027,6 +1099,8 @@ contract V4DistributorTest is Test, Deployers {
         dist.notify(address(token), 1 ether);
         vm.warp(DRAND_GENESIS + 1000 * 3);
         uint256 round = 2000;
+        // Eligibility freezes at block.number-1, so holdings must predate the commit block.
+        vm.roll(block.number + 1);
         dist.commitDraw(address(token), round);
 
         // Warp past the round's beacon production time.
