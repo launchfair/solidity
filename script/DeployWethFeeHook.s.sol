@@ -31,6 +31,13 @@ contract DeployWethFeeHook is Script {
         IPoolManager pm = IPoolManager(vm.envAddress("POOL_MANAGER"));
         address weth = vm.envAddress("WETH");
         uint16 feeBps = uint16(vm.envOr("HOOK_FEE_BPS", uint256(100)));
+        // REQUIRED, not optional: an unset LAUNCHPAD sends every creator's dev share to treasury,
+        // and an unset DISTRIBUTOR means no mode token can fund its mechanism. Both used to default
+        // to address(0) and fail silently. TREASURY is the only fallback destination, by design.
+        address treasury = vm.envAddress("TREASURY");
+        address distributor = vm.envAddress("DISTRIBUTOR");
+        address launchpad = vm.envAddress("LAUNCHPAD");
+        address flagshipSink = vm.envOr("FLAGSHIP_SINK", address(0)); // 0 folds flagship to treasury pre-TGE
 
         uint160 flags = uint160(
             Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
@@ -42,17 +49,26 @@ contract DeployWethFeeHook is Script {
         vm.startBroadcast(pk);
         WethFeeHook hook = new WethFeeHook{salt: salt}(owner, pm, weth, feeBps);
         require(address(hook) == hookAddr, "mined-address mismatch");
-        hook.setDestinations(
-            vm.envAddress("TREASURY"),
-            vm.envOr("DISTRIBUTOR", address(0)),
-            vm.envOr("FLAGSHIP_SINK", address(0)),
-            vm.envOr("LAUNCHPAD", address(0))
-        );
+        hook.setDestinations(treasury, distributor, flagshipSink, launchpad);
+
+        // The two wirings that used to be printed as console hints and never executed — both fail
+        // SILENTLY: without setFeeHook, Base-mode launches revert InvalidMode and mode tokens
+        // launch under the old LP-fee model; without setFeeSource the hook's notify() reverts and
+        // every Reward/Lottery mechanism folds quietly into the flagship. Mirrors DeployStockPair.
+        ILaunchpadFeeHook(launchpad).setFeeHook(address(hook));
+        IDistributorFeeSource(distributor).setFeeSource(address(hook), true);
         vm.stopBroadcast();
 
         console2.log("WethFeeHook:", address(hook));
         console2.log("  feeBps:   ", feeBps);
-        console2.log("Next: LaunchFairV4.setFeeHook(", address(hook), ")");
-        console2.log("Then: LaunchFairV4Distributor.setFeeHook(hook) to authorize mechanism notify");
+        console2.log("  wired: launchpad.setFeeHook + distributor.setFeeSource(hook,true)");
     }
+}
+
+interface ILaunchpadFeeHook {
+    function setFeeHook(address hook) external;
+}
+
+interface IDistributorFeeSource {
+    function setFeeSource(address source, bool allowed) external;
 }

@@ -35,14 +35,33 @@ contract Deploy is Script {
     function run() external {
         uint256 pk = vm.envOr("PRIVATE_KEY", ANVIL_KEY_0);
         address deployer = vm.addr(pk);
+
+        // On a real chain, refuse the anvil defaults. FeeLocker.weth and V3Launchpad's
+        // weth/factory/positionManager are all IMMUTABLE, so deploying against a freshly-minted
+        // mock (from an unset env) would permanently bind the launchpad to fake contracts — and
+        // broadcasting from the public anvil key lets anyone spend from it. Both silent at deploy.
+        bool realChain = block.chainid != 31337;
+        if (realChain) {
+            require(pk != ANVIL_KEY_0, "set PRIVATE_KEY: refusing to broadcast from the public anvil key");
+        }
+
         vm.startBroadcast(pk);
 
         address weth = vm.envOr("WETH", address(0));
-        if (weth == address(0)) weth = address(new MockWETH());
+        if (weth == address(0)) {
+            require(!realChain, "set WETH on a real chain (immutable: a mock would be permanent)");
+            weth = address(new MockWETH());
+        }
         address factory = vm.envOr("UNIV3_FACTORY", address(0));
-        if (factory == address(0)) factory = address(new MockV3Factory());
+        if (factory == address(0)) {
+            require(!realChain, "set UNIV3_FACTORY on a real chain");
+            factory = address(new MockV3Factory());
+        }
         address positionManager = vm.envOr("POSITION_MANAGER", address(0));
-        if (positionManager == address(0)) positionManager = address(new MockPositionManager());
+        if (positionManager == address(0)) {
+            require(!realChain, "set POSITION_MANAGER on a real chain");
+            positionManager = address(new MockPositionManager());
+        }
         // Platform treasury: receives the 25% treasury WETH share, the flat per-token
         // creation fee, and the 50% flagship-buyback slice until a flagshipSink is set.
         // Override with TREASURY env if needed.

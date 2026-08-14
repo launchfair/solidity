@@ -12,6 +12,19 @@ interface ISinkAdmin {
     function treasury() external view returns (address);
 }
 
+/// The WethFeeHook's 4-arg setDestinations (mode-token fee sink) + the fields to preserve.
+interface IWethHookAdmin {
+    function setDestinations(address treasury_, address distributor_, address flagshipSink_, address launchpad_)
+        external;
+    function distributor() external view returns (address);
+    function launchpad() external view returns (address);
+}
+
+/// Cross-check: the core token must be minted by the same factory as every launchpad token.
+interface ILaunchpadDeployer {
+    function deployer() external view returns (address);
+}
+
 /// Deploys the CoreTGE war chest and points BOTH flagship fee sinks at it, so a slice of
 /// every trade on the platform starts accumulating toward the seeded core-token launch:
 ///   - LaunchFairV4FeeLocker.setFlagshipSink(tge)   (mode-token trades, 0.1% carve)
@@ -24,13 +37,11 @@ contract DeployCoreTGE is Script {
     address constant DEFAULT_WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address constant DEFAULT_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
     address constant DEFAULT_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
-    // Open-stock-pool stack (2026-08-13).
-    address constant DEFAULT_FEE_LOCKER = 0x9c7C88D8338b13B4D04ee43334dd02522757AAC6;
-    address constant DEFAULT_STOCK_ROUTER = 0xBb6f952a5fD28566b7f0d32Ac02F2aFc6bD782BC;
-    address constant DEFAULT_STOCK_FEE_HOOK = 0x37Db3428A84f72e0df3d786483eaa1d1558d80CC;
-    /// The live launchpad's TokenDeployerV2 (LaunchFairV4.deployer()) — the core token must
-    /// come from the SAME factory as every launchpad token so aggregators index it as ours.
-    address constant DEFAULT_TOKEN_DEPLOYER = 0x3CeCC9A0329FDE96d9563a96b4bA131A115b1Dd7;
+    // NO stale defaults for the per-stack contracts. These MUST be passed explicitly at deploy —
+    // hardcoding an old stack's addresses meant the sink-repoint silently succeeded against dead
+    // contracts (or reverted mid-broadcast), and pinning a stale TOKEN_DEPLOYER gave the core
+    // token a creator no launchpad uses (the exact orphan the permanent factory exists to prevent).
+    // The token deployer especially: it is CoreTGE's immutable, so a wrong value can't be fixed.
     address constant DEFAULT_V3_ROUTER = 0xCaf681a66D020601342297493863E78C959E5cb2;
     address constant DEFAULT_TREASURY = 0x82C8f63D0E578bA3d800BA5d48F8e9dD2a009Af3;
     string constant PLATFORM_WEBSITE = "https://hood.launchfair.app/";
@@ -46,10 +57,21 @@ contract DeployCoreTGE is Script {
         address weth = vm.envOr("WETH", DEFAULT_WETH);
         address factory = vm.envOr("V3_FACTORY", DEFAULT_V3_FACTORY);
         address npm = vm.envOr("POSITION_MANAGER", DEFAULT_POSITION_MANAGER);
-        address locker = vm.envOr("FEE_LOCKER", DEFAULT_FEE_LOCKER);
-        address stockRouter = vm.envOr("STOCK_ROUTER", DEFAULT_STOCK_ROUTER);
-        address stockFeeHook = vm.envOr("STOCK_FEE_HOOK", DEFAULT_STOCK_FEE_HOOK);
-        address tokenDeployer = vm.envOr("TOKEN_DEPLOYER", DEFAULT_TOKEN_DEPLOYER);
+        address locker = vm.envAddress("FEE_LOCKER");
+        address stockRouter = vm.envAddress("STOCK_ROUTER");
+        address stockFeeHook = vm.envAddress("STOCK_FEE_HOOK");
+        // The permanent factory. Must equal the launchpad's deployer() so the core token shares
+        // the one canonical creator; cross-checked below.
+        address tokenDeployer = vm.envAddress("TOKEN_DEPLOYER");
+        address wethFeeHook = vm.envOr("WETH_FEE_HOOK", address(0)); // repointed too, if given
+        // Guard the immutable: if LAUNCHPAD is given, prove the core token will share its factory.
+        address launchpadForCheck = vm.envOr("LAUNCHPAD", address(0));
+        if (launchpadForCheck != address(0)) {
+            require(
+                ILaunchpadDeployer(launchpadForCheck).deployer() == tokenDeployer,
+                "TOKEN_DEPLOYER != launchpad.deployer(): core token would have an orphan creator"
+            );
+        }
         // Genesis split (2026-08-13): 90% into the locked pool (real float, deep liquidity,
         // FDV ≈ 1.11× the pot) + 10% team. Seasons are BUYBACK-funded (the keeper buys core
         // with fee ETH and funds each Merkle pot with the bought tokens), so no pre-minted
@@ -81,12 +103,24 @@ contract DeployCoreTGE is Script {
         // FDV, however small the pot (MIN_LAUNCH_PRICE env, WETH wei per whole token).
         tge.setMinLaunchPrice(vm.envOr("MIN_LAUNCH_PRICE", uint256(1_491_146_318)));
 
-        // Point every flagship sink at the war chest — accumulation starts NOW.
+        // Point every flagship sink at the war chest — accumulation starts NOW. There are FIVE
+        // sinks, and the WethFeeHook one (mode-token revenue, the main product) was the one this
+        // script silently skipped — so all mode-token flagship revenue leaked to treasury.
         if (wireSinks) {
             address treasury = ISinkAdmin(stockRouter).treasury();
             ISinkAdmin(locker).setFlagshipSink(address(tge));
             ISinkAdmin(stockRouter).setDestinations(treasury, address(tge));
-            if (stockFeeHook != address(0)) ISinkAdmin(stockFeeHook).setDestinations(treasury, address(tge));
+            ISinkAdmin(stockFeeHook).setDestinations(treasury, address(tge));
+            if (wethFeeHook != address(0)) {
+                // setDestinations(treasury, distributor, flagshipSink, launchpad) — preserve the
+                // distributor + launchpad the hook already has; only move the flagship sink.
+                IWethHookAdmin(wethFeeHook).setDestinations(
+                    treasury,
+                    IWethHookAdmin(wethFeeHook).distributor(),
+                    address(tge),
+                    IWethHookAdmin(wethFeeHook).launchpad()
+                );
+            }
         }
 
         vm.stopBroadcast();
