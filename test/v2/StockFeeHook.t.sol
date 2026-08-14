@@ -300,6 +300,115 @@ contract StockFeeHookTest is Test, Deployers {
         assertGt(DEV.balance, 0, "creator share was PUSHED on platform distribution");
     }
 
+    /// A second pool pairing the SAME token against a DIFFERENT stock must not repoint the
+    /// token's redemption currency — the accrual is a scalar but the fees are that pool's claims,
+    /// so repointing would strand them or burn another token's claims.
+    function test_quoteIsWriteOnce_secondPoolCannotRepoint() public {
+        stock.approve(address(swapRouter), type(uint256).max);
+        _swap(!tokenIsCurrency0, 10 ether);
+        assertEq(hook.quoteOf(address(token)), address(stock), "first pool set the quote");
+        uint256 accBefore = hook.accrued(address(token));
+
+        // A second allowed quote, and an attacker-made pool for the same token.
+        HookMockToken other = new HookMockToken("TSLA", "TSLA");
+        other.mint(address(this), 1_000_000 ether);
+        pad.setQuote(address(other), true, 3000);
+        (Currency a0, Currency a1) = address(token) < address(other)
+            ? (Currency.wrap(address(token)), Currency.wrap(address(other)))
+            : (Currency.wrap(address(other)), Currency.wrap(address(token)));
+        PoolKey memory k2 = PoolKey({currency0: a0, currency1: a1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
+        manager.initialize(k2, SQRT_PRICE_1_1);
+        other.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            k2,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 10_000 ether, salt: bytes32(0)}),
+            ""
+        );
+        other.approve(address(swapRouter), type(uint256).max);
+        bool otherIsC0 = Currency.unwrap(k2.currency0) == address(other);
+        swapRouter.swap(
+            k2,
+            IPoolManager.SwapParams({
+                zeroForOne: otherIsC0,
+                amountSpecified: -int256(1 ether),
+                sqrtPriceLimitX96: otherIsC0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertEq(hook.quoteOf(address(token)), address(stock), "quote NOT repointed by the second pool");
+        assertEq(hook.accrued(address(token)), accBefore, "second pool accrued nothing");
+    }
+
+    /// Pools for tokens this launchpad never created must not enter the fee books at all.
+    function test_foreignTokenPoolAccruesNothing() public {
+        HookMockToken foreign = new HookMockToken("FRGN", "FRGN");
+        foreign.mint(address(this), 1_000_000 ether);
+        // pad.creatorOf(foreign) == 0 (never launched here)
+        (Currency c0, Currency c1) = address(foreign) < address(stock)
+            ? (Currency.wrap(address(foreign)), Currency.wrap(address(stock)))
+            : (Currency.wrap(address(stock)), Currency.wrap(address(foreign)));
+        PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
+        manager.initialize(k, SQRT_PRICE_1_1);
+        foreign.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            k,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 10_000 ether, salt: bytes32(0)}),
+            ""
+        );
+        stock.approve(address(swapRouter), type(uint256).max);
+        bool stockIsC0 = Currency.unwrap(k.currency0) == address(stock);
+        swapRouter.swap(
+            k,
+            IPoolManager.SwapParams({
+                zeroForOne: stockIsC0,
+                amountSpecified: -int256(1 ether),
+                sqrtPriceLimitX96: stockIsC0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(hook.accrued(address(foreign)), 0, "no accrual for a token we did not launch");
+        assertEq(hook.quoteOf(address(foreign)), address(0), "no quote recorded");
+    }
+
+    /// A creator that rejects ETH must not freeze the treasury's and flagship's shares too.
+    function test_creatorRejectingEth_reroutesInsteadOfStranding() public {
+        RejectsEth badDev = new RejectsEth();
+        HookMockToken t2 = new HookMockToken("BAD", "BAD");
+        t2.mint(address(this), 1_000_000_000 ether);
+        pad.setCreator(address(t2), address(badDev));
+        (Currency c0, Currency c1) = address(t2) < address(stock)
+            ? (Currency.wrap(address(t2)), Currency.wrap(address(stock)))
+            : (Currency.wrap(address(stock)), Currency.wrap(address(t2)));
+        PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: poolKey.hooks});
+        manager.initialize(k, SQRT_PRICE_1_1);
+        t2.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            k,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 100_000 ether, salt: bytes32(0)}),
+            ""
+        );
+        stock.approve(address(swapRouter), type(uint256).max);
+        bool stockIsC0 = Currency.unwrap(k.currency0) == address(stock);
+        swapRouter.swap(
+            k,
+            IPoolManager.SwapParams({
+                zeroForOne: stockIsC0,
+                amountSpecified: -int256(50 ether),
+                sqrtPriceLimitX96: stockIsC0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertGt(hook.accrued(address(t2)), 0);
+        uint256 treasBefore = TREASURY.balance;
+        uint256 out = hook.distribute(address(t2), 0); // must NOT revert
+        assertGt(out, 0, "distribution completed despite the creator rejecting ETH");
+        assertGt(TREASURY.balance - treasBefore, (out * 2500) / 10_000, "dev share rerouted to treasury");
+    }
+
     function test_feeCap_andSplitSum() public {
         uint16 cap = hook.MAX_FEE_BPS();
         vm.expectRevert(StockFeeHook.InvalidFeeBps.selector);
@@ -396,6 +505,13 @@ contract StockFeeHookTest is Test, Deployers {
         assertEq(mdist.notifiedToken(), address(mtok), "notify() credited the right token");
         assertEq(mdist.notifiedAmount(), mech, "notify() amount matches the WETH sent");
         assertEq(FLAGSHIP.balance - flagshipBefore, out - (out * 2500) / 10_000 * 2 - mech, "flagship keeps only its own 10% + dust");
+    }
+}
+
+/// Refuses every incoming ETH transfer — stands in for a creator address that can't receive.
+contract RejectsEth {
+    receive() external payable {
+        revert("nope");
     }
 }
 

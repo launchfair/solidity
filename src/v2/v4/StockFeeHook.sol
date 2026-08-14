@@ -120,6 +120,7 @@ contract StockFeeHook is IHooks, Ownable2Step {
     event SplitSet(uint16 treasuryBps, uint16 devBps, uint16 mechanismBps, uint16 flagshipBps);
     event DistributorSet(address distributor);
     event ClaimConfigSet(address v3Factory, uint16 slippageBps);
+    event PayoutRerouted(address indexed intended, address indexed fallbackTo, uint256 amount);
     event DestinationsSet(address treasury, address flagshipSink);
 
     error NotPoolManager();
@@ -236,8 +237,23 @@ contract StockFeeHook is IHooks, Ownable2Step {
         if (launchpad.allowedQuote(c0)) (token, quote) = (c1, c0);
         else if (launchpad.allowedQuote(c1)) (token, quote) = (c0, c1);
         else return (address(0), address(0));
+
+        // Only ever charge for pools of tokens THIS launchpad created. V4 initialize is
+        // permissionless and anyone can name this hook in a key, so without this an outsider
+        // could open pools that write into our accrual bookkeeping.
+        if (launchpad.creatorOf(token) == address(0)) return (address(0), address(0));
+
+        // `accrued[token]` is a bare scalar but the fees behind it are ERC-6909 claims of THIS
+        // pool's quote. If a token could be seen with two different quotes, `quoteOf` would be
+        // overwritten and `distribute` would burn claims of the wrong currency — stranding that
+        // token's fees, or redeeming claims belonging to other tokens. So the quote is
+        // WRITE-ONCE per token: a second pool pairing the same token against a different stock
+        // simply trades fee-free rather than corrupting the first pool's accounting.
+        address known = quoteOf[token];
+        if (known == address(0)) quoteOf[token] = quote;
+        else if (known != quote) return (address(0), address(0));
+
         poolInfo[id] = PoolInfo({token: token, quote: quote});
-        quoteOf[token] = quote;
     }
 
     // ── the fee: the quote (stock) leg, all four swap cases ──────────────────────
@@ -315,10 +331,24 @@ contract StockFeeHook is IHooks, Ownable2Step {
     /// `claimSlippageBps`), same defense as FlagshipBuyback.buyback(). Requires the claim
     /// config (v3Factory) to be set; until then only the gated distribute() works.
     function claimFees(address token) external returns (uint256 wethOut) {
+        return claimFeesWithMin(token, 0);
+    }
+
+    /// @notice `claimFees` with an explicit floor. The self-quoted floor is read from the SAME
+    /// pools the conversion then swaps through, in the SAME transaction — so a caller who moves
+    /// the price first has that manipulated price baked into their own floor, and it constrains
+    /// nothing. Passing `minWethOut` (quoted off-chain, a block earlier) is the real protection;
+    /// the on-chain floor is only a backstop for callers who pass 0. The larger of the two wins,
+    /// so this can never be used to LOWER the guard.
+    function claimFeesWithMin(address token, uint256 minWethOut) public returns (uint256 wethOut) {
         if (address(claimV3Factory) == address(0)) revert NotConfigured();
         uint256 amount = accrued[token];
         if (amount == 0) return 0;
-        return _distribute(token, _claimFloor(quoteOf[token], amount));
+        uint256 floor_ = _claimFloor(quoteOf[token], amount);
+        // A zero floor means the quote failed (missing pool, or the fee sum ate it) — refuse
+        // rather than swap with no protection at all.
+        if (floor_ == 0 && minWethOut == 0) revert NotConfigured();
+        return _distribute(token, minWethOut > floor_ ? minWethOut : floor_);
     }
 
     function _distribute(address token, uint256 minWethOut) internal returns (uint256 wethOut) {
@@ -442,7 +472,7 @@ contract StockFeeHook is IHooks, Ownable2Step {
         if (toTreasury > 0) _payEth(treasury, toTreasury);
         if (toDev > 0) {
             address dev = launchpad.creatorOf(token);
-            _payEth(dev == address(0) ? treasury : dev, toDev);
+            _payEthOrTreasury(dev == address(0) ? treasury : dev, toDev);
         }
         if (toFlagship > 0) _payEth(flagshipSink == address(0) ? treasury : flagshipSink, toFlagship);
         if (toMechanism > 0) {
@@ -457,6 +487,21 @@ contract StockFeeHook is IHooks, Ownable2Step {
     function _payEth(address to, uint256 value) private {
         (bool ok,) = to.call{value: value}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Pay a recipient that might reject ETH (a creator address is arbitrary — a contract
+    /// with no receive(), a Safe variant, a self-destructed address). Reverting here would strand
+    /// the WHOLE distribution forever: treasury's and the flagship's slices are in the same call,
+    /// and `creatorOf` is fixed at launch with no way to change it. Fall back to the treasury so
+    /// one bad address can never freeze a token's fees.
+    function _payEthOrTreasury(address to, uint256 value) private {
+        if (value == 0) return;
+        (bool ok,) = to.call{value: value, gas: 30_000}("");
+        if (!ok) {
+            (bool ok2,) = treasury.call{value: value}("");
+            if (!ok2) revert EthTransferFailed();
+            emit PayoutRerouted(to, treasury, value);
+        }
     }
 
     /// @dev Accept ETH only from unwrapping WETH (during `distribute`).

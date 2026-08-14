@@ -54,6 +54,8 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     error NotAuthorized();
     error BadRewardConfig();
     error NotRewardAsset();
+    /// Minimum float before per-share reward math is safe (1e-6 of a 1e27 supply).
+    uint256 internal constant MIN_SHARES_FOR_FUNDING = 1e21;
 
     address public immutable launchpad;
 
@@ -406,6 +408,13 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         // share drops; a sole shareholder funding their whole balance would div-by-zero).
         uint256 shares = totalShares;
         if (shares == 0) revert NoShares();
+        // A DUST share count is as dangerous as none. magnifiedDividendPerShare grows by
+        // received*2**128/shares, so funding against ~1 wei of shares makes it astronomically
+        // large; every later transfer computes magnified*delta, which OVERFLOWS and reverts —
+        // permanently freezing the token. fundRewards is permissionless, so the first buyer
+        // could brick a launch for the price of one dust buy. Require a real float first; the
+        // funder simply retries once the token has holders.
+        if (shares < MIN_SHARES_FOR_FUNDING) revert NoShares();
         // Increasing: the pulled THIS-token is the reflection pool (netted out of
         // balanceOf(this)); holders' balances grow immediately, no push needed.
         if (asset == address(this)) _reflectionHeld += received;

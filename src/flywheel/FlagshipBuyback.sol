@@ -145,6 +145,7 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
     /// up to the floor, and never more than the per-call and per-day caps. Also runs
     /// automatically inside `buyback()`, so the normal cron self-replenishes.
     function topUpGas() public returns (uint256 sent) {
+        // (callable externally by anyone, and via `this.topUpGas()` from buyback — see there)
         address r = gasRecipient;
         if (r == address(0) || gasFloorWei == 0) return 0;
 
@@ -180,7 +181,10 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
     /// needs no arguments and a mid-flight price move just reverts (retry next cycle).
     /// Tops the keeper's gas up FIRST, so the wallet paying for this call is refilled by it.
     function buyback() external onlyOwner nonReentrant returns (uint256 coreOut) {
-        topUpGas();
+        // BEST-EFFORT: topUpGas reverts if the recipient rejects ETH, and it runs first — so a
+        // misconfigured recipient would brick every buyback. The buyback matters more than the
+        // refuel; swallow a failed top-up and carry on.
+        try this.topUpGas() returns (uint256) {} catch {}
         uint256 amountIn = address(this).balance;
         if (amountIn > maxWethPerSwap) amountIn = maxWethPerSwap;
         if (amountIn == 0) revert NothingToBuy();

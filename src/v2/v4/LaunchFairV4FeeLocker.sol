@@ -80,6 +80,7 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     event TreasurySet(address treasury);
     event FlagshipSinkSet(address flagshipSink);
     event FlagshipTradeBpsSet(uint16 tradeBps);
+    event PayoutRerouted(address indexed intended, address indexed fallbackTo, uint256 amount);
 
     error OnlyLaunchpad();
     error OnlyPoolManager();
@@ -265,7 +266,7 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
                 if (wethToTreasury > 0) _payEth(treasury, wethToTreasury);
                 if (wethToDev > 0) {
                     address dev = ICreatorRegistryV4(launchpad).creatorOf(token);
-                    _payEth(dev == address(0) ? treasury : dev, wethToDev);
+                    _payEthOrTreasury(dev == address(0) ? treasury : dev, wethToDev);
                 }
                 if (wethToFlagship > 0) _payEth(sink, wethToFlagship);
                 if (wethToMechanism > 0) {
@@ -283,6 +284,21 @@ contract LaunchFairV4FeeLocker is FeeSplitConfig, Ownable2Step, ReentrancyGuard,
     function _payEth(address to, uint256 value) private {
         (bool ok,) = to.call{value: value}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev Pay a recipient that might reject ETH (a creator address is arbitrary — a contract
+    /// with no receive(), a Safe variant, a self-destructed address). Reverting here would strand
+    /// the WHOLE distribution forever: treasury's and the flagship's slices are in the same call,
+    /// and `creatorOf` is fixed at launch with no way to change it. Fall back to the treasury so
+    /// one bad address can never freeze a token's fees.
+    function _payEthOrTreasury(address to, uint256 value) private {
+        if (value == 0) return;
+        (bool ok,) = to.call{value: value, gas: 30_000}("");
+        if (!ok) {
+            (bool ok2,) = treasury.call{value: value}("");
+            if (!ok2) revert EthTransferFailed();
+            emit PayoutRerouted(to, treasury, value);
+        }
     }
 
     /// @dev Accept ETH only from unwrapping WETH during a claim.

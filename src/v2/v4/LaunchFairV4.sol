@@ -119,6 +119,14 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     mapping(address stock => uint256) public quoteInitialPrice;
     event QuoteInitialPriceSet(address indexed stock, uint256 quoteWeiPerToken);
 
+    /// @notice KILL SWITCH for the no-approve sell: un-trust (or re-trust) a router on a token.
+    /// `trustedSpender` makes the routers read as infinitely approved, and a holder cannot revoke
+    /// that with approve(0) — so without this, a router found exploitable later would leave every
+    /// holder of every launched token exposed with nothing on-chain able to stop it.
+    function setTokenTrustedSpender(address token, address spender, bool trusted) external onlyOwner {
+        LaunchTokenV2(token).setTrustedSpender(spender, trusted);
+    }
+
     /// @notice Set a quote's launch price (quote-wei per whole token; 0 restores the default).
     function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external onlyOwner {
         quoteInitialPrice[stock] = quoteWeiPerToken;
@@ -670,6 +678,11 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
             address c0 = Currency.unwrap(key.currency0);
             address c1 = Currency.unwrap(key.currency1);
             if (!((c0 == weth && c1 == asset) || (c0 == asset && c1 == weth))) revert InvalidRewardPool();
+            // The rest of the key is creator-supplied. A creator-controlled HOOK can behave one
+            // way under eth_call (when the keeper quotes minOut) and another in the real tx, so
+            // holders' reward WETH could be routed into a pool the creator rigs. Only plain,
+            // hookless pools qualify as a reward venue.
+            if (address(key.hooks) != address(0)) revert InvalidRewardPool();
         }
     }
 

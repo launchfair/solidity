@@ -60,7 +60,12 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     address public registrar; // the launchpad; records buyback pools (set-once after deploy)
     bool public registrarLocked; // registrar is frozen after the first post-deploy set (L-03)
     address public locker;
-    address public feeHook; // the WethFeeHook (an alternate fee source that may notify() the pot)
+    address public feeHook;
+    /// @notice Every contract authorized to call `notify` (both fee hooks + anything future).
+    mapping(address => bool) public isFeeSource;
+    /// @notice Ceilings so a creator can't park a payout out of reach. ~1 week of L1 blocks.
+    uint256 public constant MAX_PAYOUT_THRESHOLD = 100 ether;
+    uint256 public constant MAX_PAYOUT_INTERVAL_BLOCKS = 50_400; // the WethFeeHook (an alternate fee source that may notify() the pot)
     // Mode.Perps: the venue is PINNED per token at launch (via registerPerps) — so a later global
     // change can never brick an existing token, and the launch-time and payout-time venues can't diverge.
     mapping(address token => address) public perpsVenueOf;
@@ -164,6 +169,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
 
     event LockerSet(address locker);
     event FeeHookSet(address feeHook);
+    event FeeSourceSet(address indexed source, bool allowed);
     event PerpsVenueSet(address indexed token, address venue);
     event RegistrarSet(address registrar);
     event ProcessorSet(address indexed processor, bool allowed);
@@ -183,6 +189,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     event RandomnessReady(address indexed token, uint256 indexed requestId, bytes32 randomness);
 
     error OnlyLocker();
+    error BadPayoutConfig();
     error OnlyRegistrar();
     error OnlyPoolManager();
     error LockerAlreadySet();
@@ -253,7 +260,19 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// Owner-settable (re-settable, since the hook can be re-mined/redeployed); 0 disables it.
     function setFeeHook(address feeHook_) external onlyOwner {
         feeHook = feeHook_;
+        if (feeHook_ != address(0)) isFeeSource[feeHook_] = true; // keep the legacy setter working
         emit FeeHookSet(feeHook_);
+    }
+
+    /// @notice Authorize (or revoke) a fee source that may call `notify`. There is more than one
+    /// hook in the system — WethFeeHook for WETH pairs, StockFeeHook for stock pairs — and the
+    /// single `feeHook` slot could only ever hold one of them, so whichever was not set had its
+    /// notify REVERT, taking the whole fee distribution down with it (the mechanism slice, and
+    /// the treasury/creator/flagship slices in the same call).
+    function setFeeSource(address source, bool allowed) external onlyOwner {
+        if (source == address(0)) revert ZeroAddress();
+        isFeeSource[source] = allowed;
+        emit FeeSourceSet(source, allowed);
     }
 
 
@@ -315,7 +334,7 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
 
     /// @notice Called by the V4 FeeLocker after forwarding `amount` WETH here.
     function notify(address token, uint256 amount) external {
-        if (msg.sender != locker && (feeHook == address(0) || msg.sender != feeHook)) revert OnlyLocker();
+        if (msg.sender != locker && !isFeeSource[msg.sender]) revert OnlyLocker();
         pendingWeth[token] += amount;
         emit Notified(token, amount, pendingWeth[token]);
     }
@@ -323,7 +342,13 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// @notice The token's dev (creator) — or the launchpad — sets the minimum
     /// pending WETH that must accrue before a payout fires.
     function setPayoutThreshold(address token, uint256 amount) external {
-        if (msg.sender != registrar && msg.sender != _creator(token)) revert NotAuthorized();
+        if (msg.sender != registrar && msg.sender != _creator(token) && msg.sender != owner()) {
+            revert NotAuthorized();
+        }
+        // A creator setting this to type(uint256).max would make process() revert BelowThreshold
+        // forever, freezing every holder's rewards (and a lottery's whole pot) with no way out.
+        // The owner is now authorized to unstick it, and the value is clamped.
+        if (amount > MAX_PAYOUT_THRESHOLD) revert BadPayoutConfig();
         payoutThreshold[token] = amount;
         emit PayoutThresholdSet(token, amount);
     }
@@ -331,7 +356,11 @@ contract LaunchFairV4Distributor is Ownable, ReentrancyGuard, IUnlockCallback, I
     /// @notice The token's dev (creator) — or the launchpad — sets the block-based
     /// timer: minimum L1 blocks between payouts/draws. 0 = fire as soon as ready.
     function setPayoutInterval(address token, uint256 intervalBlocks) external {
-        if (msg.sender != registrar && msg.sender != _creator(token)) revert NotAuthorized();
+        if (msg.sender != registrar && msg.sender != _creator(token) && msg.sender != owner()) {
+            revert NotAuthorized();
+        }
+        // Same hostage problem as the threshold: an enormous interval freezes payouts and draws.
+        if (intervalBlocks > MAX_PAYOUT_INTERVAL_BLOCKS) revert BadPayoutConfig();
         payoutIntervalBlocks[token] = intervalBlocks;
         emit PayoutIntervalSet(token, intervalBlocks);
     }
