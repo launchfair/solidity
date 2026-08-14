@@ -376,7 +376,9 @@ contract StockFeeHook is IHooks, Ownable2Step {
     /// into their own floor and it constrained nothing: push, claim, back-run. A TWAP cannot be
     /// moved inside one transaction, and taking the higher of the two means a manipulated-low
     /// spot is simply ignored. If a pool is too young to serve a TWAP the floor falls back to
-    /// spot (the deploy script grows the cardinality of the stock pools for this reason).
+    /// spot. Robinhood's own stock/WETH pools already carry deep observation rings (measured
+    /// 2026-08-14: NVDA 1500, COIN 1500, USDG 2500, RDDT 500), so the TWAP is live on every quote
+    /// we allow today; a brand-new or thin pool is the only case that degrades to spot.
     function claimFeesWithMin(address token, uint256 minWethOut) public returns (uint256 wethOut) {
         if (address(claimV3Factory) == address(0)) revert NotConfigured();
         uint256 amount = accrued[token];
