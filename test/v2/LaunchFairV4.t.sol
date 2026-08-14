@@ -331,6 +331,42 @@ contract LaunchFairV4Test is Test, Deployers {
         assertLe(tickTokenPerQuote, bottomB, "pool initialized at/below the down-shifted range bottom");
     }
 
+    /// Selling must be ONE transaction: the platform routers read as infinitely approved, so no
+    /// approve step is ever needed. Everything else still requires a real allowance.
+    function test_trustedSpender_routersNeedNoApproval() public {
+        (address token, PoolKey memory key) = _createRedistribute();
+        LaunchTokenV2 t = LaunchTokenV2(token);
+
+        assertEq(t.allowance(HOLDER, address(v4Router)), type(uint256).max, "V4 router pre-approved");
+        assertTrue(t.trustedSpender(address(v4Router)), "router flagged trusted");
+        assertEq(t.allowance(HOLDER, address(0xBAD)), 0, "everyone else still needs an approval");
+
+        // A trusted spender can actually move tokens with no approve() call. Get real tokens
+        // by buying off the pool (past the launch guard), then hand them to the holder.
+        vm.warp(block.timestamp + 120);
+        _buy(key, token, 0.01 ether);
+        uint256 bought = IERC20(token).balanceOf(address(this));
+        assertGt(bought, 1_000 ether, "bought enough to test with");
+        IERC20(token).transfer(HOLDER, bought);
+
+        vm.prank(address(v4Router));
+        t.transferFrom(HOLDER, address(0xCAFE), 1_000 ether);
+        assertEq(t.balanceOf(address(0xCAFE)), 1_000 ether, "sold without an approval tx");
+
+        // ...and an untrusted one still cannot.
+        vm.prank(address(0xBAD));
+        vm.expectRevert();
+        t.transferFrom(HOLDER, address(0xBAD), 10 ether);
+    }
+
+    /// Stock-paired tokens get the same treatment for the stock router.
+    function test_trustedSpender_stockRouter() public {
+        MockWethT stockQ = new MockWethT();
+        _stockStack("trusted", address(stockQ));
+        address token = pad.createStockToken{value: 0.000005 ether}(_stockParams("STR", LaunchTokenV2.Mode.Base), address(stockQ));
+        assertEq(LaunchTokenV2(token).allowance(HOLDER, pad.stockPairRouter()), type(uint256).max, "stock router pre-approved");
+    }
+
     // A single reward asset taking the full fee weight, on a V3 (or V4) venue.
     function _oneReward(address asset, bool isV3, uint24 v3Fee)
         internal
