@@ -188,6 +188,9 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     error ZeroAddress();
     error EthTransferFailed();
     error FeeTooHigh();
+    /// @notice The pool already existed at a price that is not the intended launch price —
+    /// someone front-ran the launch. Deploy a TGE on a different fee tier to route around it.
+    error PoolPreInitialized();
 
     constructor(
         address owner_,
@@ -333,7 +336,23 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         // sqrtPriceX96 = sqrt(a1/a0) * 2^96, computed as (sqrt(a1) << 96) / sqrt(a0) —
         // plenty of precision for an initial price on fresh liquidity.
         uint160 sqrtPriceX96 = uint160((Math.sqrt(a1) << 96) / Math.sqrt(a0));
-        IUniswapV3Pool(pool).initialize(sqrtPriceX96);
+        // `initialize` used to be unconditional, which made this ONE-SHOT launch trivially
+        // griefable: the token address is deterministic (CREATE2), so anyone could front-run
+        // with createPool + initialize and every later launch() would revert on the already-
+        // initialized pool, with no second attempt and no way through. Adopt a pool someone
+        // else initialized as long as its price is the one we intended (within a tick of
+        // rounding); otherwise fail with a NAMED error the operator can actually act on
+        // instead of Uniswap's opaque "AI".
+        (uint160 existing,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (existing == 0) {
+            IUniswapV3Pool(pool).initialize(sqrtPriceX96);
+        } else {
+            uint160 hi = existing > sqrtPriceX96 ? existing : sqrtPriceX96;
+            uint160 lo = existing > sqrtPriceX96 ? sqrtPriceX96 : existing;
+            // 1% band on sqrt price = ~2% on price: tight enough that nobody can move the
+            // launch valuation, loose enough to absorb rounding.
+            if (uint256(hi - lo) * 100 > uint256(sqrtPriceX96)) revert PoolPreInitialized();
+        }
 
         IERC20(tokenAddr).forceApprove(address(positionManager), pairTokens);
         IERC20(address(weth)).forceApprove(address(positionManager), eth);
