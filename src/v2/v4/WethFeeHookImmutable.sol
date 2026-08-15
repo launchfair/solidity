@@ -85,19 +85,21 @@ contract WethFeeHookImmutable is IHooks, IUnlockCallback, FeeSplitConfig {
     address public immutable distributor; // the token's own reward/lottery/redistribute/perps mechanism (notify)
     address public immutable flagshipSink; // flagship buyback vault (0 folds to treasury)
     address public immutable launchpad; // resolves the per-token dev via creatorOf(token)
-    // Flat 4-way split of every collected fee, the same for every tier and token:
-    //   dev 50% : the token creator.
-    //   mechanism 30% ("protocol"): the token's own mechanism if it has one (Reward/Increasing/
-    //     Lottery/Perps) via distributor.notify; a plain Base token has none, so it folds into the
-    //     buyback. So every token feeds the flywheel by at least the buyback slice, and a Base token
-    //     feeds it 40% (mechanism + buyback).
-    //   treasury 10% : the platform treasury.
-    //   flagship 10% ("buyback"): the flagship buyback vault, which converts fees into the core token
-    //     for the points/seasons flywheel.
-    uint16 public constant treasuryBps = 1_000; // 10%
-    uint16 public constant devBps = 5_000; // 50%
-    uint16 public constant mechanismBps = 3_000; // 30% (the token's mechanism, else folds to buyback)
-    uint16 public constant flagshipBps = 1_000; // 10% (buyback) — the four sum to BPS
+    // FLAT PLATFORM TAKE + SCALING PROTOCOL. dev / buyback / treasury are (near-)flat shares of the
+    // TRADE regardless of the fee tier; only the protocol (mechanism) slice scales up with the tier.
+    // Expressed as bps of the TRADE at the 1% base tier:
+    //   dev       0.4% flat        -> the token creator.
+    //   buyback   0.2% flat        -> the flagship buyback vault (the flywheel).
+    //   treasury  0.1% + 2% of the fee-above-1% (a small notch at higher tiers) -> the treasury.
+    //   protocol  the remainder    -> the token's own mechanism (Reward/Increasing/Lottery/Perps)
+    //                                 via distributor.notify; a plain Base token has none, so its
+    //                                 protocol slice folds into the buyback (feeds the flywheel).
+    // So on a 10% token: dev 0.4 / treasury 0.28 / buyback 0.2 / protocol 9.12 (% of the trade).
+    uint16 public constant BASE_FEE_BPS = 100; // the 1% base tier the flat shares are calibrated to
+    uint16 public constant DEV_TRADE_BPS = 40; // dev 0.4% of the trade, flat
+    uint16 public constant BUYBACK_TRADE_BPS = 20; // buyback 0.2% of the trade, flat
+    uint16 public constant TREASURY_BASE_TRADE_BPS = 10; // treasury 0.1% base, flat
+    uint16 public constant TREASURY_NOTCH_BPS = 200; // + 2% of the fee-above-1% (the treasury notch)
 
     /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
     mapping(address => uint256) public owed;
@@ -128,6 +130,10 @@ contract WethFeeHookImmutable is IHooks, IUnlockCallback, FeeSplitConfig {
         address launchpad_
     ) {
         if (feeBps_ > MAX_FEE_BPS) revert InvalidFeeBps();
+        // The flat-take split calibrates the fixed dev/buyback/treasury shares to the 1% base, so the
+        // global fallback fee (used for foreign tokens with no tier) must be 0 or >= 1% — never in
+        // (0, 1%), where the fixed shares would exceed the collected fee.
+        if (feeBps_ != 0 && feeBps_ < BASE_FEE_BPS) revert InvalidFeeBps();
         if (treasury_ == address(0)) revert NotConfigured(); // treasury is the fallback for every slice
         poolManager = pm_;
         weth = weth_;
@@ -258,18 +264,18 @@ contract WethFeeHookImmutable is IHooks, IUnlockCallback, FeeSplitConfig {
     function _split(address token, uint256 amount) private {
         address t = treasury;
         IERC20 w = IERC20(weth);
-        uint256 toTreasury;
-        uint256 toDev;
-        uint256 toMechanism;
-        uint256 toFlagship;
 
-        // Flat 4-way split, identical for every tier and token: dev 50 / mechanism 30 / treasury 10
-        // / flagship 10. The fee RATE is still the creator's per-tier 3/5/10% choice (see feeBpsFor);
-        // only the split of the collected fee is uniform.
-        toTreasury = (amount * treasuryBps) / BPS;
-        toDev = (amount * devBps) / BPS;
-        toFlagship = (amount * flagshipBps) / BPS;
-        toMechanism = amount - toTreasury - toDev - toFlagship;
+        // FLAT TAKE + SCALING PROTOCOL. `feeBps` is the token's fee rate in bps of the TRADE (its
+        // 3/5/10% tier, or the 1% global fallback). dev/buyback/treasury are (near-)flat shares of the
+        // trade, so as a fraction of the collected fee `amount` (= feeBps of the trade) each is
+        // tradeBps/feeBps; the protocol/mechanism slice takes the rest and thus scales with the tier.
+        uint256 rate = feeBpsFor(token); // the token's fee rate in bps of the trade
+        uint256 extra = rate > BASE_FEE_BPS ? rate - BASE_FEE_BPS : 0; // fee above the 1% base
+        uint256 treasuryTradeBps = TREASURY_BASE_TRADE_BPS + (extra * TREASURY_NOTCH_BPS) / BPS;
+        uint256 toDev = (amount * DEV_TRADE_BPS) / rate;
+        uint256 toFlagship = (amount * BUYBACK_TRADE_BPS) / rate; // the always-buyback flat slice
+        uint256 toTreasury = (amount * treasuryTradeBps) / rate;
+        uint256 toMechanism = amount - toDev - toFlagship - toTreasury; // the scaling protocol slice
 
         // Mechanism slice stays in WETH — it feeds the on-chain buyback engine (the distributor swaps
         // WETH→reward). Plain (Base) tokens have no mechanism → the slice folds into the flagship.

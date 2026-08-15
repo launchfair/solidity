@@ -116,10 +116,11 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         assertEq(hook.treasury(), TREASURY, "treasury baked in");
         assertEq(hook.flagshipSink(), FLAGSHIP, "flagship baked in");
         assertEq(hook.launchpad(), address(pad), "launchpad baked in");
-        assertEq(hook.treasuryBps(), 1000, "treasury 10%");
-        assertEq(hook.devBps(), 5000, "dev 50%");
-        assertEq(hook.mechanismBps(), 3000, "mechanism/protocol 30%");
-        assertEq(hook.flagshipBps(), 1000, "buyback 10%");
+        assertEq(hook.BASE_FEE_BPS(), 100, "1% base");
+        assertEq(hook.DEV_TRADE_BPS(), 40, "dev 0.4% of trade, flat");
+        assertEq(hook.BUYBACK_TRADE_BPS(), 20, "buyback 0.2% of trade, flat");
+        assertEq(hook.TREASURY_BASE_TRADE_BPS(), 10, "treasury 0.1% base, flat");
+        assertEq(hook.TREASURY_NOTCH_BPS(), 200, "+2% of the fee-above-1%");
     }
 
     // ── NO admin surface: the exact selectors a scanner flags do not exist ─────────
@@ -149,9 +150,10 @@ contract WethFeeHookImmutableTest is Test, Deployers {
     }
 
     // ── per-tier RATE, flat 50/30/10/10 SPLIT ─────────────────────────────────────
-    // The creator's tier sets the fee RATE (10% here). The split of the collected fee is the flat
-    // dev 50 / mechanism 30 / treasury 10 / buyback 10. This token exposes no mode() and the
-    // distributor is unset, so its 30% mechanism slice folds into the buyback: buyback gets 40%.
+    // Flat take + scaling protocol. At the 10% tier the collected fee splits (as % of the trade):
+    // dev 0.4 / treasury 0.28 (0.1 base + 2% of the 9% extra) / buyback 0.2 flat / protocol 9.12.
+    // This token exposes no mode() and the distributor is unset, so its protocol slice folds into the
+    // buyback -> buyback gets 0.2 + 9.12 = 9.32% of the trade (93.2% of the collected fee).
     function test_tierRate_flatSplit_baseFoldsToBuyback() public {
         pad.setLaunch(address(token), address(0xDEF), 100_000); // 10% tier, creator 0xDEF
 
@@ -160,18 +162,19 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         uint256 acc = hook.accrued(address(token));
         assertEq(acc, (1 ether * 1000) / 10_000, "10% tier charged, not global 1%");
 
-        uint256 toTreasury = (acc * 1000) / 10_000; // 10%
-        uint256 toDev = (acc * 5000) / 10_000; // 50%
+        uint256 toTreasury = (acc * 28) / 1000; // 0.28% of trade = 2.8% of the 10% fee
+        uint256 toDev = (acc * 40) / 1000; // 0.4% of trade = 4% of the fee
         hook.distribute(address(token));
-        assertEq(TREASURY.balance, toTreasury, "treasury = 10%");
-        assertEq(address(0xDEF).balance, toDev, "creator PAID 50% directly");
-        // buyback (flagship) = its own 10% + the folded 30% mechanism = 40%.
-        assertEq(FLAGSHIP.balance, acc - toTreasury - toDev, "buyback got 40% (10% + folded 30%)");
+        assertEq(TREASURY.balance, toTreasury, "treasury flat 0.1% + 2% notch = 0.28% of trade");
+        assertEq(address(0xDEF).balance, toDev, "creator PAID flat 0.4% of trade");
+        // buyback (flagship) = its flat 0.2% + the folded scaling protocol = the rest.
+        assertEq(FLAGSHIP.balance, acc - toTreasury - toDev, "buyback got flat 0.2% + folded protocol");
         assertEq(hook.accrued(address(token)), 0, "accrual cleared");
     }
 
-    // ── MODE token: the 30% "protocol" slice funds the token's mechanism, buyback still gets 10% ──
-    function test_modeToken_mechanismGets30_buybackGets10() public {
+    // ── MODE token at the 10% tier: the SCALING protocol slice (~9.12% of the trade) funds the
+    // token's mechanism; dev/treasury/buyback stay flat (0.4 / 0.28 / 0.2% of the trade) ──
+    function test_modeToken_protocolScales_flatTake() public {
         MockDistributor dist = new MockDistributor();
         ModeToken mtoken = new ModeToken("MODE", "MODE");
         mtoken.setMode(1); // Reward mode -> _hasMechanism true
@@ -221,11 +224,14 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         uint256 tre0 = TREASURY.balance;
         uint256 fl0 = FLAGSHIP.balance;
         uint256 dev0 = address(0xDEF).balance;
+        uint256 toTreasury = (acc * 28) / 1000; // 0.28% of trade
+        uint256 toDev = (acc * 40) / 1000; // 0.4% of trade
+        uint256 toBuyback = (acc * 20) / 1000; // 0.2% of trade, flat
         h.distribute(address(mtoken));
-        assertEq(dist.got(), (acc * 3000) / 10_000, "mechanism (protocol) got 30% via notify");
-        assertEq(TREASURY.balance - tre0, (acc * 1000) / 10_000, "treasury 10%");
-        assertEq(address(0xDEF).balance - dev0, (acc * 5000) / 10_000, "dev 50%");
-        assertEq(FLAGSHIP.balance - fl0, (acc * 1000) / 10_000, "buyback 10% (mechanism NOT folded)");
+        assertEq(dist.got(), acc - toTreasury - toDev - toBuyback, "mechanism = the scaling protocol (~91.2%)");
+        assertEq(TREASURY.balance - tre0, toTreasury, "treasury flat 0.28% of trade");
+        assertEq(address(0xDEF).balance - dev0, toDev, "dev flat 0.4% of trade");
+        assertEq(FLAGSHIP.balance - fl0, toBuyback, "buyback flat 0.2% (protocol NOT folded)");
     }
 
     // ── sells take the fee from the WETH output, never the token ──────────────────

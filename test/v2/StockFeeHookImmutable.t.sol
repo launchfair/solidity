@@ -123,10 +123,11 @@ contract StockFeeHookImmutableTest is Test, Deployers {
         assertEq(hook.treasury(), TREASURY);
         assertEq(hook.flagshipSink(), FLAGSHIP);
         assertEq(hook.distributor(), address(dist));
-        assertEq(hook.treasuryBps(), 1000, "treasury 10%");
-        assertEq(hook.devBps(), 5000, "dev 50%");
-        assertEq(hook.mechanismBps(), 3000, "mechanism 30%");
-        assertEq(hook.flagshipBps(), 1000, "buyback 10%");
+        assertEq(hook.BASE_FEE_BPS(), 100, "1% base");
+        assertEq(hook.DEV_TRADE_BPS(), 40, "dev 0.4% of trade, flat");
+        assertEq(hook.BUYBACK_TRADE_BPS(), 20, "buyback 0.2% of trade, flat");
+        assertEq(hook.TREASURY_BASE_TRADE_BPS(), 10, "treasury 0.1% base, flat");
+        assertEq(hook.TREASURY_NOTCH_BPS(), 200, "+2% of the fee-above-1%");
         assertEq(hook.claimSlippageBps(), 300);
     }
 
@@ -154,8 +155,9 @@ contract StockFeeHookImmutableTest is Test, Deployers {
         assertEq(hook.accrued(address(token)), (stockIn * FEE_BPS) / 10_000, "1% of stock input");
     }
 
-    // Base stock token: permissionless claim, flat split, mechanism folds -> buyback gets 40%.
-    function test_claimFees_baseFlatSplit_buybackGets40() public {
+    // Base stock token, flat take at the 1% stock fee: dev 40 / treasury 10 / buyback 20 / protocol
+    // 30 (% of out). No mechanism, so protocol folds into the buyback -> buyback gets 50%.
+    function test_claimFees_baseFlatSplit_buybackGets50() public {
         stock.approve(address(swapRouter), type(uint256).max);
         _swap(!tokenIsCurrency0, 100 ether);
         uint256 acc = hook.accrued(address(token));
@@ -164,14 +166,14 @@ contract StockFeeHookImmutableTest is Test, Deployers {
         vm.prank(DEV); // permissionless: the creator triggers it
         uint256 out = hook.claimFees(address(token));
         assertEq(out, acc, "1:1 conversion");
-        assertEq(TREASURY.balance, (out * 1000) / 10_000, "treasury 10%");
-        assertEq(DEV.balance, (out * 5000) / 10_000, "dev 50%");
-        assertEq(FLAGSHIP.balance, out - (out * 1000) / 10_000 - (out * 5000) / 10_000, "buyback 40% (mechanism folded)");
+        assertEq(TREASURY.balance, (out * 10) / 100, "treasury 10% of out");
+        assertEq(DEV.balance, (out * 40) / 100, "dev 40% of out");
+        assertEq(FLAGSHIP.balance, out - (out * 10) / 100 - (out * 40) / 100, "buyback 50% (20 flat + folded 30 protocol)");
         assertEq(hook.accrued(address(token)), 0, "accrual cleared");
     }
 
-    // Mode stock token: 30% mechanism to the distributor in WETH, buyback keeps only 10%.
-    function test_claimFees_modeToken_mechanism30_buyback10() public {
+    // Mode stock token: the 30% protocol slice goes to the distributor in WETH, buyback keeps 20%.
+    function test_claimFees_modeToken_protocol30_buyback20() public {
         MockModeToken mtok = new MockModeToken("RWD", "RWD");
         mtok.mint(address(this), 1_000_000_000 ether);
         pad.setCreator(address(mtok), DEV);
@@ -207,10 +209,10 @@ contract StockFeeHookImmutableTest is Test, Deployers {
         uint256 flagBefore = FLAGSHIP.balance;
         vm.prank(DEV);
         uint256 out = hook.claimFees(address(mtok));
-        uint256 mech = (out * 3000) / 10_000;
-        assertEq(weth.balanceOf(address(dist)), mech, "mechanism 30% to distributor in WETH");
+        uint256 mech = (out * 30) / 100; // the scaling protocol slice (30% of out at the 1% stock fee)
+        assertEq(weth.balanceOf(address(dist)), mech, "protocol 30% to distributor in WETH");
         assertEq(dist.notifiedAmount(), mech, "notify amount matches");
-        assertEq(FLAGSHIP.balance - flagBefore, (out * 1000) / 10_000, "buyback keeps only its 10%");
+        assertEq(FLAGSHIP.balance - flagBefore, (out * 20) / 100, "buyback keeps its flat 20%");
     }
 
     // The self-quoted floor still blocks a rigged conversion, even with no owner.

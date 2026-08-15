@@ -112,13 +112,15 @@ contract StockFeeHookImmutable is IHooks {
     // ── split & destinations: FIXED at construction, no setters ──
     address public immutable treasury; // fallback for every unset destination
     address public immutable flagshipSink; // the flagship buyback vault (0 folds to treasury)
-    // Flat 4-way split of every collected fee, the same for every stock token:
-    //   dev 50 : the token creator. mechanism 30 ("protocol"): the token's own reward/lottery via
-    //   distributor.notify, or folds into the buyback for a Base stock token. treasury 10. buyback 10.
-    uint16 public constant treasuryBps = 1_000; // 10%
-    uint16 public constant devBps = 5_000; // 50%
-    uint16 public constant mechanismBps = 3_000; // 30% (the token's mechanism, else folds to buyback)
-    uint16 public constant flagshipBps = 1_000; // 10% (buyback) — the four sum to BPS
+    // FLAT TAKE + SCALING PROTOCOL (same model as the WETH hook, calibrated to the 1% base). Stock
+    // pools charge feeBps (1%), so in practice the scaling never engages and the split is the base
+    // dev 0.4 / buyback 0.2 / treasury 0.1 / protocol 0.3 (% of the trade); if a higher stock fee is
+    // ever set, dev/buyback stay flat and the protocol slice scales, exactly like the WETH hook.
+    uint16 public constant BASE_FEE_BPS = 100; // the 1% base the flat shares are calibrated to
+    uint16 public constant DEV_TRADE_BPS = 40; // dev 0.4% of the trade, flat
+    uint16 public constant BUYBACK_TRADE_BPS = 20; // buyback 0.2% of the trade, flat
+    uint16 public constant TREASURY_BASE_TRADE_BPS = 10; // treasury 0.1% base, flat
+    uint16 public constant TREASURY_NOTCH_BPS = 200; // + 2% of the fee-above-1% (the treasury notch)
     /// The V4 distributor. Mechanism slices for Reward/Lottery stock tokens go here in WETH + a
     /// notify() credit, mirroring the V4 FeeLocker's WETH-pair flow.
     address public immutable distributor;
@@ -169,6 +171,9 @@ contract StockFeeHookImmutable is IHooks {
         uint16 claimSlippageBps_
     ) {
         if (feeBps_ > MAX_FEE_BPS) revert InvalidFeeBps();
+        // The flat-take split calibrates the fixed shares to the 1% base, so the stock fee must be
+        // 0 or >= 1% — never in (0, 1%), where the fixed shares would exceed the collected fee.
+        if (feeBps_ != 0 && feeBps_ < BASE_FEE_BPS) revert InvalidFeeBps();
         if (treasury_ == address(0)) revert NotConfigured(); // treasury is the fallback for every slice
         if (claimSlippageBps_ > 2_000) revert InvalidSplit();
         poolManager = pm_;
@@ -471,22 +476,28 @@ contract StockFeeHookImmutable is IHooks {
     }
 
     function _split(address token, uint256 stockIn, uint256 out) private {
-        uint256 toTreasury = (out * treasuryBps) / BPS;
-        uint256 toDev = (out * devBps) / BPS;
+        // FLAT TAKE + SCALING PROTOCOL, on the WETH obtained from converting the stock fee. `rate` is
+        // the stock-leg fee in bps; dev/buyback/treasury are (near-)flat shares of the trade, so as a
+        // fraction of `out` each is tradeBps/rate; the protocol slice takes the rest and scales.
+        uint256 rate = feeBps;
+        uint256 extra = rate > BASE_FEE_BPS ? rate - BASE_FEE_BPS : 0;
+        uint256 treasuryTradeBps = TREASURY_BASE_TRADE_BPS + (extra * TREASURY_NOTCH_BPS) / BPS;
+        uint256 toTreasury = (out * treasuryTradeBps) / rate;
+        uint256 toDev = (out * DEV_TRADE_BPS) / rate;
+        uint256 toBuyback = (out * BUYBACK_TRADE_BPS) / rate; // the always-buyback flat slice
 
-        // MODE stock tokens (Reward/Lottery — mode != 0) fund their mechanism through the
-        // distributor, exactly like the V4 FeeLocker does for WETH pairs: the slice stays WETH
-        // and is credited via notify(). Base tokens (and an unset distributor, and any token
-        // whose mode read fails) fold the slice into the flagship as before — fail-open to the
-        // old behavior, never a stuck distribute().
+        // MODE stock tokens (Reward/Lottery — mode != 0) fund their mechanism with the scaling
+        // PROTOCOL slice through the distributor (WETH + a notify() credit). Base tokens (and an unset
+        // distributor, and any token whose mode read fails) fold that slice into the flagship —
+        // fail-open, never a stuck distribute().
         uint256 toMechanism;
         address dist = distributor;
-        if (dist != address(0) && mechanismBps != 0) {
+        if (dist != address(0)) {
             try IModeTokenView(token).mode() returns (uint8 m) {
-                if (m != 0) toMechanism = (out * mechanismBps) / BPS;
+                if (m != 0) toMechanism = out - toTreasury - toDev - toBuyback; // the protocol slice
             } catch {}
         }
-        // Flagship takes the remainder (its own share + Base tokens' folded mechanism + dust).
+        // Flagship takes the remainder: the flat buyback slice + Base tokens' folded protocol + dust.
         uint256 toFlagship = out - toTreasury - toDev - toMechanism;
 
         // BEST-EFFORT, exactly like WethFeeHook: a distributor that reverts (revoked fee source,
