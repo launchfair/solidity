@@ -60,11 +60,10 @@ contract DeployV4 is Script {
     address constant DEFAULT_V4_SWAP_ROUTER = 0x0e6c53664388B68F6b41851D224248F391CC8947;
     // TokenDeployerV2 is a stateless CREATE2 factory, but it BAKES IN the LaunchTokenV2
     // bytecode — so reusing an old one silently launches tokens built from old token code.
-    // That is exactly what happened on the first stack #9 attempt: this constant still pointed
-    // at a factory that predates `trustedSpender`, so every launch reverted at
-    // setTrustedSpender and, had it not reverted, would have shipped tokens without the
-    // one-transaction sell. Default to deploying a FRESH one; pin it via the TOKEN_DEPLOYER env
-    // only after checking that factory's token bytecode is current.
+    // A stale deployer here ships tokens from the wrong token bytecode: e.g. one built before
+    // the `trustedSpender` removal would still carry the infinite-allowance getter that trips
+    // the "unsafe contract" scanner flag. Default to deploying a FRESH one; pin it via the
+    // TOKEN_DEPLOYER env only after checking that factory's token bytecode is current.
     address constant DEFAULT_TOKEN_DEPLOYER = address(0);
 
     function run() external {

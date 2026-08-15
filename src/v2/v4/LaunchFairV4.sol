@@ -124,27 +124,6 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
     mapping(address stock => uint256) public quoteInitialPrice;
     event QuoteInitialPriceSet(address indexed stock, uint256 quoteWeiPerToken);
 
-    /// @notice KILL SWITCH for the no-approve sell: un-trust a router on a token.
-    /// `trustedSpender` makes the routers read as infinitely approved, and a holder cannot revoke
-    /// that with approve(0) — so without this, a router found exploitable later would leave every
-    /// holder of every launched token exposed with nothing on-chain able to stop it.
-    ///
-    /// REVOKE-ONLY on purpose. It used to take a bool, which made the same switch a way to GRANT
-    /// infinite allowance over every holder of any launched token to an arbitrary address: one
-    /// call plus `transferFrom` drains them all, and holders have no on-chain defence because
-    /// `approve(0)` cannot revoke a trusted spender. Owner power here is now strictly subtractive.
-    function untrustTokenSpender(address token, address spender) external onlyOwner {
-        LaunchTokenV2(token).setTrustedSpender(spender, false);
-    }
-
-    /// @notice Restore trust after a revoke — ONLY for this platform's own routers, which are the
-    /// only addresses the launch flow ever trusted in the first place. A false alarm is
-    /// recoverable; granting a fresh address is not possible.
-    function retrustTokenRouter(address token, address spender) external onlyOwner {
-        if (spender != swapRouter && spender != stockPairRouter) revert QuoteNotAllowed();
-        LaunchTokenV2(token).setTrustedSpender(spender, true);
-    }
-
     /// @notice Set a quote's launch price (quote-wei per whole token; 0 restores the default).
     function setAllowedQuotePrice(address stock, uint256 quoteWeiPerToken) external onlyOwner {
         quoteInitialPrice[stock] = quoteWeiPerToken;
@@ -488,9 +467,8 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         t.excludeFromDividends(distributor, true);
         t.setLimitExempt(address(poolManager), true);
         t.setLimitExempt(address(locker), true);
-        // No approve step when selling (see LaunchTokenV2.trustedSpender). `swapRouter` is the
-        // set-once V4 router every mode/base token sells through.
-        if (swapRouter != address(0)) t.setTrustedSpender(swapRouter, true);
+        // Selling uses the standard ERC-20 approve of the router (no trustedSpender) so the token
+        // trips no scanner "infinite designated-spender allowance" flag.
 
         // Hand the supply to the locker and lock it single-sided forever.
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
@@ -676,9 +654,7 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
         t.setLimitExempt(address(poolManager), true);
         t.setLimitExempt(address(locker), true);
         t.setLimitExempt(stockPairRouter, true);
-        // No approve step when selling: the router reads as infinitely approved (see
-        // LaunchTokenV2.trustedSpender), so a sell is ONE transaction.
-        t.setTrustedSpender(stockPairRouter, true);
+        // Selling uses the standard ERC-20 approve of the stock router (no trustedSpender).
 
         IERC20(token).safeTransfer(address(locker), tokenTotalSupply);
         locker.lockLiquidity(token, key, tl, tu, liquidity, tokenIsCurrency0);

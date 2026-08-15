@@ -79,14 +79,13 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
     mapping(address => bool) public limitExempt;
     event LimitExemptSet(address indexed account, bool exempt);
 
-    /// @notice Platform routers that never need an ERC-20 approval from holders: `allowance()`
-    /// reports max for them, so selling is ONE transaction instead of approve-then-sell.
-    /// Launchpad-set (the launchpad marks its own routers at launch), and deliberately narrow:
-    /// a router can only ever move tokens the holder passes to it in their own sell call — the
-    /// same standing permission every holder already grants with the infinite approval the UI
-    /// used to request on a first sell, minus the extra signature.
-    mapping(address => bool) public trustedSpender;
-    event TrustedSpenderSet(address indexed spender, bool trusted);
+    // Allowances are plain ERC-20 throughout: a sell needs the normal one-time `approve` of the
+    // router, so this token trips no "infinite designated-spender allowance" scanner heuristic.
+    // The old `trustedSpender` no-approve-sell shortcut (its mapping getter plus an `allowance()`
+    // override that reported max for routers) was exactly what a token scanner flagged as an
+    // unsafe contract, so it was removed. The frontend already approves-then-sells when the
+    // allowance is short, and the instant wallet signs that approve with no popup, so the only
+    // cost is one silent extra tx. `setTrustedSpender` survives below as a no-op ABI shim.
 
     // ── creator/platform metadata ────────────────────────────────────────────
     string public platformWebsite;
@@ -254,20 +253,14 @@ contract LaunchTokenV2 is ERC20Burnable, ReentrancyGuard {
         emit LimitExemptSet(account, exempt);
     }
 
-    /// @notice Launchpad-only: mark/unmark a platform router as needing no approval.
-    function setTrustedSpender(address spender, bool trusted) external {
+    /// @notice No-op ABI compatibility shim. Already-deployed launchpads call this at launch to
+    /// mark their routers as no-approve spenders; that mechanism was removed (it made the token
+    /// scan as unsafe), but the selector must stay callable so this token can be hot-swapped in
+    /// as the factory implementation UNDER an existing launchpad without a launchpad redeploy.
+    /// It records nothing and changes no allowance, so it is invisible to token scanners. Safe to
+    /// delete once no live launchpad references it.
+    function setTrustedSpender(address, bool) external view {
         if (msg.sender != launchpad) revert OnlyLaunchpad();
-        trustedSpender[spender] = trusted;
-        emit TrustedSpenderSet(spender, trusted);
-    }
-
-    /// @inheritdoc ERC20
-    /// @dev Trusted platform routers read as infinitely approved. OZ's `_spendAllowance` reads
-    /// this same virtual getter and skips the bookkeeping write on a max allowance, so
-    /// transferFrom just works for them and nothing else changes.
-    function allowance(address owner_, address spender) public view override returns (uint256) {
-        if (trustedSpender[spender]) return type(uint256).max;
-        return super.allowance(owner_, spender);
     }
 
     /// @notice Launchpad-only; records this token's own WETH pool (once) so the

@@ -355,40 +355,55 @@ contract LaunchFairV4Test is Test, Deployers {
         assertLe(tickTokenPerQuote, bottomB, "pool initialized at/below the down-shifted range bottom");
     }
 
-    /// Selling must be ONE transaction: the platform routers read as infinitely approved, so no
-    /// approve step is ever needed. Everything else still requires a real allowance.
-    function test_trustedSpender_routersNeedNoApproval() public {
+    /// No token is ever born with an infinite designated-spender allowance. The platform routers
+    /// get NO special standing (that `trustedSpender` shortcut was removed so tokens scan clean);
+    /// a sell goes through the standard ERC-20 approve, and transferFrom without one reverts.
+    function test_noInfiniteAllowanceForRouters() public {
         (address token, PoolKey memory key) = _createRedistribute();
         LaunchTokenV2 t = LaunchTokenV2(token);
 
-        assertEq(t.allowance(HOLDER, address(v4Router)), type(uint256).max, "V4 router pre-approved");
-        assertTrue(t.trustedSpender(address(v4Router)), "router flagged trusted");
-        assertEq(t.allowance(HOLDER, address(0xBAD)), 0, "everyone else still needs an approval");
+        // The router is NOT pre-approved, and neither is anyone else.
+        assertEq(t.allowance(HOLDER, address(v4Router)), 0, "V4 router has no standing allowance");
+        assertEq(t.allowance(HOLDER, address(0xBAD)), 0, "no one else does either");
 
-        // A trusted spender can actually move tokens with no approve() call. Get real tokens
-        // by buying off the pool (past the launch guard), then hand them to the holder.
+        // Get real tokens by buying off the pool (past the launch guard), then hand them to HOLDER.
         vm.warp(block.timestamp + 120);
         _buy(key, token, 0.01 ether);
         uint256 bought = IERC20(token).balanceOf(address(this));
         assertGt(bought, 1_000 ether, "bought enough to test with");
         IERC20(token).transfer(HOLDER, bought);
 
+        // Without an approval, even the platform router cannot pull.
+        vm.prank(address(v4Router));
+        vm.expectRevert();
+        t.transferFrom(HOLDER, address(0xCAFE), 1_000 ether);
+
+        // The standard one-time approve is all it takes.
+        vm.prank(HOLDER);
+        t.approve(address(v4Router), 1_000 ether);
         vm.prank(address(v4Router));
         t.transferFrom(HOLDER, address(0xCAFE), 1_000 ether);
-        assertEq(t.balanceOf(address(0xCAFE)), 1_000 ether, "sold without an approval tx");
+        assertEq(t.balanceOf(address(0xCAFE)), 1_000 ether, "sold with a normal approve");
+        assertEq(t.allowance(HOLDER, address(v4Router)), 0, "allowance spent down, not infinite");
 
-        // ...and an untrusted one still cannot.
+        // The setTrustedSpender selector survives as a no-op shim so an ALREADY-DEPLOYED launchpad
+        // (which still calls it at launch) can hot-swap this token in as the factory impl without a
+        // launchpad redeploy. It must not revert for the launchpad and must grant NO allowance...
+        vm.prank(t.launchpad());
+        t.setTrustedSpender(address(v4Router), true);
+        assertEq(t.allowance(HOLDER, address(v4Router)), 0, "shim granted no allowance");
+        // ...and it stays launchpad-only.
         vm.prank(address(0xBAD));
         vm.expectRevert();
-        t.transferFrom(HOLDER, address(0xBAD), 10 ether);
+        t.setTrustedSpender(address(0xBAD), true);
     }
 
-    /// Stock-paired tokens get the same treatment for the stock router.
-    function test_trustedSpender_stockRouter() public {
+    /// Stock-paired tokens are the same: the stock router gets no free-standing allowance.
+    function test_noInfiniteAllowanceForStockRouter() public {
         MockWethT stockQ = new MockWethT();
         _stockStack("trusted", address(stockQ));
         address token = pad.createStockToken{value: 0.000005 ether}(_stockParams("STR", LaunchTokenV2.Mode.Base), address(stockQ));
-        assertEq(LaunchTokenV2(token).allowance(HOLDER, pad.stockPairRouter()), type(uint256).max, "stock router pre-approved");
+        assertEq(LaunchTokenV2(token).allowance(HOLDER, pad.stockPairRouter()), 0, "stock router has no standing allowance");
     }
 
     // A single reward asset taking the full fee weight, on a V3 (or V4) venue.
