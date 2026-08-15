@@ -1,88 +1,96 @@
 # Contracts layout
 
-Two launchpad stacks live here. The platform is **consolidating onto the V4 stack** (`src/v2`);
-the V1 stack (`src/v1`) is the legacy plain-token launchpad and is being retired. Points/seasons
-and the flagship flywheel span both.
+The current system is the **mode-token launchpad on Uniswap V4** (`src/v2/`, `src/v2/v4/`) plus the
+**flagship flywheel** (`src/flywheel/`). Every launched market is a real Uniswap V4 pool.
+
+> A retired `src/v1/` (a plain-token launchpad on Uniswap V3) still exists in the tree but is being
+> decommissioned and is not part of the current system, so it is intentionally omitted below.
 
 ```
 src/
-├── v1/                     LEGACY — plain-token launchpad (bonding curve → Uniswap V3). Being retired.
-│   ├── V3Launchpad.sol       factory + bonding curve; graduates to a Uniswap V3 pool
-│   ├── FeeLocker.sol         locks the graduated LP; splits WETH fees 25 treasury / 25 dev / 50 flagship (settable)
-│   └── LaunchToken.sol       the V1 ERC20 (on-chain SVG metadata)
-│
-├── v2/                     CURRENT — mode-token launchpad (Uniswap V4).
-│   ├── LaunchTokenV2.sol     the V2 ERC20 (modes: Base / Reward / Increasing / Lottery / Perps)
-│   ├── TokenDeployerV2.sol   deploys LaunchTokenV2 instances
+├── v2/                     the launchpad
+│   ├── LaunchFairTokenFactory.sol  permanent creator address: delegatecall proxy over TokenDeployerV2
+│   ├── TokenDeployerV2.sol         stateless factory implementation (deploys LaunchTokenV2 instances)
+│   ├── LaunchTokenV2.sol           the ERC20 (modes: Base / Reward / Increasing / Lottery)
 │   └── v4/
-│       ├── LaunchFairV4.sol            the V4 launchpad/factory (create + atomic createAndBuy); wires the fee hook
-│       ├── LaunchFairV4FeeLocker.sol   locks the V4 LP; claims fees; carves the flagship slice from the dev share
-│       ├── LaunchFairV4Distributor.sol reward / lottery / perps mechanism + WETH→asset buyback engine
-│       ├── LaunchFairV4SwapRouter.sol  minimal V4 swap router
-│       ├── WethFeeHook.sol             V4 hook: takes the fee in WETH on BOTH buys and sells (no token sell pressure)
-│       ├── LaunchFairVRFCoordinator.sol lottery randomness (VRF)
-│       ├── DrandBLS.sol                drand BLS12-381 verification (trustless lottery beacon)
-│       ├── FeeSplitConfig.sol          fee-split config (treasury / dev / mechanism)
+│       ├── LaunchFairV4.sol            the launchpad (create + atomic createAndBuy); holds the launch record
+│       ├── WethFeeHookImmutable.sol    CURRENT V4 fee hook: fee in WETH on BOTH legs; no owner, no setters
+│       ├── WethFeeHook.sol             superseded owner-tunable hook (only pools created before the swap use it)
+│       ├── LaunchFairV4FeeLocker.sol   locks the V4 LP forever; no withdrawal or decrease path
+│       ├── LaunchFairV4Distributor.sol reward / lottery mechanism + WETH-to-asset buyback engine
+│       ├── LaunchFairV4SwapRouter.sol  minimal native-ETH V4 swap router (buy / sell)
+│       ├── LaunchFairVRFCoordinator.sol lottery randomness coordinator
+│       ├── DrandBLS.sol                on-chain drand BLS12-381 verification (trustless lottery beacon)
+│       ├── FeeSplitConfig.sol          per-tier fee-split table (treasury / dev / mechanism)
 │       ├── LiquidityMath.sol           sqrtPrice / liquidity helpers
-│       ├── IPerpsVenue.sol             Perps-mode venue interface (marginToken / open / positionTokenFor)
-│       ├── PerpPositionToken.sol       fungible ERC20 share of a pooled leveraged position (redeem for WETH at NAV)
-│       ├── ReferenceStockPerpVenue.sol reference venue — WETH margin, operator oracle, mints PerpPositionToken (NOT production)
-│       ├── StockPairRouter.sol         stock-paired tokens: buy/sell in ETH over a TOKEN/<stock> pool (2-hop V3+V4), WETH fee at the router
-│       └── RouterGateHook.sol          gate hook: only the StockPairRouter may swap a stock pool (so the WETH fee can't be bypassed)
+│       ├── CoreTGE.sol                 flagship/core token generation (seeded launch through the factory)
+│       ├── StockPairRouter.sol         stock-paired tokens: buy/sell in ETH over a TOKEN/<stock> pool
+│       ├── StockFeeHook.sol            stock-pool hook: takes the WETH fee in-pool and gates trading to the router
+│       └── (Perps mode files: IPerpsVenue.sol / PerpPositionToken.sol / ReferenceStockPerpVenue.sol / RouterGateHook.sol)
 │
-├── interfaces/
-│   └── IUniswapV3.sol       SHARED — used by V1 pools AND the V4 distributor's V3 buyback venue
+├── flywheel/
+│   ├── FlagshipBuyback.sol          buyback vault: fee-funded flagship buybacks; fixed-destination team cut
+│   └── SeasonMerkleDistributor.sol  per-season Merkle reward claim (with a keeper-veto claim window)
 │
-└── flywheel/
-    └── SeasonMerkleDistributor.sol   SHARED — per-season Merkle reward claim for the flagship flywheel
+└── interfaces/
+    └── IUniswapV3.sol       used by the distributor's V3 reward/buyback venues and the stock-quote routes
 ```
 
-Tests mirror this layout: `test/v1/`, `test/v2/` (the V4 engine), `test/flywheel/`, with shared mocks
-in `test/mocks/`. Deploy scripts live in `script/` (`Deploy` = V1, `DeployV4` = V4,
-`DeploySeasonDistributor`, `DeployWethFeeHook` + `HookMiner`).
+Tests mirror this layout: `test/v2/` (the V4 engine) and `test/flywheel/`, with shared mocks in
+`test/mocks/`. Deploy scripts live in `script/`: `DeployV4` (the launchpad stack),
+`DeployTokenFactory` (the permanent factory), `DeployWethFeeHookImmutable` + `HookMiner` (the immutable
+fee hook), `DeployStockPair` (stock-paired quotes), `DeploySeasonDistributor` (after the flagship
+launches), and `SwapTokenImpl` (hot-swap the factory's token implementation).
 
-## Naming note
+## Permanent creator address
 
-"V2" (our launchpad's second generation) uses **Uniswap V4** under the hood — hence the `v2/v4`
-nesting. The V1 launchpad uses **Uniswap V3**. Contract names (`LaunchTokenV2`, `LaunchFairV4`)
-carry the same distinction.
+`LaunchFairTokenFactory` is a delegatecall proxy in front of the stateless `TokenDeployerV2`. Because
+every token is deployed in the proxy's context, all launched tokens share ONE canonical, permanent
+creator address that indexers and token trackers can key on, even across token-code upgrades. The
+upgrade surface is bounded (deployer-or-treasury only, contract-is-checked on every call, an
+allowlist of launchers, disabled renounce, and a one-way `freezeImplementation`). See the security
+section in the top-level [`README.md`](../README.md) for the full rationale.
 
 ## Fee model
 
-- **V1** (`FeeLocker`): WETH-on-buy, token burn on sell. Split 25/25/50 (treasury/dev/flagship), owner-tunable.
-- **V4 default** (`LaunchFairV4FeeLocker`): WETH-on-buy, token burn on sell; mechanism slice funds the
-  token's own reward/lottery; a flat 0.1%-of-trade carve from the dev slice funds the flagship.
-- **V4 + WethFeeHook** (going-forward): fee taken in **WETH on both legs** (no token sell pressure),
-  captured on every trade regardless of router. Feeds the same treasury/dev/mechanism/flagship split.
+The fee is taken in **WETH on both legs** (no token sell pressure) by `WethFeeHookImmutable`, captured
+on every trade regardless of router, at the token's chosen **tier (3, 5, or 10 percent)** written once
+into the launch record. `FeeSplitConfig` sets the per-tier treasury / dev / mechanism shares. Treasury,
+dev, and flagship are paid out as native ETH; the mechanism slice stays in WETH to fund the reward or
+prize buyback. A Base token has no mechanism, so its mechanism slice folds into the flagship. Stock
+pairs take the same WETH fee at the `StockPairRouter` and split it identically. See
+[`docs/V4_WETH_FEE_HOOK.md`](../docs/V4_WETH_FEE_HOOK.md).
 
 ## Reward modes (`LaunchTokenV2`)
 
-Every V4 token picks one mode at launch (immutable). The distributor turns the mechanism fee slice
-into holder value per mode:
+Every token picks one mode at launch (immutable). The distributor turns the mechanism fee slice into
+holder value per mode:
 
-- **Base** — plain fair launch, no mechanism payout.
-- **Reward** — buys up to 5 dev-chosen external tokens and distributes them to holders.
-- **Increasing** — auto-compounding: buys back THIS token and distributes it (every holder's balance grows).
-- **Lottery** — holdings-weighted three-outcome draw (miss / regular win / jackpot); a random holder
+- **Base**: plain fair launch, no mechanism payout.
+- **Reward**: buys up to 5 dev-chosen external tokens and distributes them to holders.
+- **Increasing**: auto-compounding: buys back THIS token and distributes it (every holder's balance grows).
+- **Lottery**: holdings-weighted three-outcome draw (miss / regular win / jackpot); a random holder
   takes the pot. Randomness is trustless drand BLS (`DrandBLS` + `LaunchFairVRFCoordinator`).
-- **Perps** — deposits the fee slice as margin into an `IPerpsVenue`, which mints a fungible
-  `PerpPositionToken` (a share of a pooled leveraged stock-perp position) and distributes it hands-off
-  like a reward token; holders hold / sell / redeem for WETH at NAV. `ReferenceStockPerpVenue` is a
-  reference only (operator-set oracle) — a production venue needs a real oracle + liquidations.
+
+> A fifth enum value, **Perps**, exists in the contracts but is **not currently offered**:
+> `ReferenceStockPerpVenue` uses an operator-set oracle and is not production. A real venue would need a
+> genuine push oracle plus liquidations and funding. See [`docs/PERPS_REWARD_MODE.md`](../docs/PERPS_REWARD_MODE.md).
 
 ## Stock-paired tokens (`createStockToken`)
 
-An additive launch type whose liquidity pool is **`TOKEN/<stock>`** (e.g. `TOKEN/AAPL`, using the
-first-party Robinhood tokenized stocks) instead of `TOKEN/WETH` — so holders get built-in equity
+An additive launch type whose liquidity pool is **`TOKEN/<stock>`** (for example `TOKEN/AAPL`, using
+the first-party Robinhood tokenized stocks) instead of `TOKEN/WETH`, so holders get built-in equity
 exposure. Users still **buy with native ETH and sell for ETH**: the `StockPairRouter` routes
-`ETH→WETH→stock→TOKEN` (and back) in one tx, hopping the `<stock>/WETH` leg on Uniswap V3 and the
-`TOKEN/<stock>` leg on our V4 pool. The **fee is taken in WETH at the router**, then split
-treasury/dev/flagship exactly like the WETH-paired path — so dev-fee economics are unchanged. The pool
-is a **0-fee, `RouterGateHook`-gated** pool (only the router may swap it), so the fee can't be
-bypassed. Quotes are an owner allowlist (`setAllowedQuote`); v1 launches are Base mode. Deploy with
-`script/DeployStockPair.s.sol`.
+`ETH -> WETH -> stock -> TOKEN` (and back) in one tx, hopping the `<stock>/WETH` leg on Uniswap V3 and
+the `TOKEN/<stock>` leg on the V4 pool. The **fee is taken in WETH at the router**, then split
+treasury / dev / mechanism / flagship exactly like the WETH-paired path, so dev-fee economics are
+unchanged. The pool is gated by `StockFeeHook` (only the router may swap it), so the fee cannot be
+bypassed. Quotes are an owner allowlist (`setAllowedQuote`, runtime, no redeploy to add one). Deploy
+with `script/DeployStockPair.s.sol`.
 
-## Audits
+## Security
 
-- `AUDIT.md` (V1), `AUDIT_V4_HOOK.md` (WETH fee hook), `AUDIT_PERPS_MODE.md` (perps mode) — internal reviews.
-- `FLAGSHIP_FLYWHEEL_STATUS.md` — the fee → buyback → seasonal-Merkle flagship flywheel.
+The full security write-up (review process, the token-safety and scanner-posture fixes, the permanent
+factory's bounded upgrade surface, the flywheel keeper hardening, and the known pre-production
+requirements) lives in the top-level [`README.md`](../README.md#security-audits-and-fixes). Hook-level
+notes are in [`docs/V4_WETH_FEE_HOOK.md`](../docs/V4_WETH_FEE_HOOK.md).
