@@ -39,7 +39,8 @@ from an on-chain admin dashboard, so nothing can ever get stuck on a misconfigur
 The classic pump-style flow: buy on a bonding curve, and when the curve fills, liquidity migrates
 into a real Uniswap V3 pool. The LP position is held by a **FeeLocker** that collects the pool's
 trading fees and splits them between treasury, the token's creator, and the flagship pot. This stack
-still runs, but new development is on V4; its locker is due one final redeploy (see §12).
+still runs on its final, security-fixed locker (the WETH-drain fix shipped); new development is on V4
+and the curve stack is being retired.
 
 ### b) Mode tokens (V4 — the current engine)
 Tokens launch straight into a **Uniswap V4 single-sided pool** — no curve phase. What makes them
@@ -93,7 +94,7 @@ and every split below is a **live dashboard knob**, not a constant:
 
 | Family | Fee | Default split | Settable via |
 |---|---|---|---|
-| Curve (V1/V3) | pool trading fee | 25% treasury / 25% creator / 50% flagship | `setFeeShares` — **pending the V1 locker redeploy** |
+| Curve (V1/V3) | pool trading fee | 25% treasury / 25% creator / 50% flagship | `setFeeShares` (live on the fixed locker) |
 | Mode (V4) 3% tier | 3% of trade, in WETH | 16.67% treasury / 16.67% dev / 66.67% mechanism | per-tier `setSideBps` (Fees tab) |
 | Mode (V4) 5% tier | 5% | 15% / 15% / 70% | same |
 | Mode (V4) 10% tier | 10% | 10% / 10% / 80% | same |
@@ -256,7 +257,7 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 - **Fees tab:** stock router fee + 4-way split + destinations (treasury & sink); V4 per-tier
   side-shares (3/5/10% tiers); flagship trade carve; V4 locker flagship sink. Live view of the ETH
-  accumulated at the sink. Curve-token setters appear after the V1 locker redeploy (noted in-UI).
+  accumulated at the sink. Curve-token setters are live (the V1 locker redeploy shipped).
 - **Core Token tab:** war chest balance, manual seed, the one-shot **launch** form with live
   starting-price/market-cap projection, bucket balances, claims tranche funding (skim shown
   inline), team/community payouts, **Collect & compound** button, and the dev-fee config form
@@ -286,7 +287,7 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 ## 11. Security work already done
 
 - **Internal audit (AUDIT.md):** fixed a Critical lottery round-grinding vector plus a batch of
-  lower-severity issues. The V1 stack's WETH-drain fix is written and awaits the redeploy.
+  lower-severity issues. The V1 stack's WETH-drain fix shipped in its final locker redeploy.
 - **V4 WETH fee hook:** 4 independent audit passes; no Critical/High; the shared ERC-6909 claim
   pool proven non-drainable; hardened with fee caps, `Ownable2Step`, permission validation.
 - **Perps mode:** 3 adversarial passes; H-1/H-2/H-3 + M-1 fixed; stays sunset pending a production
@@ -379,14 +380,12 @@ receiving exactly its 50%.
    before funding the pot (the on-chain `fundClaims` skim is dormant at Claims = 0).
 2. **SeasonMerkleDistributor deploy** — can only happen *after* the Core token exists (the token
    address is an immutable constructor argument), then `setClaimsDistributor` on the TGE.
-3. **V1 FeeLocker redeploy** — ships the WETH-drain fix + `setFeeShares`, which also lights up the
-   curve-token fee controls in the dashboard.
-4. **Post-TGE sink repoint** — flip both flagship sinks from the TGE to the buyback keeper
+3. **Post-TGE sink repoint** — flip both flagship sinks from the TGE to the buyback keeper
    (dashboard action, §5).
-5. **Production rollout checklist** — updated indexer + envs on the servers (the new stack
+4. **Production rollout checklist** — updated indexer + envs on the servers (the new stack
    addresses, `ROBINHOOD_CORE_TGE` so the core token indexes at launch, and the WS push secret —
    remember it fails *closed*), frontend RPC pointed at the API proxy, X callback URLs registered
    in the X developer portal, shared API secret on both servers, X quest scanner running on a
    schedule, and previously-linked X users relinking once.
-6. **Later / optional:** Perps mode production venue + oracle (then un-sunset the UI), trustless
+5. **Later / optional:** Perps mode production venue + oracle (then un-sunset the UI), trustless
    drand lottery via the new BLS precompiles.
