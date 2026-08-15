@@ -115,8 +115,10 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     /// PURE REVENUE: the core pool's 1% fee (hard-capped at construction) is split between
     /// the TEAM and the TREASURY — nothing is reinvested; the core's liquidity keeps growing
     /// from the flywheel's buybacks of every other token's fees, not from its own.
-    uint16 public teamFeeBps = 5_000; // team share of collected pool fees
-    uint16 public treasuryFeeBps = 5_000; // treasury share — the two MUST sum to 100%
+    // The core token has no external creator (it is the team's own), so its locked-pool LP fees are
+    // pure revenue: a small operational cut to the team, the rest to the treasury. Owner-retunable.
+    uint16 public teamFeeBps = 1_000; // 10% team share of collected pool fees
+    uint16 public treasuryFeeBps = 9_000; // 90% treasury share — the two MUST sum to 100%
     /// Where `buybackAndFund` sends the bought core (the FlagshipBuyback vault ⇒ season pots).
     address public rewardSink;
 
