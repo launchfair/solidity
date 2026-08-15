@@ -7,7 +7,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {StockPairRouter, IWETH, ILaunchpadV4} from "../src/v2/v4/StockPairRouter.sol";
-import {StockFeeHook, ILaunchpadStockView, IStockRoutesView} from "../src/v2/v4/StockFeeHook.sol";
+import {StockFeeHookImmutable, ILaunchpadStockView, IStockRoutesView} from "../src/v2/v4/StockFeeHookImmutable.sol";
 import {IV3SwapRouter, IUniswapV3Factory} from "../src/interfaces/IUniswapV3.sol";
 import {HookMiner} from "./HookMiner.sol";
 
@@ -137,38 +137,47 @@ contract DeployStockPair is Script {
             Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
                 | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
-        bytes memory args = abi.encode(owner, pm, weth, v3Router, launchpad, address(router), hookFeeBps);
-        (address hookAddr, bytes32 salt) =
-            HookMiner.find(CREATE2_DEPLOYER, flags, type(StockFeeHook).creationCode, args);
-        StockFeeHook hook = new StockFeeHook{salt: salt}(
-            owner,
+        ILaunchpadAdmin pad = ILaunchpadAdmin(launchpad);
+        // All config is baked into the IMMUTABLE hook at construction (no owner, no setters): the
+        // distributor (for mode tokens' mechanism), the claim floor's V3 factory + slippage, the
+        // fee/split/destinations. flagshipSink = the buyback vault so stock tokens feed the flywheel.
+        address dist = pad.distributor();
+        bytes memory args = abi.encode(
             pm,
             weth,
             IV3SwapRouter(v3Router),
             ILaunchpadStockView(launchpad),
             IStockRoutesView(address(router)),
-            hookFeeBps
+            hookFeeBps,
+            treasury,
+            dist,
+            flagshipSink,
+            IUniswapV3Factory(v3Factory),
+            CLAIM_SLIPPAGE_BPS
+        );
+        (address hookAddr, bytes32 salt) =
+            HookMiner.find(CREATE2_DEPLOYER, flags, type(StockFeeHookImmutable).creationCode, args);
+        StockFeeHookImmutable hook = new StockFeeHookImmutable{salt: salt}(
+            pm,
+            weth,
+            IV3SwapRouter(v3Router),
+            ILaunchpadStockView(launchpad),
+            IStockRoutesView(address(router)),
+            hookFeeBps,
+            treasury,
+            dist,
+            flagshipSink,
+            IUniswapV3Factory(v3Factory),
+            CLAIM_SLIPPAGE_BPS
         );
         require(address(hook) == hookAddr, "mined-address mismatch");
-        hook.setDestinations(treasury, flagshipSink);
 
-        ILaunchpadAdmin pad = ILaunchpadAdmin(launchpad);
         pad.setStockPairRouter(address(router));
         pad.setStockGateHook(address(hook)); // hook.router() satisfies the consistency check
-
-        // Two wirings that used to be manual post-deploy steps, and were MISSED on the first
-        // stack #9 attempt — both fail quietly rather than loudly, which is exactly why they
-        // belong in the script:
-        //   1. The hook must be an authorized fee source or its notify() reverts, which would
-        //      leave every mode stock token's mechanism unfunded.
-        //   2. Without the claim config, the permissionless `claimFees` (the site's creator
-        //      claim button) reverts NotConfigured and only the gated distribute() works.
-        address dist = pad.distributor();
-        if (dist != address(0)) {
-            hook.setDistributor(dist);
-            IDistributorAdmin(dist).setFeeSource(address(hook), true);
-        }
-        hook.setClaimConfig(IUniswapV3Factory(v3Factory), CLAIM_SLIPPAGE_BPS);
+        // The hook must be an authorized fee source or its notify() reverts, which would leave
+        // every mode stock token's mechanism unfunded. (The claim config + destinations + the
+        // distributor are already baked into the immutable hook above.)
+        if (dist != address(0)) IDistributorAdmin(dist).setFeeSource(address(hook), true);
 
         // DIRECT quotes: the stock's own <stock>/WETH pool carries the trade.
         pad.setAllowedQuote(COIN, true, 3000);
@@ -220,10 +229,6 @@ contract DeployStockPair is Script {
             abi.encodePacked(USDG, USDG_BRIDGE_FEE, weth)
         );
         _priceQuoteDec(pad, USDG, 1e6, 6); // 1 whole USDG = 1e6 of itself
-
-        // MODE stock tokens (Reward/Lottery) fund their mechanism through the distributor —
-        // point the hook at the launchpad's one.
-        hook.setDistributor(pad.distributor());
 
         vm.stopBroadcast();
 
