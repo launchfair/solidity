@@ -286,7 +286,7 @@ close calls: **anything that can be misconfigured must be re-configurable from h
 
 ## 11. Security work already done
 
-- **Internal audit (AUDIT.md):** fixed a Critical lottery round-grinding vector plus a batch of
+- **Internal audit:** fixed a Critical lottery round-grinding vector plus a batch of
   lower-severity issues. The V1 stack's WETH-drain fix shipped in its final locker redeploy.
 - **V4 WETH fee hook:** 4 independent audit passes; no Critical/High; the shared ERC-6909 claim
   pool proven non-drainable; hardened with fee caps, `Ownable2Step`, permission validation.
