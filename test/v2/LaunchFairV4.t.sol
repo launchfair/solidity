@@ -441,6 +441,41 @@ contract LaunchFairV4Test is Test, Deployers {
     /// End-to-end: a PLAIN (Base) token on V4 with the WETH fee hook — fee is WETH on both the
     /// buy and the sell (no token taken → no sell pressure), and distribute() splits it, folding
     /// the plain token's mechanism slice into the flagship.
+    /// The fee tier is mode-scoped: Base meme coins are locked to a fixed 1% (10_000) — they carry
+    /// no mechanism, so the fee funds only dev + buyback + treasury — while Mode tokens must pick a
+    /// 3/5/10% tier whose extra above 1% returns to their holders/pot.
+    function test_feeGate_baseIs1pct_modeIsTiered() public {
+        // Base tokens are only allowed once the WETH fee hook is set.
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
+        address hookAddr = address(flags | (uint160(0x6666) << 144));
+        deployCodeTo("WethFeeHook.sol:WethFeeHook", abi.encode(address(this), manager, address(weth), uint16(100)), hookAddr);
+        pad.setFeeHook(hookAddr);
+
+        LaunchTokenV2.Metadata memory meta;
+        PoolKey memory none;
+
+        // A Base token at a Mode tier (3%) is rejected — base is 1% only.
+        vm.expectRevert(LaunchFairV4.InvalidFee.selector);
+        pad.createToken{value: 0.000005 ether}(LaunchFairV4.CreateParams({
+            name: "B3", symbol: "B3", metadata: meta, salt: keccak256("b3"),
+            mode: LaunchTokenV2.Mode.Base, fee: 30_000, rewards: _noRewards(), perps: _noPerps(), prizeToken: address(0),
+            prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
+            payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+        }));
+
+        // A Mode token at the 1% base tier is rejected — mode tokens are 3/5/10 only.
+        vm.expectRevert(LaunchFairV4.InvalidFee.selector);
+        pad.createToken{value: 0.000005 ether}(LaunchFairV4.CreateParams({
+            name: "R1", symbol: "R1", metadata: meta, salt: keccak256("r1"),
+            mode: LaunchTokenV2.Mode.Reward, fee: 10_000, rewards: _noRewards(), perps: _noPerps(), prizeToken: address(0),
+            prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
+            payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
+        }));
+    }
+
     function test_endToEnd_baseTokenOnV4_wethHookBothWays() public {
         // Deploy the hook at a permission-encoded address + wire it.
         uint160 flags = uint160(
@@ -459,7 +494,7 @@ contract LaunchFairV4Test is Test, Deployers {
         address token = pad.createToken{value: 0.000005 ether}(
             LaunchFairV4.CreateParams({
                 name: "Plain", symbol: "PLN", metadata: meta, salt: bytes32(uint256(7)),
-                mode: LaunchTokenV2.Mode.Base, fee: 30_000, rewards: _noRewards(), perps: _noPerps(), prizeToken: address(0),
+                mode: LaunchTokenV2.Mode.Base, fee: 10_000, rewards: _noRewards(), perps: _noPerps(), prizeToken: address(0),
                 prizeIsV3: false, prizeV3Fee: 0, prizePoolKey: none, minHold: 0,
                 payoutThreshold: 0, payoutIntervalBlocks: 0, missBps: 0, jackpotChanceBps: 0, regularWinShareBps: 0
             })

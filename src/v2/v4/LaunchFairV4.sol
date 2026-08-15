@@ -358,8 +358,21 @@ contract LaunchFairV4 is Ownable, ReentrancyGuard {
 
     /// @dev Core creation: validate, deploy, launch on V4, emit. No `msg.value` handling — the
     /// public wrappers (createToken / createAndBuy) pay the fee and refund or dev-buy the rest.
+    /// @dev Fee tier is mode-gated. Base meme coins are a FIXED 1% (10_000): they carry no mechanism
+    /// of their own, so the fee funds only dev + buyback(flywheel) + treasury (the hook maps this
+    /// unsupported tier to its 1% base rate and folds the leftover slice into the flagship). Mode
+    /// tokens carry a mechanism, so they pick a higher tier (3/5/10%) whose extra above 1% returns
+    /// to their holders/pot. Extracted to keep _create out of stack-too-deep.
+    function _requireValidFee(LaunchTokenV2.Mode mode, uint24 fee) private pure {
+        if (mode == LaunchTokenV2.Mode.Base) {
+            if (fee != 10_000) revert InvalidFee();
+        } else if (!(fee == 30_000 || fee == 50_000 || fee == 100_000)) {
+            revert InvalidFee();
+        }
+    }
+
     function _create(CreateParams calldata p) internal returns (address token) {
-        if (!(p.fee == 30_000 || p.fee == 50_000 || p.fee == 100_000)) revert InvalidFee();
+        _requireValidFee(p.mode, p.fee);
         // Base/plain tokens are allowed on V4 ONLY with the WETH fee hook set — the hook routes a
         // plain token's "mechanism" fee slice to the flagship (it has no reward/lottery of its own).
         // Without the hook their mechanism slice would strand in the distributor, so require it.
