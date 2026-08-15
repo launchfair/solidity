@@ -83,10 +83,13 @@ them.
   the winner is frozen before the beacon is public.
 
 **Fee model:** the fee is charged in WETH on both sides at the token's chosen **tier (3, 5, or 10
-percent)**, written once into the launch record and not changeable afterward. The `FeeSplitConfig`
-per-tier table sets treasury, dev, and mechanism shares; treasury, dev, and flagship are paid out as
-native ETH, while the mechanism slice stays in WETH to fund the reward or prize buyback. A Base token
-has no mechanism, so its mechanism slice folds into the flagship. See
+percent)**, written once into the launch record and not changeable afterward. Every collected fee is
+then split the same flat way for all tokens and tiers: **dev 50%, the token's own mechanism 30%,
+treasury 10%, buyback 10%**. Treasury, dev, and the buyback are paid out as native ETH; the mechanism
+slice stays in WETH and funds the token's reward or lottery (Reward / Increasing / Lottery / Perps). A
+plain Base token has no mechanism, so its 30% folds into the buyback, sending 40% of every fee to the
+flywheel. The buyback slice goes to the `FlagshipBuyback` vault, which converts it into the core token
+for the points/seasons flywheel, so **every launched token feeds the flywheel**. See
 [`docs/V4_WETH_FEE_HOOK.md`](docs/V4_WETH_FEE_HOOK.md).
 
 **Lottery** is three-outcome with two pools (pot plus jackpot): **miss** rolls the pot over,

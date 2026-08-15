@@ -21,6 +21,20 @@ contract ImmToken is ERC20 {
     receive() external payable { _mint(msg.sender, msg.value); }
 }
 
+/// A token that reports a non-Base mode so the hook funds its mechanism instead of folding.
+contract ModeToken is ImmToken {
+    uint8 private _mode;
+    constructor(string memory n, string memory s) ImmToken(n, s) {}
+    function setMode(uint8 x) external { _mode = x; }
+    function mode() external view returns (uint8) { return _mode; }
+}
+
+/// Records the WETH the hook routes to a token's mechanism via notify().
+contract MockDistributor {
+    uint256 public got;
+    function notify(address, uint256 amt) external { got += amt; }
+}
+
 /// Minimal launchpad exposing getLaunch/creatorOf so the hook can read a token's tier + creator.
 contract MockPad {
     struct L { address creator; PoolKey key; uint24 fee; address quoteToken; bool exists; }
@@ -102,10 +116,10 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         assertEq(hook.treasury(), TREASURY, "treasury baked in");
         assertEq(hook.flagshipSink(), FLAGSHIP, "flagship baked in");
         assertEq(hook.launchpad(), address(pad), "launchpad baked in");
-        assertEq(hook.treasuryBps(), 2500);
-        assertEq(hook.devBps(), 2500);
-        assertEq(hook.mechanismBps(), 4000);
-        assertEq(hook.flagshipBps(), 1000);
+        assertEq(hook.treasuryBps(), 1000, "treasury 10%");
+        assertEq(hook.devBps(), 5000, "dev 50%");
+        assertEq(hook.mechanismBps(), 3000, "mechanism/protocol 30%");
+        assertEq(hook.flagshipBps(), 1000, "buyback 10%");
     }
 
     // ── NO admin surface: the exact selectors a scanner flags do not exist ─────────
@@ -134,8 +148,11 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         assertEq(hook.accrued(address(token)), (wethIn * FEE_BPS) / 10_000, "1% global fee accrued");
     }
 
-    // ── fees still work: per-tier + split with a live launch record ───────────────
-    function test_perTier_chargesTierRate_andSplits() public {
+    // ── per-tier RATE, flat 50/30/10/10 SPLIT ─────────────────────────────────────
+    // The creator's tier sets the fee RATE (10% here). The split of the collected fee is the flat
+    // dev 50 / mechanism 30 / treasury 10 / buyback 10. This token exposes no mode() and the
+    // distributor is unset, so its 30% mechanism slice folds into the buyback: buyback gets 40%.
+    function test_tierRate_flatSplit_baseFoldsToBuyback() public {
         pad.setLaunch(address(token), address(0xDEF), 100_000); // 10% tier, creator 0xDEF
 
         weth.approve(address(swapRouter), type(uint256).max);
@@ -143,12 +160,72 @@ contract WethFeeHookImmutableTest is Test, Deployers {
         uint256 acc = hook.accrued(address(token));
         assertEq(acc, (1 ether * 1000) / 10_000, "10% tier charged, not global 1%");
 
-        uint256 side = (acc * hook.sideBps(100_000)) / 10_000; // sideBps[10%] = 1000
+        uint256 toTreasury = (acc * 1000) / 10_000; // 10%
+        uint256 toDev = (acc * 5000) / 10_000; // 50%
         hook.distribute(address(token));
-        assertEq(TREASURY.balance, side, "treasury = sideBps of the fee");
-        assertEq(address(0xDEF).balance, side, "creator PAID his tier share directly");
-        assertEq(FLAGSHIP.balance, acc - side - side, "mechanism folded to flagship (Base token)");
+        assertEq(TREASURY.balance, toTreasury, "treasury = 10%");
+        assertEq(address(0xDEF).balance, toDev, "creator PAID 50% directly");
+        // buyback (flagship) = its own 10% + the folded 30% mechanism = 40%.
+        assertEq(FLAGSHIP.balance, acc - toTreasury - toDev, "buyback got 40% (10% + folded 30%)");
         assertEq(hook.accrued(address(token)), 0, "accrual cleared");
+    }
+
+    // ── MODE token: the 30% "protocol" slice funds the token's mechanism, buyback still gets 10% ──
+    function test_modeToken_mechanismGets30_buybackGets10() public {
+        MockDistributor dist = new MockDistributor();
+        ModeToken mtoken = new ModeToken("MODE", "MODE");
+        mtoken.setMode(1); // Reward mode -> _hasMechanism true
+        mtoken.mint(address(this), 1_000_000_000 ether);
+
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
+        address hookAddr = address(flags | (uint160(0x5555) << 144));
+        deployCodeTo(
+            "WethFeeHookImmutable.sol:WethFeeHookImmutable",
+            abi.encode(manager, address(weth), FEE_BPS, TREASURY, address(dist), FLAGSHIP, address(pad)),
+            hookAddr
+        );
+        WethFeeHookImmutable h = WethFeeHookImmutable(payable(hookAddr));
+        pad.setLaunch(address(mtoken), address(0xDEF), 100_000); // 10% tier, creator 0xDEF
+
+        bool mIs0 = address(mtoken) < address(weth);
+        (Currency c0, Currency c1) = mIs0
+            ? (Currency.wrap(address(mtoken)), Currency.wrap(address(weth)))
+            : (Currency.wrap(address(weth)), Currency.wrap(address(mtoken)));
+        PoolKey memory k = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(hookAddr)});
+        manager.initialize(k, SQRT_PRICE_1_1);
+        mtoken.approve(address(modifyLiquidityRouter), type(uint256).max);
+        weth.approve(address(modifyLiquidityRouter), type(uint256).max);
+        modifyLiquidityRouter.modifyLiquidity(
+            k,
+            IPoolManager.ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 100_000 ether, salt: bytes32(0)}),
+            ""
+        );
+
+        weth.approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            k,
+            IPoolManager.SwapParams({
+                zeroForOne: !mIs0,
+                amountSpecified: -1 ether,
+                sqrtPriceLimitX96: !mIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        uint256 acc = h.accrued(address(mtoken));
+        assertEq(acc, (1 ether * 1000) / 10_000, "10% tier charged");
+        uint256 tre0 = TREASURY.balance;
+        uint256 fl0 = FLAGSHIP.balance;
+        uint256 dev0 = address(0xDEF).balance;
+        h.distribute(address(mtoken));
+        assertEq(dist.got(), (acc * 3000) / 10_000, "mechanism (protocol) got 30% via notify");
+        assertEq(TREASURY.balance - tre0, (acc * 1000) / 10_000, "treasury 10%");
+        assertEq(address(0xDEF).balance - dev0, (acc * 5000) / 10_000, "dev 50%");
+        assertEq(FLAGSHIP.balance - fl0, (acc * 1000) / 10_000, "buyback 10% (mechanism NOT folded)");
     }
 
     // ── sells take the fee from the WETH output, never the token ──────────────────

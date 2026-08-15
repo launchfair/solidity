@@ -55,10 +55,12 @@ section in the top-level [`README.md`](../README.md) for the full rationale.
 
 The fee is taken in **WETH on both legs** (no token sell pressure) by `WethFeeHookImmutable`, captured
 on every trade regardless of router, at the token's chosen **tier (3, 5, or 10 percent)** written once
-into the launch record. `FeeSplitConfig` sets the per-tier treasury / dev / mechanism shares. Treasury,
-dev, and flagship are paid out as native ETH; the mechanism slice stays in WETH to fund the reward or
-prize buyback. A Base token has no mechanism, so its mechanism slice folds into the flagship. Stock
-pairs take the same WETH fee at the `StockPairRouter` and split it identically. See
+into the launch record. Every collected fee is split the same flat way for all tokens and tiers:
+**dev 50 / mechanism 30 / treasury 10 / buyback 10**. Treasury, dev, and the buyback are paid as native
+ETH; the mechanism slice stays in WETH and funds the token's own reward or lottery. A Base token has no
+mechanism, so its 30% folds into the buyback (40% of every fee to the flywheel). The buyback slice goes
+to the `FlagshipBuyback` vault, which converts it into the core token for the points/seasons flywheel,
+so every launched token feeds the flywheel. See
 [`docs/V4_WETH_FEE_HOOK.md`](../docs/V4_WETH_FEE_HOOK.md).
 
 ## Reward modes (`LaunchTokenV2`)

@@ -82,14 +82,22 @@ contract WethFeeHookImmutable is IHooks, IUnlockCallback, FeeSplitConfig {
 
     // ── fee-split config: FIXED at construction, no setters ──
     address public immutable treasury; // platform treasury (also the fallback for any unset destination)
-    address public immutable distributor; // V4 reward/lottery mechanism (notify)
-    address public immutable flagshipSink; // flagship buyback (0 folds to treasury)
+    address public immutable distributor; // the token's own reward/lottery/redistribute/perps mechanism (notify)
+    address public immutable flagshipSink; // flagship buyback vault (0 folds to treasury)
     address public immutable launchpad; // resolves the per-token dev via creatorOf(token)
-    // Global 4-way split (foreign/legacy tokens only; our tokens use the per-tier FeeSplitConfig).
-    uint16 public constant treasuryBps = 2_500; // 25%
-    uint16 public constant devBps = 2_500; // 25%
-    uint16 public constant mechanismBps = 4_000; // 40%
-    uint16 public constant flagshipBps = 1_000; // 10% — the four sum to BPS
+    // Flat 4-way split of every collected fee, the same for every tier and token:
+    //   dev 50% : the token creator.
+    //   mechanism 30% ("protocol"): the token's own mechanism if it has one (Reward/Increasing/
+    //     Lottery/Perps) via distributor.notify; a plain Base token has none, so it folds into the
+    //     buyback. So every token feeds the flywheel by at least the buyback slice, and a Base token
+    //     feeds it 40% (mechanism + buyback).
+    //   treasury 10% : the platform treasury.
+    //   flagship 10% ("buyback"): the flagship buyback vault, which converts fees into the core token
+    //     for the points/seasons flywheel.
+    uint16 public constant treasuryBps = 1_000; // 10%
+    uint16 public constant devBps = 5_000; // 50%
+    uint16 public constant mechanismBps = 3_000; // 30% (the token's mechanism, else folds to buyback)
+    uint16 public constant flagshipBps = 1_000; // 10% (buyback) — the four sum to BPS
 
     /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
     mapping(address => uint256) public owed;
@@ -255,18 +263,13 @@ contract WethFeeHookImmutable is IHooks, IUnlockCallback, FeeSplitConfig {
         uint256 toMechanism;
         uint256 toFlagship;
 
-        uint24 tier = _launchFee(token);
-        if (isSupportedFee(tier)) {
-            // PER-TIER split (the creator's 3/5/10% choice). treasury == dev == sideBps[tier];
-            // the remainder is the mechanism slice, which folds into the flagship for a Base token.
-            (toTreasury, toDev, toMechanism) = splitOf(tier, amount);
-        } else {
-            // Foreign/legacy token (no launch record): the global 4-way split.
-            toTreasury = (amount * treasuryBps) / BPS;
-            toDev = (amount * devBps) / BPS;
-            toFlagship = (amount * flagshipBps) / BPS;
-            toMechanism = amount - toTreasury - toDev - toFlagship;
-        }
+        // Flat 4-way split, identical for every tier and token: dev 50 / mechanism 30 / treasury 10
+        // / flagship 10. The fee RATE is still the creator's per-tier 3/5/10% choice (see feeBpsFor);
+        // only the split of the collected fee is uniform.
+        toTreasury = (amount * treasuryBps) / BPS;
+        toDev = (amount * devBps) / BPS;
+        toFlagship = (amount * flagshipBps) / BPS;
+        toMechanism = amount - toTreasury - toDev - toFlagship;
 
         // Mechanism slice stays in WETH — it feeds the on-chain buyback engine (the distributor swaps
         // WETH→reward). Plain (Base) tokens have no mechanism → the slice folds into the flagship.
