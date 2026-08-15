@@ -55,6 +55,7 @@ contract CoreTGETest is Test {
             INonfungiblePositionManager(address(npm)),
             tokenDeployer,
             IV3SwapRouter(address(v3router)),
+            TEAM,
             TREASURY,
             "https://hood.launchfair.app/",
             10_000,
@@ -101,10 +102,10 @@ contract CoreTGETest is Test {
     function test_allocationMustSumAndHaveLp() public {
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_000, 5_000, 1_000, 3_000, 500);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TEAM, TREASURY, "", 10_000, 5_000, 1_000, 3_000, 500);
         vm.expectRevert(CoreTGE.BadAllocation.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_000, 6_000, 1_000, 3_000, 0);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TEAM, TREASURY, "", 10_000, 6_000, 1_000, 3_000, 0);
     }
 
     /// The split is a live dashboard knob until launch; the values in force at launch freeze.
@@ -211,7 +212,7 @@ contract CoreTGETest is Test {
     function test_poolFeeCappedAtOnePercent() public {
         vm.expectRevert(CoreTGE.FeeTooHigh.selector);
         new CoreTGE(address(this), IWETH9(address(weth)), IUniswapV3Factory(address(factory)),
-            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TREASURY, "", 10_001, 0, 1_000, 0, 9_000);
+            INonfungiblePositionManager(address(npm)), tokenDeployer, IV3SwapRouter(address(v3router)), TEAM, TREASURY, "", 10_001, 0, 1_000, 0, 9_000);
     }
 
     /// A big pot needs no clamp: natural price above the floor pairs the full LP slice.
@@ -274,9 +275,9 @@ contract CoreTGETest is Test {
         tge.setClaimsDistributor(DISTRIBUTOR);
         vm.warp(block.timestamp + 61); // past the anti-snipe window — admin tranches settle after launch
         tge.fundClaims(100_000_000 ether); // season 1 tranche — purely the admin's call
-        // 10% season skim to the teamWallet (defaults to the owner), 90% to the distributor.
+        // 10% season skim to the teamWallet (required at construction = TEAM), 90% to the distributor.
         assertEq(IERC20(tokenAddr).balanceOf(DISTRIBUTOR), 90_000_000 ether, "90% to claims");
-        assertEq(IERC20(tokenAddr).balanceOf(address(this)), 10_000_000 ether, "10% dev cut");
+        assertEq(IERC20(tokenAddr).balanceOf(TEAM), 10_000_000 ether, "10% dev cut to the team wallet");
         assertEq(tge.claimsRemaining(), SUPPLY / 2 - 100_000_000 ether);
 
         vm.expectRevert(CoreTGE.InsufficientBucket.selector);

@@ -31,7 +31,8 @@ interface ILaunchpadDeployer {
 ///   - StockPairRouter.setDestinations(treasury, tge) (stock-token trades, flagship split)
 /// The claims distributor is wired later (it needs the token address, which exists post-TGE).
 ///
-/// Env: PRIVATE_KEY [required]; WETH, V3_FACTORY, POSITION_MANAGER, FEE_LOCKER, STOCK_ROUTER
+/// Env: PRIVATE_KEY, TEAM_WALLET [required — where the team fee lands]; WETH, V3_FACTORY,
+/// POSITION_MANAGER, FEE_LOCKER, STOCK_ROUTER, TREASURY
 /// [defaults below]; CLAIMS_BPS/TEAM_BPS/COMMUNITY_BPS/LP_BPS [default 0/1000/0/9000 = NO pre-mint:
 /// 0% claims + 0% community (seasons are buyback-funded), 10% team, 90% into the locked seed pool].
 contract DeployCoreTGE is Script {
@@ -91,6 +92,7 @@ contract DeployCoreTGE is Script {
             INonfungiblePositionManager(npm),
             TokenDeployerV2(tokenDeployer),
             IV3SwapRouter(vm.envOr("V3_ROUTER", DEFAULT_V3_ROUTER)),
+            vm.envAddress("TEAM_WALLET"), // REQUIRED: where the team's fee share lands (no default)
             vm.envOr("TREASURY", DEFAULT_TREASURY),
             PLATFORM_WEBSITE,
             10_000, // 1% pool fee tier for the seeded pool

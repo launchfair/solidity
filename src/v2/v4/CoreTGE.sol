@@ -89,7 +89,8 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     // ── revenue (owner-settable so a misconfig is never terminal) ────────────
     /// Season skim ceiling: users' rewards can never be zeroed by a fat-fingered config.
     uint16 public constant MAX_SEASON_DEV_FEE_BPS = 2_000; // 20%
-    /// Receives the team share of pool fees + the fundClaims skim. Defaults to the owner.
+    /// Receives the team share of pool fees + the fundClaims skim. REQUIRED at construction (the dev
+    /// must pick where fees land), retunable via setFeeWallets.
     address public teamWallet;
     /// Receives the treasury share of pool fees. Set at deploy; settable.
     address public treasuryWallet;
@@ -218,6 +219,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         INonfungiblePositionManager positionManager_,
         TokenDeployerV2 tokenDeployer_,
         IV3SwapRouter v3Router_,
+        address teamWallet_,
         address treasuryWallet_,
         string memory platformWebsite_,
         uint24 poolFee_,
@@ -235,14 +237,16 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         weth = weth_;
         factory = factory_;
         positionManager = positionManager_;
-        if (treasuryWallet_ == address(0)) revert ZeroAddress();
+        // The team wallet where the team's fee share lands is REQUIRED at creation — the dev must
+        // pick where fees go, never a silent default.
+        if (teamWallet_ == address(0) || treasuryWallet_ == address(0)) revert ZeroAddress();
         if (poolFee_ > 10_000) revert FeeTooHigh(); // the core token maxes out at a 1% fee
         tokenDeployer = tokenDeployer_;
         v3Router = v3Router_;
         platformWebsite = platformWebsite_;
         poolFee = poolFee_;
         _setAllocation(claimsBps_, teamBps_, communityBps_, lpBps_);
-        teamWallet = owner_;
+        teamWallet = teamWallet_;
         treasuryWallet = treasuryWallet_;
     }
 
