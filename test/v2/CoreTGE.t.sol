@@ -194,13 +194,16 @@ contract CoreTGETest is Test {
 
         address SINK = address(0x5111c);
         tge.setRewardSink(SINK);
-        uint256 out = tge.buybackAndFund{value: 0.5 ether}(0);
+        // minCoreOut must be non-zero now (no unprotected market buys) — 1:1 mock, so 0.45 is safe.
+        vm.expectRevert(CoreTGE.UnprotectedBuyback.selector);
+        tge.buybackAndFund{value: 0.5 ether}(0);
+        uint256 out = tge.buybackAndFund{value: 0.5 ether}(0.45 ether);
         assertEq(out, 0.5 ether, "1:1 mock fill");
         assertEq(IERC20(tokenAddr).balanceOf(SINK), 0.5 ether, "bought core delivered to the reward sink");
 
         vm.prank(address(0xbad));
         vm.expectRevert();
-        tge.buybackAndFund{value: 1}(0); // owner only
+        tge.buybackAndFund{value: 1}(1); // owner only
     }
 
     /// The core token's fee is HARD-CAPPED at 1% — a fatter tier can't even be deployed.

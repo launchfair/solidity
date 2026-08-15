@@ -150,6 +150,10 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         if (address(token) == address(0)) revert NotLaunched();
         if (rewardSink == address(0)) revert ZeroAddress();
         if (msg.value == 0) revert NothingAccumulated();
+        // Refuse an unprotected market buy: minCoreOut == 0 lets the swap fill at any price, so a
+        // sandwicher / back-runner can steal the buyback. The caller must pass an off-chain quote
+        // (from a prior block); the pool spot is not a safe floor since the swap moves it.
+        if (minCoreOut == 0) revert UnprotectedBuyback();
         weth.deposit{value: msg.value}();
         IERC20(address(weth)).forceApprove(address(v3Router), msg.value);
         coreOut = v3Router.exactInputSingle(
@@ -191,6 +195,8 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     /// @notice The pool already existed at a price that is not the intended launch price —
     /// someone front-ran the launch. Deploy a TGE on a different fee tier to route around it.
     error PoolPreInitialized();
+    /// @notice buybackAndFund was called with minCoreOut == 0 (an unprotected market buy).
+    error UnprotectedBuyback();
 
     constructor(
         address owner_,
