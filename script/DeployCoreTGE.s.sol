@@ -52,7 +52,10 @@ contract DeployCoreTGE is Script {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
         // secret plumbing is needed to run this script.
         uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
-        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        if (pk == 0) {
+            require(!vm.envOr("PROD", false), "PROD deploy needs PRIVATE_KEY (the real deployer) - no tester fallback");
+            pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        }
         // WIRE_SINKS=0 skips repointing the live fee sinks — for throwaway/e2e TGE deploys.
         bool wireSinks = vm.envOr("WIRE_SINKS", uint256(1)) != 0;
         address owner = vm.addr(pk);

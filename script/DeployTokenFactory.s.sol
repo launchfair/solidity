@@ -33,7 +33,10 @@ contract DeployTokenFactory is Script {
 
     function run() external {
         uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
-        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        if (pk == 0) {
+            require(!vm.envOr("PROD", false), "PROD deploy needs PRIVATE_KEY (the real deployer) - no tester fallback");
+            pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        }
         address deployer = vm.addr(pk);
         address owner = vm.envOr("OWNER", deployer);
         address treasury = vm.envOr("TREASURY", DEFAULT_TREASURY);

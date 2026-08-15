@@ -111,7 +111,10 @@ contract DeployStockPair is Script {
         // Foundry auto-loads the repo .env: fall back to the tester key so no shell-level
         // secret plumbing is needed to run this script.
         uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
-        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        if (pk == 0) {
+            require(!vm.envOr("PROD", false), "PROD deploy needs PRIVATE_KEY (the real deployer) - no tester fallback");
+            pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        }
         address owner = vm.addr(pk);
         IPoolManager pm = IPoolManager(vm.envAddress("POOL_MANAGER"));
         address weth = vm.envAddress("WETH");

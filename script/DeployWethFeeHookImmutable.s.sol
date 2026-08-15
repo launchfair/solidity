@@ -21,7 +21,10 @@ contract DeployWethFeeHookImmutable is Script {
 
     function run() external {
         uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
-        if (pk == 0) pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        if (pk == 0) {
+            require(!vm.envOr("PROD", false), "PROD deploy needs PRIVATE_KEY (the real deployer) - no tester fallback");
+            pk = vm.envUint("TESTER_DEPLOYER_PKEY");
+        }
         IPoolManager pm = IPoolManager(vm.envAddress("POOL_MANAGER"));
         address weth = vm.envAddress("WETH");
         uint16 feeBps = uint16(vm.envOr("HOOK_FEE_BPS", uint256(100)));
