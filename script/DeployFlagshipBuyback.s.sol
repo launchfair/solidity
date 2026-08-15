@@ -44,8 +44,9 @@ contract DeployFlagshipBuyback is Script {
         // flywheel never stalls on an empty keeper. Off unless KEEPER is provided.
         address keeper = vm.envOr("KEEPER", address(0));
         if (keeper != address(0)) {
-            // Authorize the cron for buyback + publishSeason ONLY (never the withdrawals), so the
-            // hot key can move value along the on-chain flow but can't drain the vault.
+            // Authorize the cron for buyback + publishSeason + carveTeamCut ONLY (never the
+            // arbitrary-destination withdrawals), so the hot key moves value along the on-chain
+            // flow but can't drain the vault to an address of its choosing.
             vault.setKeeper(keeper, true);
             vault.setGasPolicy(
                 keeper,
@@ -53,6 +54,13 @@ contract DeployFlagshipBuyback is Script {
                 vm.envOr("GAS_MAX_PER_TOPUP_WEI", uint256(0.02 ether)),
                 vm.envOr("GAS_DAILY_CAP_WEI", uint256(0.1 ether))
             );
+        }
+        // The FIXED team-cut destination. carveTeamCut (keeper-callable) can ONLY pay this address,
+        // so the keeper carves the weekly cut without an arbitrary-destination power. REQUIRED if a
+        // keeper is set and a non-zero season team cut is used.
+        address teamWallet = vm.envOr("TEAM_WALLET", address(0));
+        if (teamWallet != address(0)) {
+            vault.setTeamConfig(teamWallet, uint16(vm.envOr("TEAM_CUT_MAX_BPS", uint256(2_000))));
         }
         vm.stopBroadcast();
 

@@ -73,6 +73,10 @@ contract SeasonMerkleDistributorTest is Test {
         vm.prank(owner);
         flag = new MockFlagship(); // owner holds the supply
         dist = new SeasonMerkleDistributor(owner, IERC20(address(flag)), treasury, publisher);
+        // Most tests exercise the happy path — disable the claim veto delay here; the dedicated
+        // veto tests below set it back on.
+        vm.prank(owner);
+        dist.setClaimDelay(0);
 
         leafA = _leaf(0, alice, aliceAmt);
         leafB = _leaf(1, bob, bobAmt);
@@ -86,6 +90,48 @@ contract SeasonMerkleDistributorTest is Test {
         flag.approve(address(dist), type(uint256).max);
         dist.fundAndPublish(SEASON, 100 ether, root, 100 ether);
         vm.stopPrank();
+    }
+
+    /* ── claim veto window (a leaked keeper can't drain: owner overrides before claims open) ── */
+
+    function test_claimVetoWindow_blocksUntilDelay_ownerCanOverride() public {
+        // Fresh distributor WITH the default 1-day delay, publisher publishes a self-serving root.
+        SeasonMerkleDistributor d = new SeasonMerkleDistributor(owner, IERC20(address(flag)), treasury, publisher);
+        vm.prank(owner);
+        flag.transfer(publisher, 1_000 ether);
+        vm.startPrank(publisher);
+        flag.approve(address(d), type(uint256).max);
+        // A malicious keeper publishes a one-leaf tree paying `attacker` the whole pot.
+        bytes32 evil = _leaf(0, address(0xEBAD), 100 ether);
+        d.fundAndPublish(SEASON, 100 ether, evil, 100 ether);
+        vm.stopPrank();
+
+        // Claims are NOT open yet — the attacker cannot pull the pot inside the veto window.
+        vm.expectRevert(SeasonMerkleDistributor.ClaimWindowNotOpen.selector);
+        d.claim(SEASON, 0, address(0xEBAD), 100 ether, new bytes32[](0));
+
+        // The cold owner spots it and overrides with the correct root while claimed == 0.
+        bytes32 goodRoot = _hashPair(leafA, leafB);
+        vm.prank(owner);
+        d.adminSetRoot(SEASON, goodRoot, 100 ether);
+
+        // The attacker's leaf no longer verifies; the honest allocation does (after the delay).
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.expectRevert(SeasonMerkleDistributor.InvalidProof.selector);
+        d.claim(SEASON, 0, address(0xEBAD), 100 ether, new bytes32[](0));
+        d.claim(SEASON, 0, alice, aliceAmt, _proof(leafB));
+        assertEq(flag.balanceOf(alice), aliceAmt, "honest claimant paid after the override");
+    }
+
+    function test_setClaimDelay_ownerOnly_andCapped() public {
+        vm.expectRevert();
+        dist.setClaimDelay(1 hours); // not owner
+        vm.prank(owner);
+        vm.expectRevert(SeasonMerkleDistributor.DelayTooLong.selector);
+        dist.setClaimDelay(8 days);
+        vm.prank(owner);
+        dist.setClaimDelay(2 days);
+        assertEq(dist.claimDelay(), 2 days);
     }
 
     /* ── claim ── */
@@ -239,6 +285,8 @@ contract SeasonMerkleDistributorTest is Test {
     function test_feeOnTransfer_creditsMeasuredDelta() public {
         FeeToken fee = new FeeToken();
         SeasonMerkleDistributor d2 = new SeasonMerkleDistributor(owner, IERC20(address(fee)), treasury, publisher);
+        vm.prank(owner);
+        d2.setClaimDelay(0); // happy-path test, no veto window
         fee.transfer(publisher, 1_000 ether);
 
         vm.startPrank(publisher);

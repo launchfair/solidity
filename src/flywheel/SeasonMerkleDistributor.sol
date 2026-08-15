@@ -48,7 +48,17 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
     mapping(uint256 season => uint256) public seasonTotal; // Σ leaf allocations of the published root
     mapping(uint256 season => uint256) public claimed; // flagship claimed so far
     mapping(uint256 season => bool) public frozen; // rolled-away seasons can't be claimed
+    mapping(uint256 season => uint256) public rootPublishedAt; // block.timestamp a root was (re)set
     mapping(uint256 season => mapping(uint256 word => uint256)) private claimedBitMap;
+
+    /// @notice Claims open only after this delay past a root's publish time. The root publisher is
+    /// a HOT keeper key, and publish forwards a caller-supplied root — so a leaked keeper could
+    /// publish a tree paying itself the whole pot. This window gives the COLD owner time to spot a
+    /// fraudulent root and override it with `adminSetRoot` (allowed while `claimed == 0`) before any
+    /// claim can execute. Owner-settable; 0 disables the delay. Bounded so the owner can't strand
+    /// funds behind an unreachable window.
+    uint256 public claimDelay = 1 days;
+    uint256 public constant MAX_CLAIM_DELAY = 7 days;
 
     error NotPublisher();
     error RootAlreadySet();
@@ -63,6 +73,8 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
     error SeasonFrozen();
     error SameSeason();
     error ZeroAddress();
+    error ClaimWindowNotOpen();
+    error DelayTooLong();
 
     event RootPublisherSet(address indexed rootPublisher);
     event SeasonFunded(uint256 indexed season, address indexed from, uint256 amount);
@@ -71,6 +83,7 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
     event Claimed(uint256 indexed season, uint256 index, address indexed account, uint256 amount);
     event RolledUnclaimed(uint256 indexed fromSeason, uint256 indexed toSeason, uint256 amount);
     event Rescued(address indexed token, address indexed to, uint256 amount);
+    event ClaimDelaySet(uint256 delay);
 
     modifier onlyRootPublisher() {
         if (msg.sender != rootPublisher) revert NotPublisher();
@@ -112,6 +125,7 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
         if (total > deposited[season]) revert ExceedsDeposit();
         root[season] = merkleRoot;
         seasonTotal[season] = total;
+        rootPublishedAt[season] = block.timestamp; // starts the owner's veto window (see claimDelay)
         emit SeasonRootSet(season, merkleRoot, total);
     }
 
@@ -156,6 +170,9 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
         if (frozen[season]) revert SeasonFrozen();
         bytes32 r = root[season];
         if (r == bytes32(0)) revert RootNotSet();
+        // Veto window: a keeper-published root is not claimable until the cold owner has had
+        // `claimDelay` to override a fraudulent one (see claimDelay).
+        if (block.timestamp < rootPublishedAt[season] + claimDelay) revert ClaimWindowNotOpen();
         if (isClaimed(season, index)) revert AlreadyClaimed();
         if (amount == 0) revert ZeroAmount(); // a 0-amount claim would set a bit without moving `claimed`
 
@@ -204,6 +221,15 @@ contract SeasonMerkleDistributor is Ownable2Step, ReentrancyGuard {
         if (total > deposited[season]) revert ExceedsDeposit();
         root[season] = merkleRoot;
         seasonTotal[season] = total;
+        rootPublishedAt[season] = block.timestamp; // restart the veto window on an override too
         emit RootOverridden(season, merkleRoot, total);
+    }
+
+    /// @notice Set the claim veto window (see claimDelay). Owner-only, hard-capped so it can never
+    /// be used to lock claimants out permanently.
+    function setClaimDelay(uint256 newDelay) external onlyOwner {
+        if (newDelay > MAX_CLAIM_DELAY) revert DelayTooLong();
+        claimDelay = newDelay;
+        emit ClaimDelaySet(newDelay);
     }
 }

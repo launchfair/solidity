@@ -277,6 +277,31 @@ contract FlagshipBuybackTest is Test {
         vault.buyback();
     }
 
+    // The keeper can carve the team cut, but ONLY to the fixed teamWallet (it takes no destination),
+    // so a leaked keeper key cannot redirect the cut — and the per-carve ceiling bounds it.
+    function test_carveTeamCut_paysFixedWallet_keeperCannotRedirect() public {
+        address team = address(0x7EA0);
+        vault.setTeamConfig(team, 2_000); // 20% cap
+        vault.setKeeper(KEEPER, true);
+        // Give the vault some bought core to carve from.
+        core.mint(address(vault), 100 ether);
+
+        // Keeper carves 10 (<= 20% of 100) to the fixed team wallet — no destination arg exists.
+        vm.prank(KEEPER);
+        vault.carveTeamCut(10 ether);
+        assertEq(core.balanceOf(team), 10 ether, "cut paid to the FIXED team wallet");
+
+        // Over the ceiling reverts (can't over-carve a compromised amount).
+        vm.prank(KEEPER);
+        vm.expectRevert(FlagshipBuyback.BadParams.selector);
+        vault.carveTeamCut(50 ether); // > 20% of the remaining 90
+
+        // A random caller can't carve at all.
+        vm.prank(address(0xBAD));
+        vm.expectRevert(FlagshipBuyback.NotAuthorized.selector);
+        vault.carveTeamCut(1 ether);
+    }
+
     // The off-chain quote is the real MEV guard: a minOut above the self-floor is enforced.
     function test_buyback_enforcesCallerMinOutOverFloor() public {
         vm.deal(address(vault), 0.3 ether);

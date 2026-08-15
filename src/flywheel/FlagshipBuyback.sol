@@ -187,15 +187,47 @@ contract FlagshipBuyback is Ownable2Step, ReentrancyGuard {
         emit GasToppedUp(r, need, r.balance);
     }
 
-    /// @notice Authorize (or revoke) a keeper wallet for `buyback`/`publishSeason`. Owner-only.
+    /// @notice Authorize (or revoke) a keeper wallet for `buyback`/`publishSeason`/`carveTeamCut`.
     function setKeeper(address keeper, bool ok) external onlyOwner {
         if (keeper == address(0)) revert ZeroAddress();
         isKeeper[keeper] = ok;
         emit KeeperSet(keeper, ok);
     }
 
+    /// @notice The FIXED destination of the season team cut, and the per-carve ceiling (bps of the
+    /// bought batch). Owner-only. The keeper carves the cut via `carveTeamCut`, which can ONLY pay
+    /// this address — so the keeper key still cannot redirect value to an arbitrary destination,
+    /// even though it (not the cold owner) runs the weekly carve.
+    address public teamWallet;
+    uint16 public teamCutMaxBps = 2_000; // 20% cap, matching the season config's on-chain skim cap
+
+    event TeamConfigSet(address teamWallet, uint16 maxBps);
+    event TeamCutCarved(uint256 amount);
+
+    function setTeamConfig(address teamWallet_, uint16 maxBps_) external onlyOwner {
+        if (maxBps_ > 2_000) revert BadParams();
+        teamWallet = teamWallet_;
+        teamCutMaxBps = maxBps_;
+        emit TeamConfigSet(teamWallet_, maxBps_);
+    }
+
+    /// @notice Carve `amount` of bought `core` to the fixed `teamWallet`. Keeper-callable so the
+    /// weekly settlement stays automated, but the destination is NOT a parameter — the keeper
+    /// cannot send it anywhere else. The caller (off-chain keeper) computes `amount` from the
+    /// season config's bps; the on-chain ceiling is a backstop against a compromised keeper
+    /// over-carving. Replaces the keeper's old use of the owner-only `withdrawToken`.
+    function carveTeamCut(uint256 amount) external onlyOwnerOrKeeper nonReentrant {
+        if (teamWallet == address(0)) revert ZeroAddress();
+        uint256 bal = core.balanceOf(address(this));
+        // Ceiling: never more than teamCutMaxBps of what the vault currently holds in one call.
+        if (amount > (bal * teamCutMaxBps) / BPS) revert BadParams();
+        core.safeTransfer(teamWallet, amount);
+        emit TeamCutCarved(amount);
+    }
+
     /// @dev Owner (cold) OR an authorized keeper (hot cron). The keeper can only move value along
-    /// the on-chain flow — it can never reach the owner-only withdrawals.
+    /// the on-chain flow (buy core, carve to the FIXED team wallet, fund a season) — it can never
+    /// reach the owner-only arbitrary-destination withdrawals.
     modifier onlyOwnerOrKeeper() {
         if (msg.sender != owner() && !isKeeper[msg.sender]) revert NotAuthorized();
         _;

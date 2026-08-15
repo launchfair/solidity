@@ -360,17 +360,49 @@ contract StockPairRouter is IUnlockCallback, ReentrancyGuard, Ownable {
         if (dev == address(0)) dev = treasury;
         address sink = flagshipSink == address(0) ? treasury : flagshipSink;
         _payEth(treasury, toTreasury);
-        _payEth(dev, toDev);
+        // CREDIT the creator on failure, never revert the whole distribution or forfeit the share:
+        // `creatorOf` is an arbitrary address (a splitter, a 7702 delegate). Dead today because the
+        // router ships with feeBps == 0, but re-arms the moment a router fee is enabled — same brick
+        // the hooks already fixed. treasury + flagship keep the revert-and-retry path (platform
+        // addresses that accept ETH).
+        _payEthOrCredit(dev, toDev);
         _payEth(sink, toFlagship);
         emit Distributed(token, toTreasury, toDev, toFlagship);
     }
 
     /// @dev Send native ETH; reverts if the recipient rejects it (retryable — `accrued` is restored
-    /// by the revert). Recipients should be able to receive ETH (EOAs always can).
+    /// by the revert). Used for treasury + flagship (platform-controlled, accept ETH).
     function _payEth(address to, uint256 value) private {
         if (value == 0) return;
         (bool ok,) = to.call{value: value}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @notice Fee shares that could not be pushed to their recipient — pull with `withdrawOwed`.
+    mapping(address => uint256) public owed;
+
+    event PayoutOwed(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
+
+    /// @dev Pay the creator; on failure credit the value (pull via `withdrawOwed`) instead of
+    /// reverting the whole distribution or confiscating it to the treasury.
+    function _payEthOrCredit(address to, uint256 value) private {
+        if (value == 0) return;
+        (bool ok,) = to.call{value: value, gas: 100_000}("");
+        if (!ok) {
+            owed[to] += value;
+            emit PayoutOwed(to, value);
+        }
+    }
+
+    /// @notice Withdraw fee shares that could not be pushed. Permissionless; only ever pays `to`.
+    function withdrawOwed(address to) external returns (uint256 amount) {
+        amount = owed[to];
+        if (amount == 0) return 0;
+        owed[to] = 0;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
+        emit OwedWithdrawn(to, amount);
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
