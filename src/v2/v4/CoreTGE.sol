@@ -10,8 +10,9 @@ pragma solidity ^0.8.24;
 //
 // When the owner triggers `launch`, the core token is deployed ONCE — through the platform's
 // own TokenDeployerV2 factory (the same contract that creates every launchpad token), as a
-// Base-mode LaunchTokenV2 with the launch limits off: byte-for-byte the bytecode aggregators
-// and explorers already recognize as ours, behaving as a plain fixed-supply ERC20 — and split:
+// Base-mode LaunchTokenV2 with the anti-snipe guard ON (front-run protection for the seed launch,
+// owner-tunable via setAntiSnipe; a constructor arg, so the bytecode aggregators and explorers
+// already recognize as ours is unchanged, behaving as a plain fixed-supply ERC20) — and split:
 //   - claims    → held here, released to the season Merkle distributor in ADMIN-SIZED tranches
 //                 (`fundClaims`) — volume-based seasonal rewards, computed off-chain per points
 //   - team      → held here, claimable by the owner from the dashboard (`claimTeam`)
@@ -63,6 +64,15 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     uint16 public teamBps;
     uint16 public communityBps;
     uint16 public lpBps;
+
+    // ── anti-snipe on the core token (front-run protection for the seed launch) ──
+    // The instant the seed pool goes live, a bot could grab a large chunk before the price walks
+    // up. This caps any wallet to `coreMaxBuyBps` of supply for the first `coreMaxBuySecs` after
+    // launch (the same guard every launchpad token uses), frozen into the token at launch. It is
+    // a constructor arg, not bytecode, so the token stays byte-for-byte the recognised LaunchTokenV2.
+    // Owner-settable BEFORE launch; default 1% / 60s. 0 bps disables it (not recommended).
+    uint16 public coreMaxBuyBps = 100;
+    uint32 public coreMaxBuySecs = 60;
 
     IERC20 public token; // zero until launch (a factory-deployed Base-mode LaunchTokenV2)
     uint256 public lpTokenId; // the locked full-range position NFT (held here forever)
@@ -172,6 +182,7 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
     }
 
     event AllocationSet(uint16 claimsBps, uint16 teamBps, uint16 communityBps, uint16 lpBps);
+    event AntiSnipeSet(uint16 maxBuyBps, uint32 maxBuySecs);
     event Seeded(address indexed from, uint256 amount);
     event Launched(address token, uint256 supply, uint256 ethSeeded, uint256 lpTokens, uint256 lpTokenId);
     event ClaimsFunded(address indexed distributor, uint256 amount);
@@ -244,6 +255,17 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
         _setAllocation(claimsBps_, teamBps_, communityBps_, lpBps_);
     }
 
+    /// @notice Anti-snipe guard for the core token, set BEFORE launch and frozen into the token at
+    /// launch. `maxBuyBps` caps any wallet to that share of supply for `maxBuySecs` after the seed
+    /// pool opens, so nobody can front-run the seeding with an outsized grab. Owner-only.
+    function setAntiSnipe(uint16 maxBuyBps_, uint32 maxBuySecs_) external onlyOwner {
+        if (address(token) != address(0)) revert AlreadyLaunched();
+        if (maxBuyBps_ > BPS) revert BadAllocation();
+        coreMaxBuyBps = maxBuyBps_;
+        coreMaxBuySecs = maxBuySecs_;
+        emit AntiSnipeSet(maxBuyBps_, maxBuySecs_);
+    }
+
     function _setAllocation(uint16 claimsBps_, uint16 teamBps_, uint16 communityBps_, uint16 lpBps_) internal {
         if (uint256(claimsBps_) + teamBps_ + communityBps_ + lpBps_ != BPS || lpBps_ == 0) revert BadAllocation();
         claimsBps = claimsBps_;
@@ -299,8 +321,8 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
                 supply: supply,
                 platformWebsite: platformWebsite,
                 metadata: meta,
-                maxBuyBps: 0, // limits off ⇒ limitActive() is permanently false
-                maxBuySecs: 0,
+                maxBuyBps: coreMaxBuyBps, // anti-snipe: cap any wallet for the first coreMaxBuySecs
+                maxBuySecs: coreMaxBuySecs, // (front-run protection for the seed launch)
                 mode: LaunchTokenV2.Mode.Base,
                 rewardTokens: noRewards,
                 rewardWeights: noWeights,
@@ -359,6 +381,12 @@ contract CoreTGE is Ownable2Step, ReentrancyGuard {
             // launch valuation, loose enough to absorb rounding.
             if (uint256(hi - lo) * 100 > uint256(sqrtPriceX96)) revert PoolPreInitialized();
         }
+
+        // Anti-snipe is ON for the core token (front-run protection), so exempt the LP infra: the
+        // seed mint moves the LP slice into the pool, which would otherwise trip the wallet cap.
+        // These addresses only ever hold protocol liquidity, never a sniper's buy.
+        LaunchTokenV2(tokenAddr).setLimitExempt(pool, true);
+        LaunchTokenV2(tokenAddr).setLimitExempt(address(positionManager), true);
 
         IERC20(tokenAddr).forceApprove(address(positionManager), pairTokens);
         IERC20(address(weth)).forceApprove(address(positionManager), eth);

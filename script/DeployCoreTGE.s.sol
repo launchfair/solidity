@@ -32,7 +32,8 @@ interface ILaunchpadDeployer {
 /// The claims distributor is wired later (it needs the token address, which exists post-TGE).
 ///
 /// Env: PRIVATE_KEY [required]; WETH, V3_FACTORY, POSITION_MANAGER, FEE_LOCKER, STOCK_ROUTER
-/// [defaults below]; CLAIMS_BPS/TEAM_BPS/COMMUNITY_BPS/LP_BPS [default 5000/1000/3000/1000].
+/// [defaults below]; CLAIMS_BPS/TEAM_BPS/COMMUNITY_BPS/LP_BPS [default 0/1000/0/9000 = NO pre-mint:
+/// 0% claims + 0% community (seasons are buyback-funded), 10% team, 90% into the locked seed pool].
 contract DeployCoreTGE is Script {
     address constant DEFAULT_WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address constant DEFAULT_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;

@@ -85,7 +85,7 @@ contract CoreTGETest is Test {
 
         assertEq(t.launchpad(), address(tge), "TGE is the token's (unused) launchpad");
         assertEq(uint8(t.mode()), uint8(LaunchTokenV2.Mode.Base), "Base mode");
-        assertFalse(t.limitActive(), "launch limits permanently off");
+        assertTrue(t.limitActive(), "anti-snipe guard ON at launch (front-run protection for the seed)");
         assertEq(t.owner(), address(0), "reads renounced on explorers");
         assertEq(t.website(), "https://core.example", "metadata baked into the token");
         assertEq(t.platformWebsite(), "https://hood.launchfair.app/", "platform site set");
@@ -149,6 +149,7 @@ contract CoreTGETest is Test {
 
         // Unpaired remainder is surplus above the buckets — withdrawable, not stuck.
         uint256 surplus = lpSlice - expectedPaired;
+        vm.warp(block.timestamp + 61); // past the anti-snipe window before the big admin withdrawal
         tge.withdrawToken(tokenAddr, TEAM, surplus);
         assertEq(IERC20(tokenAddr).balanceOf(TEAM), surplus, "unpaired LP remainder recoverable");
 
@@ -271,6 +272,7 @@ contract CoreTGETest is Test {
         tge.fundClaims(1 ether); // distributor unset
 
         tge.setClaimsDistributor(DISTRIBUTOR);
+        vm.warp(block.timestamp + 61); // past the anti-snipe window — admin tranches settle after launch
         tge.fundClaims(100_000_000 ether); // season 1 tranche — purely the admin's call
         // 10% season skim to the teamWallet (defaults to the owner), 90% to the distributor.
         assertEq(IERC20(tokenAddr).balanceOf(DISTRIBUTOR), 90_000_000 ether, "90% to claims");
